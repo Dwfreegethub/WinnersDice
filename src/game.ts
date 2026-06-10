@@ -143,6 +143,15 @@ export class WinnersDiceGame {
             case "!cancel":
                 this.handleCancel(sender);
                 break;
+            case "!bank":
+                this.handleBank(sender);
+                break;
+            case "!press":
+                this.handlePress(sender);
+                break;
+            case "!endgame":
+                this.handleEndgame(sender);
+                break;
         }
     }
 
@@ -425,5 +434,66 @@ export class WinnersDiceGame {
             `Streak: ${result.winnerStreak} (next roll advantage: +${result.winnerAdvantage}). ` +
             `${winner.name}, choose: ${choices.join(", ")}.`
         );
+    }
+
+    private handleBank(sender: number): void {
+        const state = this.state;
+        if (state.phase !== "playing" || !state.players || state.awaitingDecision !== sender) return;
+
+        const winner = state.players.find(p => p.memberNumber === sender)!;
+        winner.banked += winner.unbankedPot;
+        winner.unbankedPot = 0;
+
+        this.bot.sendChat(`${winner.name} banks the pot. Banked total: ${winner.banked}.`);
+        this.advanceRound();
+    }
+
+    private handlePress(sender: number): void {
+        const state = this.state;
+        if (state.phase !== "playing" || !state.players || state.awaitingDecision !== sender) return;
+
+        const winner = state.players.find(p => p.memberNumber === sender)!;
+        const advantage = Math.min(winner.streak, 3);
+
+        this.bot.sendChat(
+            `${winner.name} presses on, keeping ${winner.unbankedPot} points at risk with a +${advantage} advantage on the next roll.`
+        );
+        this.advanceRound();
+    }
+
+    private advanceRound(): void {
+        this.state.awaitingDecision = null;
+        this.state.round += 1;
+        this.bot.sendChat(`Round ${this.state.round} — both players roll!`);
+        this.playRound();
+    }
+
+    private handleEndgame(sender: number): void {
+        const state = this.state;
+        if (state.phase !== "playing" || !state.players || !state.config || state.awaitingDecision !== sender) return;
+
+        if (state.round < state.config.minRounds) {
+            this.bot.sendChat(`The minimum of ${state.config.minRounds} rounds hasn't been reached yet — !bank or !press to continue.`);
+            return;
+        }
+
+        const winner = state.players.find(p => p.memberNumber === sender)!;
+        winner.banked += winner.unbankedPot;
+        winner.unbankedPot = 0;
+
+        const [p1, p2] = state.players;
+        let resultMsg: string;
+        if (p1.banked === p2.banked) {
+            resultMsg = "It's a tie!";
+        } else {
+            const finalWinner = p1.banked > p2.banked ? p1 : p2;
+            resultMsg = `${finalWinner.name} wins WinnersDice!`;
+        }
+
+        this.bot.sendChat(
+            `${winner.name} ends the match! Final scores — ${p1.name}: ${p1.banked}, ${p2.name}: ${p2.banked}. ${resultMsg}`
+        );
+
+        this.state = this.createIdleState();
     }
 }
