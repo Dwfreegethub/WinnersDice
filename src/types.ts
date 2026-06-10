@@ -43,3 +43,56 @@ export interface BCMemberEvent {
     Character?: BCCharacter;
     [key: string]: any;
 }
+
+// ============================================================
+// WINNERSDICE GAME TYPES
+// ============================================================
+
+export type BondageAppliedBy = "bot" | "player";
+
+// The agreed rules for a match, settled during pre-game negotiation.
+export interface GameConfig {
+    minRounds: number;
+    stripping: boolean;
+    bondage: boolean;
+    bondageAppliedBy: BondageAppliedBy | null;
+    lockDuration: number;
+    toys: boolean;
+    services: boolean;
+}
+
+export type NegotiationKey = keyof GameConfig;
+
+// A proposed value for one setting, awaiting a response from the other player.
+export interface NegotiationProposal {
+    key: NegotiationKey;
+    value: any;
+    proposedBy: number;
+}
+
+export interface NegotiationState {
+    challenger: Player;
+    opponent: Player;
+    config: Partial<GameConfig>;
+    pending: NegotiationProposal | null;
+}
+
+// Per-player running totals for a match.
+export interface PlayerState {
+    memberNumber: number;
+    name: string;
+    banked: number;
+    unbankedPot: number;
+    streak: number;
+    frozen: boolean;
+}
+
+export type GamePhase = "idle" | "negotiating" | "playing" | "ended";
+
+export interface GameState {
+    phase: GamePhase;
+    config: GameConfig | null;
+    players: [PlayerState, PlayerState] | null;
+    round: number;
+    negotiation: NegotiationState | null;
+}

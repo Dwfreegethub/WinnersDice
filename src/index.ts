@@ -27,7 +27,7 @@ async function main() {
     log("WinnersDice starting...");
 
     const bot = new BCConnection();
-    const game = new WinnersDiceGame(bot);
+    const game = new WinnersDiceGame(bot, roomMembers);
 
     bot.onMessage((data: BCChatMessage) => {
         log(`MSG [${data.Type}] from ${data.Sender}: ${data.Content}`);
@@ -43,7 +43,7 @@ async function main() {
 
         if (data.Type === "Chat") {
             const msg = stripOOC(data.Content);
-            // TODO: dispatch to game chat command handler
+            game.handleChatMessage(memberNumber, msg);
         }
     });
 
