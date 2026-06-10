@@ -94,5 +94,24 @@ export interface GameState {
     config: GameConfig | null;
     players: [PlayerState, PlayerState] | null;
     round: number;
+    // Member number of the round's winner, while they decide bank/press/endgame.
+    awaitingDecision: number | null;
     negotiation: NegotiationState | null;
+}
+
+// A single player's 2d6 roll for a round, including their streak bonus.
+export interface DiceRoll {
+    memberNumber: number;
+    dice: [number, number];
+    bonus: number;
+    total: number;
+}
+
+export interface RoundResult {
+    round: number;
+    rolls: [DiceRoll, DiceRoll];
+    winner: number;
+    pot: number;
+    winnerStreak: number;
+    winnerAdvantage: number;
 }

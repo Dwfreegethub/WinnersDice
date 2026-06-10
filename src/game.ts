@@ -1,11 +1,13 @@
 import { BCConnection } from "./connection";
 import {
     Player,
+    DiceRoll,
     GameConfig,
     GameState,
     NegotiationKey,
     NegotiationState,
     PlayerState,
+    RoundResult,
 } from "./types";
 
 // ============================================================
@@ -56,6 +58,14 @@ function describeSetting(key: NegotiationKey): string {
     }
 }
 
+function rollDie(): number {
+    return Math.floor(Math.random() * 6) + 1;
+}
+
+function roll2d6(): [number, number] {
+    return [rollDie(), rollDie()];
+}
+
 function formatValue(key: NegotiationKey, value: any): string {
     if (typeof value === "boolean") return value ? "yes" : "no";
     return String(value);
@@ -104,6 +114,7 @@ export class WinnersDiceGame {
             config: null,
             players: null,
             round: 1,
+            awaitingDecision: null,
             negotiation: null,
         };
     }
@@ -177,6 +188,7 @@ export class WinnersDiceGame {
             config: null,
             players: null,
             round: 1,
+            awaitingDecision: null,
             negotiation,
         };
 
@@ -322,6 +334,7 @@ export class WinnersDiceGame {
             config,
             players,
             round: 1,
+            awaitingDecision: null,
             negotiation: null,
         };
 
@@ -335,6 +348,82 @@ export class WinnersDiceGame {
 
         this.bot.sendChat(
             `All settings agreed! ${summary}. The WinnersDice match between ${players[0].name} and ${players[1].name} is starting!`
+        );
+
+        this.startMatch();
+    }
+
+    private startMatch(): void {
+        this.bot.sendChat(`Round ${this.state.round} — both players roll!`);
+        this.playRound();
+    }
+
+    private playRound(): void {
+        const state = this.state;
+        if (state.phase !== "playing" || !state.players || !state.config) return;
+
+        const [p1, p2] = state.players;
+        const bonus1 = Math.min(p1.streak, 3);
+        const bonus2 = Math.min(p2.streak, 3);
+
+        let dice1: [number, number];
+        let dice2: [number, number];
+        let total1: number;
+        let total2: number;
+        do {
+            dice1 = roll2d6();
+            dice2 = roll2d6();
+            total1 = dice1[0] + dice1[1] + bonus1;
+            total2 = dice2[0] + dice2[1] + bonus2;
+        } while (total1 === total2);
+
+        const winner = total1 > total2 ? p1 : p2;
+        const loser = winner === p1 ? p2 : p1;
+        const winnerDice = winner === p1 ? dice1 : dice2;
+
+        const pot = (winnerDice[0] + winnerDice[1]) * state.round;
+
+        winner.streak += 1;
+        loser.streak = 0;
+        loser.frozen = true;
+        winner.frozen = false;
+        winner.unbankedPot += pot;
+
+        state.awaitingDecision = winner.memberNumber;
+
+        const result: RoundResult = {
+            round: state.round,
+            rolls: [
+                { memberNumber: p1.memberNumber, dice: dice1, bonus: bonus1, total: total1 },
+                { memberNumber: p2.memberNumber, dice: dice2, bonus: bonus2, total: total2 },
+            ],
+            winner: winner.memberNumber,
+            pot,
+            winnerStreak: winner.streak,
+            winnerAdvantage: Math.min(winner.streak, 3),
+        };
+
+        this.announceRoundResult(result);
+    }
+
+    private announceRoundResult(result: RoundResult): void {
+        const [p1, p2] = this.state.players!;
+        const winner = result.winner === p1.memberNumber ? p1 : p2;
+        const [r1, r2] = result.rolls;
+
+        const fmtRoll = (name: string, roll: DiceRoll) =>
+            `${name} rolled [${roll.dice[0]}, ${roll.dice[1]}]${roll.bonus > 0 ? ` +${roll.bonus}` : ""} = ${roll.total}`;
+
+        const choices = ["!bank to lock in the pot", "!press to keep your advantage and continue"];
+        if (this.state.round >= this.state.config!.minRounds) {
+            choices.push("!endgame to end the match now");
+        }
+
+        this.bot.sendChat(
+            `Round ${result.round}: ${fmtRoll(p1.name, r1)} | ${fmtRoll(p2.name, r2)}. ` +
+            `${winner.name} wins the round and adds ${result.pot} points to their pot (now ${winner.unbankedPot}). ` +
+            `Streak: ${result.winnerStreak} (next roll advantage: +${result.winnerAdvantage}). ` +
+            `${winner.name}, choose: ${choices.join(", ")}.`
         );
     }
 }
