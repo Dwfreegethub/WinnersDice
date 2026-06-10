@@ -1,0 +1,7 @@
+node_modules/
+build/
+src/secrets.ts
+*.log
+pending_update.txt
+feedback_status.json
+lock_release_log.txt
