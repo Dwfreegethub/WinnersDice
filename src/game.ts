@@ -185,14 +185,23 @@ export class WinnersDiceGame {
     }
 
     private handleHelp(sender: number): void {
-        this.bot.sendChat(
-            "WinnersDice commands: " +
-            "!challenge @PlayerName (start a match) | " +
-            "Setup: !yes / !no answer the bot's yes-or-no questions, " +
-            "!propose <value> / !accept / !counter <value> / !decline settle minimum rounds, bondage application, and lock duration, " +
-            "!cancel aborts the negotiation | " +
-            "!bank, !press, !endgame (during play)."
-        );
+        const text =
+            `=== WinnersDice Commands ===\n` +
+            `!challenge @PlayerName - Challenge a player to a match\n` +
+            `!help - Show this message\n\n` +
+            `=== Setup (Negotiating Match Rules) ===\n` +
+            `!yes / !no - Answer the bot's yes-or-no questions\n` +
+            `!propose <value> - Propose a value for the current setting\n` +
+            `!accept - Accept the other player's proposal\n` +
+            `!counter <value> - Counter-propose a different value\n` +
+            `!decline - Decline and end the negotiation\n` +
+            `!cancel - Abort the negotiation entirely\n\n` +
+            `=== During the Game ===\n` +
+            `!bank - Lock in your pot and pass the turn safely\n` +
+            `!press - Keep your streak and roll again, risking it all\n` +
+            `!endgame - Call the match early (after the minimum rounds)`;
+
+        this.bot.whisper(sender, text);
     }
 
     private findPlayerByName(name: string, excludeMemberNumber: number): Player | null {
