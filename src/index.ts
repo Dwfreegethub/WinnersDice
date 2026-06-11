@@ -5,6 +5,16 @@ import { WinnersDiceGame } from "./game";
 import { log, logError } from "./logger";
 import { Player, BCChatMessage, BCRoomSync, BCMemberEvent } from "./types";
 
+process.on('uncaughtException', (err) => {
+    console.error('[CRASH] Uncaught exception:', err);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[CRASH] Unhandled rejection:', reason);
+    process.exit(1);
+});
+
 // Tracks everyone currently in the room, by member number.
 const roomMembers: Map<number, Player> = new Map();
 

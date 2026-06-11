@@ -5,7 +5,7 @@ while ($true) {
     $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[$time] Starting WinnersDice..."
 
-    node build/index.js
+    node build/index.js >> wrapper.output 2>&1
 
     $exitCode = $LASTEXITCODE
     $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
