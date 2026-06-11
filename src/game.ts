@@ -493,15 +493,39 @@ export class WinnersDiceGame {
         let dice2: number;
         let total1: number;
         let total2: number;
-        do {
+        let winner: PlayerState;
+        let loser: PlayerState;
+        while (true) {
             dice1 = rollD20();
             dice2 = rollD20();
             total1 = dice1 + bonus1;
             total2 = dice2 + bonus2;
-        } while (total1 === total2);
 
-        const winner = total1 > total2 ? p1 : p2;
-        const loser = winner === p1 ? p2 : p1;
+            const p1Natural1 = dice1 === 1;
+            const p2Natural1 = dice2 === 1;
+            const p1Natural20 = dice1 === 20;
+            const p2Natural20 = dice2 === 20;
+
+            // Matching natural 1s or natural 20s cancel each other out - reroll.
+            if ((p1Natural1 && p2Natural1) || (p1Natural20 && p2Natural20)) continue;
+
+            if (p1Natural1 || p2Natural20) {
+                winner = p2;
+                loser = p1;
+                break;
+            }
+            if (p2Natural1 || p1Natural20) {
+                winner = p1;
+                loser = p2;
+                break;
+            }
+            if (total1 === total2) continue;
+
+            winner = total1 > total2 ? p1 : p2;
+            loser = winner === p1 ? p2 : p1;
+            break;
+        }
+
         const winnerDice = winner === p1 ? dice1 : dice2;
 
         const pot = winnerDice * state.round;
@@ -534,8 +558,10 @@ export class WinnersDiceGame {
         const winner = result.winner === p1.memberNumber ? p1 : p2;
         const [r1, r2] = result.rolls;
 
-        const fmtRoll = (name: string, roll: DiceRoll) =>
-            `${name} rolled ${roll.dice}${roll.bonus > 0 ? ` +${roll.bonus}` : ""} = ${roll.total}`;
+        const fmtRoll = (name: string, roll: DiceRoll) => {
+            const natural = roll.dice === 1 ? " (natural 1!)" : roll.dice === 20 ? " (natural 20!)" : "";
+            return `${name} rolled ${roll.dice}${roll.bonus > 0 ? ` +${roll.bonus}` : ""} = ${roll.total}${natural}`;
+        };
 
         const choices = ["!bank to lock in the pot", "!press to keep your advantage and continue"];
         if (this.state.round >= this.state.config!.minRounds) {
