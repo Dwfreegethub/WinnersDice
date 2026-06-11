@@ -203,6 +203,13 @@ export class BCConnection {
         });
     }
 
+    public moveLeft(): void {
+        this.socket.emit("ChatRoomAdmin", {
+            MemberNumber: this.playerNumber,
+            Action: "MoveLeft",
+        });
+    }
+
     public removeItem(targetNumber: number, group: string): void {
         this.socket.emit("ChatRoomCharacterItemUpdate", {
             Target: targetNumber,

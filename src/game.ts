@@ -1,14 +1,29 @@
+import * as fs from "fs";
+import * as path from "path";
 import { BCConnection } from "./connection";
+import { log, centralTimestamp } from "./logger";
+import { secrets } from "./secrets";
 import {
+    BCCharacter,
     Player,
     DiceRoll,
+    FeedbackItemStatus,
+    FeedbackStatusEntry,
     GameConfig,
     GameState,
     NegotiationKey,
     NegotiationState,
+    PlayerRecord,
     PlayerState,
     RoundResult,
 } from "./types";
+
+const FEEDBACK_STATUS_LABELS: Record<FeedbackItemStatus, string> = {
+    reviewing: "🔍 Reviewing",
+    testing: "🧪 Testing",
+    implemented: "✅ Implemented",
+    partly_implemented: "🔧 Partly implemented",
+};
 
 // ============================================================
 // WinnersDice
@@ -119,10 +134,22 @@ export class WinnersDiceGame {
     private roomMembers: Map<number, Player>;
     private state: GameState;
 
+    private feedbackStatus: Record<string, FeedbackStatusEntry> = {};
+    private feedbackNotified: Set<number> = new Set();
+    private readonly feedbackStatusPath = path.join(__dirname, "..", "feedback_status.json");
+    private readonly feedbackLogPath = path.join(__dirname, "..", "feedback.log");
+
+    private playerRecords: Record<string, PlayerRecord> = {};
+    private readonly playerRecordsPath = path.join(__dirname, "..", "players.json");
+
+    private readonly pendingUpdatePath = path.join(__dirname, "..", "pending_update.txt");
+
     constructor(bot: BCConnection, roomMembers: Map<number, Player>) {
         this.bot = bot;
         this.roomMembers = roomMembers;
         this.state = this.createIdleState();
+        this.loadFeedbackStatus();
+        this.loadPlayerRecords();
     }
 
     private createIdleState(): GameState {
@@ -136,7 +163,7 @@ export class WinnersDiceGame {
         };
     }
 
-    public handleChatMessage(sender: number, content: string): void {
+    public handleChatMessage(sender: number, content: string, isWhisper: boolean): void {
         const msg = content.trim();
         if (!msg.startsWith("!")) return;
 
@@ -181,11 +208,20 @@ export class WinnersDiceGame {
             case "!endgame":
                 this.handleEndgame(sender);
                 break;
+            case "!reset":
+                this.handleReset(sender);
+                break;
+            case "!feedback":
+                this.handleFeedback(sender, args, isWhisper);
+                break;
+            case "!setstatus":
+                this.handleSetStatus(sender, args, isWhisper);
+                break;
         }
     }
 
     private handleHelp(sender: number): void {
-        const text =
+        let text =
             `=== WinnersDice Commands ===\n` +
             `!challenge @PlayerName - Challenge a player to a match\n` +
             `!help - Show this message\n\n` +
@@ -199,7 +235,17 @@ export class WinnersDiceGame {
             `=== During the Game ===\n` +
             `!bank - Lock in your pot and pass the turn safely\n` +
             `!press - Keep your streak and roll again, risking it all\n` +
-            `!endgame - Call the match early (after the minimum rounds)`;
+            `!endgame - Call the match early (after the minimum rounds)\n\n` +
+            `=== Feedback ===\n` +
+            `!feedback <text> - Send feedback to the developers (whisper only)`;
+
+        if (this.isAdmin(sender)) {
+            text +=
+                `\n\n=== Admin Commands ===\n` +
+                `!reset - End the current match immediately and reset to idle\n` +
+                `!setstatus <memberNumber> <status> - Set a player's feedback status (reviewing, testing, implemented, partly_implemented)\n` +
+                `!feedback list - View a summary of all tracked feedback`;
+        }
 
         this.bot.whisper(sender, text);
     }
@@ -218,6 +264,8 @@ export class WinnersDiceGame {
             this.bot.sendChat("A WinnersDice match is already in progress. Type !cancel to abort an ongoing negotiation first.");
             return;
         }
+
+        if (this.checkPendingUpdate()) return;
 
         const targetName = args.replace(/^@/, "").trim();
         if (!targetName) {
@@ -634,10 +682,12 @@ export class WinnersDiceGame {
 
         const [p1, p2] = state.players;
         let resultMsg: string;
+        let finalWinnerMemberNumber: number | null = null;
         if (p1.banked === p2.banked) {
             resultMsg = "It's a tie!";
         } else {
             const finalWinner = p1.banked > p2.banked ? p1 : p2;
+            finalWinnerMemberNumber = finalWinner.memberNumber;
             resultMsg = `${finalWinner.name} wins WinnersDice!`;
         }
 
@@ -645,6 +695,304 @@ export class WinnersDiceGame {
             `${winner.name} ends the match! Final scores — ${p1.name}: ${p1.banked}, ${p2.name}: ${p2.banked}. ${resultMsg}`
         );
 
+        this.recordGameCompletion(finalWinnerMemberNumber, [p1, p2]);
+
         this.state = this.createIdleState();
+
+        this.checkPendingUpdate();
+    }
+
+    // ============================================================
+    // ADMIN COMMANDS
+    // ============================================================
+
+    private isAdmin(memberNumber: number): boolean {
+        return memberNumber === secrets.adminMemberNumber || memberNumber === this.bot.getMemberNumber();
+    }
+
+    private handleReset(sender: number): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+        if (this.state.phase === "idle") {
+            this.bot.whisper(sender, "No game is currently running.");
+            return;
+        }
+
+        this.state = this.createIdleState();
+        this.bot.sendChat("Game has been reset by admin.");
+    }
+
+    // ============================================================
+    // FEEDBACK
+    // ============================================================
+
+    private handleFeedback(sender: number, args: string, isWhisper: boolean): void {
+        if (!isWhisper) return;
+
+        const trimmed = args.trim();
+        if (trimmed.toLowerCase() === "list") {
+            this.handleFeedbackList(sender);
+            return;
+        }
+
+        if (!trimmed) {
+            this.bot.whisper(sender, "Please include your feedback! e.g. !feedback The game was great but...");
+            return;
+        }
+
+        const name = this.roomMembers.get(sender)?.name ?? `Player #${sender}`;
+        const timestamp = centralTimestamp();
+        const line = `[${timestamp}] ${name} (#${sender}): ${trimmed}\n`;
+        fs.appendFileSync(this.feedbackLogPath, line, "utf8");
+        log(`Feedback from ${name}: ${trimmed}`);
+
+        const key = String(sender);
+        const entry = this.feedbackStatus[key] ?? { name, items: [] };
+        entry.name = name;
+        entry.items.push({ timestamp, text: trimmed, status: "reviewing" });
+        this.feedbackStatus[key] = entry;
+        this.saveFeedbackStatus();
+
+        const playerRecord = this.playerRecords[key];
+        if (playerRecord && !playerRecord.feedbackGiven) {
+            playerRecord.feedbackGiven = true;
+            this.savePlayerRecords();
+        }
+
+        this.bot.whisper(sender, "Thank you for your feedback! 💬 We read everything and really appreciate it.");
+    }
+
+    private handleFeedbackList(sender: number): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        const entries = Object.entries(this.feedbackStatus);
+        if (entries.length === 0) {
+            this.bot.whisper(sender, "No feedback recorded yet.");
+            return;
+        }
+
+        const lines: string[] = [];
+        for (const [playerId, entry] of entries) {
+            lines.push(`${entry.name} (#${playerId}):`);
+            entry.items.forEach((item, i) => {
+                lines.push(`  ${i + 1}. [${FEEDBACK_STATUS_LABELS[item.status] ?? item.status}] ${item.text}`);
+            });
+        }
+
+        this.sendLongWhisper(sender, `=== Feedback Status ===\n${lines.join("\n")}`);
+    }
+
+    private handleSetStatus(sender: number, args: string, isWhisper: boolean): void {
+        if (!isWhisper) return;
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        const parts = args.trim().split(/\s+/);
+        const playerId = parts[0];
+        const status = (parts[1] ?? "").toLowerCase() as FeedbackItemStatus;
+        const validStatuses: FeedbackItemStatus[] = ["reviewing", "testing", "implemented", "partly_implemented"];
+
+        if (!playerId || !/^\d+$/.test(playerId)) {
+            this.bot.whisper(sender, "Usage: !setstatus <memberNumber> <status>");
+            return;
+        }
+        if (!validStatuses.includes(status)) {
+            this.bot.whisper(sender, `Invalid status. Valid statuses: ${validStatuses.join(", ")}`);
+            return;
+        }
+
+        const entry = this.feedbackStatus[playerId];
+        if (!entry || entry.items.length === 0) {
+            this.bot.whisper(sender, `No feedback found for player #${playerId}.`);
+            return;
+        }
+
+        for (const item of entry.items) {
+            item.status = status;
+        }
+        this.saveFeedbackStatus();
+        this.bot.whisper(sender, `Updated ${entry.items.length} feedback item(s) for ${entry.name} (#${playerId}) to "${status}".`);
+    }
+
+    private loadFeedbackStatus(): void {
+        try {
+            const raw = fs.readFileSync(this.feedbackStatusPath, "utf8");
+            this.feedbackStatus = JSON.parse(raw);
+        } catch {
+            this.feedbackStatus = {};
+        }
+    }
+
+    private saveFeedbackStatus(): void {
+        fs.writeFileSync(this.feedbackStatusPath, JSON.stringify(this.feedbackStatus, null, 2), "utf8");
+    }
+
+    private notifyFeedbackStatus(memberNumber: number, name: string): void {
+        if (this.feedbackNotified.has(memberNumber)) return;
+        const entry = this.feedbackStatus[String(memberNumber)];
+        if (!entry || entry.items.length === 0) return;
+        this.feedbackNotified.add(memberNumber);
+
+        const latest = entry.items[entry.items.length - 1];
+        this.bot.whisper(memberNumber,
+            `Hi ${name}! Here's an update on your most recent suggestion:\n` +
+            `"${latest.text}" — ${FEEDBACK_STATUS_LABELS[latest.status] ?? latest.status}\n\n` +
+            `Thanks for helping us improve the game! 💕`
+        );
+    }
+
+    // Whispers tend to get silently dropped by the BC server if they exceed
+    // its max chat message length, so split long messages on line boundaries.
+    private sendLongWhisper(memberNumber: number, text: string, maxLen: number = 900): void {
+        if (text.length <= maxLen) {
+            this.bot.whisper(memberNumber, text);
+            return;
+        }
+
+        const chunks: string[] = [];
+        let chunk = "";
+        for (const line of text.split("\n")) {
+            if (chunk && chunk.length + 1 + line.length > maxLen) {
+                chunks.push(chunk);
+                chunk = "";
+            }
+            chunk = chunk ? `${chunk}\n${line}` : line;
+        }
+        if (chunk) chunks.push(chunk);
+
+        chunks.forEach((c, i) => {
+            setTimeout(() => this.bot.whisper(memberNumber, c), i * 300);
+        });
+    }
+
+    // ============================================================
+    // PLAYER TRACKING
+    // ============================================================
+
+    public onMemberJoin(memberNumber: number, name: string): void {
+        if (memberNumber === this.bot.getMemberNumber()) return;
+        this.recordPlayerSeen(memberNumber, name);
+        this.sendWelcomeWhisper(memberNumber, name);
+        this.notifyFeedbackStatus(memberNumber, name);
+    }
+
+    public onRoomSync(characters: BCCharacter[]): void {
+        for (const char of characters) {
+            if (char.MemberNumber === undefined || char.MemberNumber === this.bot.getMemberNumber()) continue;
+            const name = char.Nickname || char.Name || `Player #${char.MemberNumber}`;
+            this.recordPlayerSeen(char.MemberNumber, name);
+        }
+    }
+
+    private sendWelcomeWhisper(memberNumber: number, name: string): void {
+        this.bot.whisper(memberNumber,
+            `Welcome, ${name}! WinnersDice has been getting regular updates thanks to player feedback. ` +
+            `Play a round and let us know what you think — type !challenge @opponent to start or !help to see the rules. 🎲`
+        );
+    }
+
+    private loadPlayerRecords(): void {
+        try {
+            const raw = fs.readFileSync(this.playerRecordsPath, "utf8");
+            this.playerRecords = JSON.parse(raw);
+        } catch {
+            this.playerRecords = {};
+        }
+
+        for (const memberNumber of this.loadFeedbackMemberNumbers()) {
+            const record = this.playerRecords[String(memberNumber)];
+            if (record) record.feedbackGiven = true;
+        }
+    }
+
+    private savePlayerRecords(): void {
+        fs.writeFileSync(this.playerRecordsPath, JSON.stringify(this.playerRecords, null, 2), "utf8");
+    }
+
+    // Reads feedback.log and returns the set of member numbers that have
+    // submitted feedback, e.g. lines like "... Missy (#208543): ...".
+    private loadFeedbackMemberNumbers(): Set<number> {
+        const memberNumbers = new Set<number>();
+        try {
+            const raw = fs.readFileSync(this.feedbackLogPath, "utf8");
+            for (const match of raw.matchAll(/\(#(\d+)\)/g)) {
+                memberNumbers.add(Number(match[1]));
+            }
+        } catch {
+            // No feedback log yet
+        }
+        return memberNumbers;
+    }
+
+    private recordPlayerSeen(memberNumber: number, name: string): void {
+        const key = String(memberNumber);
+        const now = centralTimestamp();
+        const existing = this.playerRecords[key];
+        if (existing) {
+            existing.name = name;
+            existing.lastSeen = now;
+        } else {
+            this.playerRecords[key] = {
+                memberNumber,
+                name,
+                firstSeen: now,
+                lastSeen: now,
+                gamesPlayed: 0,
+                gamesWon: 0,
+                feedbackGiven: this.loadFeedbackMemberNumbers().has(memberNumber),
+            };
+        }
+        this.savePlayerRecords();
+    }
+
+    // Called once a match concludes, crediting both participants with a
+    // completed game and the winner (if any) with a win.
+    private recordGameCompletion(winnerMemberNumber: number | null, participants: PlayerState[]): void {
+        for (const participant of participants) {
+            const record = this.playerRecords[String(participant.memberNumber)];
+            if (!record) continue;
+            record.gamesPlayed++;
+            if (winnerMemberNumber !== null && participant.memberNumber === winnerMemberNumber) {
+                record.gamesWon++;
+            }
+        }
+        this.savePlayerRecords();
+    }
+
+    // ============================================================
+    // GRACEFUL UPDATE / REBOOT
+    // ============================================================
+
+    private checkPendingUpdate(): boolean {
+        if (!fs.existsSync(this.pendingUpdatePath)) return false;
+
+        let note = "";
+        try {
+            note = fs.readFileSync(this.pendingUpdatePath, "utf8").trim();
+        } catch {
+            note = "";
+        }
+
+        const message = note
+            ? `Heads up — I'll be restarting shortly for an update: ${note}. Be right back!`
+            : `Heads up — I'll be restarting shortly for an update. Be right back!`;
+
+        this.bot.sendChat(message);
+        log(`Pending update detected${note ? ` (${note})` : ""}. Restarting...`);
+
+        fs.unlinkSync(this.pendingUpdatePath);
+
+        setTimeout(() => {
+            process.exit(0);
+        }, 2000);
+
+        return true;
     }
 }

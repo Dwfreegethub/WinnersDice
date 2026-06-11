@@ -29,10 +29,17 @@ function stripOOC(msg: string): string {
 
 async function main() {
     const pendingUpdatePath = path.join(__dirname, "..", "pending_update.txt");
+    let updateNote: string | null = null;
     if (fs.existsSync(pendingUpdatePath)) {
+        try {
+            updateNote = fs.readFileSync(pendingUpdatePath, "utf8").trim();
+        } catch {
+            updateNote = "";
+        }
         fs.unlinkSync(pendingUpdatePath);
-        log("Removed leftover pending_update.txt from previous restart.");
+        log(`Removed pending_update.txt from previous restart (note: "${updateNote}").`);
     }
+    let restartAnnounced = false;
 
     log("WinnersDice starting...");
 
@@ -48,12 +55,12 @@ async function main() {
         if (data.Type === "Whisper") {
             const msg = stripOOC(data.Content);
             log(`Whisper from ${name} (#${memberNumber}): ${msg}`);
-            game.handleChatMessage(memberNumber, msg);
+            game.handleChatMessage(memberNumber, msg, true);
         }
 
         if (data.Type === "Chat") {
             const msg = stripOOC(data.Content);
-            game.handleChatMessage(memberNumber, msg);
+            game.handleChatMessage(memberNumber, msg, false);
         }
     });
 
@@ -70,12 +77,33 @@ async function main() {
             }
         }
 
+        game.onRoomSync(data.Character ?? []);
+
         if (data.Visibility?.includes("All")) {
             log("Room is publicly listed, updating room settings to make it private...");
             bot.makeRoomPrivate();
         }
 
+        const myIndex = (data.Character ?? []).findIndex((c) => c.MemberNumber === bot.getMemberNumber());
+        if (myIndex > 0) {
+            log(`Bot is at position ${myIndex} — moving to the leftmost spot...`);
+            for (let i = 0; i < myIndex; i++) {
+                bot.moveLeft();
+            }
+        }
+
         bot.sendChat("WinnersDice is online!");
+
+        if (!restartAnnounced) {
+            restartAnnounced = true;
+            if (updateNote !== null) {
+                bot.sendChat(updateNote
+                    ? `WinnersDice is back with updates! ${updateNote}`
+                    : `WinnersDice is back with updates!`);
+            } else {
+                bot.sendChat("Sorry for the interruption — WinnersDice is back!");
+            }
+        }
     });
 
     bot.onMemberJoin((data: BCMemberEvent) => {
@@ -83,7 +111,7 @@ async function main() {
         const name = data.Character?.Nickname || data.Character?.Name || `Player #${memberNumber}`;
         log(`${name} (#${memberNumber}) joined the room.`);
         roomMembers.set(memberNumber, { memberNumber, name });
-        bot.sendChat(`Welcome to WinnersDice, ${name}!`);
+        game.onMemberJoin(memberNumber, name);
     });
 
     bot.onMemberLeave((data: BCMemberEvent) => {

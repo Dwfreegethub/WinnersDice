@@ -117,3 +117,30 @@ export interface RoundResult {
     winnerStreak: number;
     winnerAdvantage: number;
 }
+
+// ============================================================
+// PLAYER TRACKING & FEEDBACK
+// ============================================================
+
+export interface PlayerRecord {
+    memberNumber: number;
+    name: string;
+    firstSeen: string;
+    lastSeen: string;
+    gamesPlayed: number;
+    gamesWon: number;
+    feedbackGiven: boolean;
+}
+
+export type FeedbackItemStatus = "reviewing" | "testing" | "implemented" | "partly_implemented";
+
+export interface FeedbackItem {
+    timestamp: string;
+    text: string;
+    status: FeedbackItemStatus;
+}
+
+export interface FeedbackStatusEntry {
+    name: string;
+    items: FeedbackItem[];
+}
