@@ -58,6 +58,24 @@ function describeSetting(key: NegotiationKey): string {
     }
 }
 
+// Settings that are simple yes/no toggles, asked directly to both players.
+// Anything not in this set is settled via the !propose/!accept/!counter/!decline flow.
+const YES_NO_KEYS = new Set<NegotiationKey>(["stripping", "bondage", "toys", "services"]);
+
+function isYesNoKey(key: NegotiationKey): boolean {
+    return YES_NO_KEYS.has(key);
+}
+
+function yesNoQuestion(key: NegotiationKey): string {
+    switch (key) {
+        case "stripping": return "Enable stripping?";
+        case "bondage": return "Enable bondage?";
+        case "toys": return "Enable toys?";
+        case "services": return "Enable services?";
+        default: return `Enable ${settingLabel(key)}?`;
+    }
+}
+
 function rollDie(): number {
     return Math.floor(Math.random() * 6) + 1;
 }
@@ -128,6 +146,9 @@ export class WinnersDiceGame {
         const args = rest.join(" ");
 
         switch (cmd) {
+            case "!help":
+                this.handleHelp(sender);
+                break;
             case "!challenge":
                 this.handleChallenge(sender, args);
                 break;
@@ -139,6 +160,15 @@ export class WinnersDiceGame {
                 break;
             case "!counter":
                 this.handleCounter(sender, args);
+                break;
+            case "!decline":
+                this.handleDecline(sender);
+                break;
+            case "!yes":
+                this.handleYesNoAnswer(sender, true);
+                break;
+            case "!no":
+                this.handleYesNoAnswer(sender, false);
                 break;
             case "!cancel":
                 this.handleCancel(sender);
@@ -153,6 +183,17 @@ export class WinnersDiceGame {
                 this.handleEndgame(sender);
                 break;
         }
+    }
+
+    private handleHelp(sender: number): void {
+        this.bot.sendChat(
+            "WinnersDice commands: " +
+            "!challenge @PlayerName (start a match) | " +
+            "Setup: !yes / !no answer the bot's yes-or-no questions, " +
+            "!propose <value> / !accept / !counter <value> / !decline settle minimum rounds, bondage application, and lock duration, " +
+            "!cancel aborts the negotiation | " +
+            "!bank, !press, !endgame (during play)."
+        );
     }
 
     private findPlayerByName(name: string, excludeMemberNumber: number): Player | null {
@@ -190,6 +231,7 @@ export class WinnersDiceGame {
             opponent,
             config: {},
             pending: null,
+            answers: {},
         };
 
         this.state = {
@@ -218,6 +260,16 @@ export class WinnersDiceGame {
             return;
         }
 
+        negotiation.pending = null;
+
+        if (isYesNoKey(key)) {
+            negotiation.answers = {};
+            this.bot.sendChat(
+                `${negotiation.challenger.name} and ${negotiation.opponent.name}: ${yesNoQuestion(key)} Reply !yes or !no.`
+            );
+            return;
+        }
+
         this.bot.sendChat(`${negotiation.challenger.name}, propose a value for ${describeSetting(key)}. Use !propose <value>.`);
     }
 
@@ -237,6 +289,11 @@ export class WinnersDiceGame {
 
         const key = nextNegotiationKey(negotiation.config);
         if (key === null) return;
+
+        if (isYesNoKey(key)) {
+            this.bot.sendChat(`${settingLabel(key)} is a yes/no setting — both players reply !yes or !no.`);
+            return;
+        }
 
         const parsed = parseProposalValue(key, args);
         if (typeof parsed === "string") {
@@ -304,6 +361,64 @@ export class WinnersDiceGame {
             `${counterer.name} counters: ${settingLabel(negotiation.pending.key)} = ${formatValue(negotiation.pending.key, parsed.value)}. ` +
             `${other.name}, type !accept or !counter <value>.`
         );
+    }
+
+    private handleDecline(sender: number): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || !negotiation.pending) {
+            return;
+        }
+
+        if (sender === negotiation.pending.proposedBy) {
+            this.bot.sendChat("You can't decline your own proposal.");
+            return;
+        }
+
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) {
+            return;
+        }
+
+        const decliner = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+        const key = negotiation.pending.key;
+        negotiation.pending = null;
+
+        this.bot.sendChat(`${decliner.name} declines the proposal for ${settingLabel(key)}.`);
+        this.promptNextSetting();
+    }
+
+    private handleYesNoAnswer(sender: number, value: boolean): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation) return;
+
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) {
+            return;
+        }
+
+        const key = nextNegotiationKey(negotiation.config);
+        if (key === null || !isYesNoKey(key)) return;
+
+        negotiation.answers[sender] = value;
+
+        const challengerAnswer = negotiation.answers[negotiation.challenger.memberNumber];
+        const opponentAnswer = negotiation.answers[negotiation.opponent.memberNumber];
+
+        if (challengerAnswer === undefined || opponentAnswer === undefined) {
+            const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+            const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+            this.bot.sendChat(`${responder.name} says ${value ? "yes" : "no"}. Waiting on ${other.name}...`);
+            return;
+        }
+
+        const agreed = challengerAnswer && opponentAnswer;
+        (negotiation.config as any)[key] = agreed;
+        negotiation.answers = {};
+
+        if (agreed) {
+            this.bot.sendChat(`Both players said yes — ${settingLabel(key)}: enabled.`);
+        } else {
+            this.bot.sendChat(`${settingLabel(key)}: disabled (at least one player said no).`);
+        }
+        this.promptNextSetting();
     }
 
     private handleCancel(sender: number): void {

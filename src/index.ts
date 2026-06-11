@@ -38,7 +38,7 @@ async function main() {
         if (data.Type === "Whisper") {
             const msg = stripOOC(data.Content);
             log(`Whisper from ${name} (#${memberNumber}): ${msg}`);
-            // TODO: dispatch to game whisper command handler
+            game.handleChatMessage(memberNumber, msg);
         }
 
         if (data.Type === "Chat") {
@@ -60,9 +60,9 @@ async function main() {
             }
         }
 
-        if (data.Visibility?.[0] !== "All" || data.Private) {
-            log("Room is not public, updating room settings to make it public...");
-            bot.makeRoomPublic();
+        if (data.Visibility?.includes("All")) {
+            log("Room is publicly listed, updating room settings to make it private...");
+            bot.makeRoomPrivate();
         }
 
         bot.sendChat("WinnersDice is online!");

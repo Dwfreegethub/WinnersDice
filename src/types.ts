@@ -75,6 +75,8 @@ export interface NegotiationState {
     opponent: Player;
     config: Partial<GameConfig>;
     pending: NegotiationProposal | null;
+    // Yes/no answers for the setting currently being asked, keyed by member number.
+    answers: Partial<Record<number, boolean>>;
 }
 
 // Per-player running totals for a match.

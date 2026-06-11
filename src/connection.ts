@@ -149,12 +149,12 @@ export class BCConnection {
             Limit: 10,
             BlockCategory: [],
             Language: "EN",
-            Visibility: ["All"],
+            Visibility: ["Admin"],
             Access: ["All"],
         });
     }
 
-    public makeRoomPublic(): void {
+    public makeRoomPrivate(): void {
         this.socket.emit("ChatRoomAdmin", {
             MemberNumber: this.playerNumber,
             Action: "Update",
@@ -169,7 +169,7 @@ export class BCConnection {
                 Limit: 10,
                 BlockCategory: [],
                 Language: "EN",
-                Visibility: ["All"],
+                Visibility: ["Admin"],
                 Access: ["All"],
             },
         });
