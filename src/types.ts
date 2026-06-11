@@ -101,10 +101,10 @@ export interface GameState {
     negotiation: NegotiationState | null;
 }
 
-// A single player's 2d6 roll for a round, including their streak bonus.
+// A single player's d20 roll for a round, including their streak bonus.
 export interface DiceRoll {
     memberNumber: number;
-    dice: [number, number];
+    dice: number;
     bonus: number;
     total: number;
 }

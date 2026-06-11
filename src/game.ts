@@ -76,13 +76,12 @@ function yesNoQuestion(key: NegotiationKey): string {
     }
 }
 
-function rollDie(): number {
-    return Math.floor(Math.random() * 6) + 1;
+function rollD20(): number {
+    return Math.floor(Math.random() * 20) + 1;
 }
 
-function roll2d6(): [number, number] {
-    return [rollDie(), rollDie()];
-}
+// Cap on the streak bonus added to a d20 roll (1-20 range).
+const MAX_STREAK_BONUS = 5;
 
 function formatValue(key: NegotiationKey, value: any): string {
     if (typeof value === "boolean") return value ? "yes" : "no";
@@ -487,25 +486,25 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || !state.config) return;
 
         const [p1, p2] = state.players;
-        const bonus1 = Math.min(p1.streak, 3);
-        const bonus2 = Math.min(p2.streak, 3);
+        const bonus1 = Math.min(p1.streak, MAX_STREAK_BONUS);
+        const bonus2 = Math.min(p2.streak, MAX_STREAK_BONUS);
 
-        let dice1: [number, number];
-        let dice2: [number, number];
+        let dice1: number;
+        let dice2: number;
         let total1: number;
         let total2: number;
         do {
-            dice1 = roll2d6();
-            dice2 = roll2d6();
-            total1 = dice1[0] + dice1[1] + bonus1;
-            total2 = dice2[0] + dice2[1] + bonus2;
+            dice1 = rollD20();
+            dice2 = rollD20();
+            total1 = dice1 + bonus1;
+            total2 = dice2 + bonus2;
         } while (total1 === total2);
 
         const winner = total1 > total2 ? p1 : p2;
         const loser = winner === p1 ? p2 : p1;
         const winnerDice = winner === p1 ? dice1 : dice2;
 
-        const pot = (winnerDice[0] + winnerDice[1]) * state.round;
+        const pot = winnerDice * state.round;
 
         winner.streak += 1;
         loser.streak = 0;
@@ -524,7 +523,7 @@ export class WinnersDiceGame {
             winner: winner.memberNumber,
             pot,
             winnerStreak: winner.streak,
-            winnerAdvantage: Math.min(winner.streak, 3),
+            winnerAdvantage: Math.min(winner.streak, MAX_STREAK_BONUS),
         };
 
         this.announceRoundResult(result);
@@ -536,7 +535,7 @@ export class WinnersDiceGame {
         const [r1, r2] = result.rolls;
 
         const fmtRoll = (name: string, roll: DiceRoll) =>
-            `${name} rolled [${roll.dice[0]}, ${roll.dice[1]}]${roll.bonus > 0 ? ` +${roll.bonus}` : ""} = ${roll.total}`;
+            `${name} rolled ${roll.dice}${roll.bonus > 0 ? ` +${roll.bonus}` : ""} = ${roll.total}`;
 
         const choices = ["!bank to lock in the pot", "!press to keep your advantage and continue"];
         if (this.state.round >= this.state.config!.minRounds) {
@@ -568,7 +567,7 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || state.awaitingDecision !== sender) return;
 
         const winner = state.players.find(p => p.memberNumber === sender)!;
-        const advantage = Math.min(winner.streak, 3);
+        const advantage = Math.min(winner.streak, MAX_STREAK_BONUS);
 
         this.bot.sendChat(
             `${winner.name} presses on, keeping ${winner.unbankedPot} points at risk with a +${advantage} advantage on the next roll.`
