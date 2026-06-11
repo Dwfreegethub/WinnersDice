@@ -559,20 +559,22 @@ export class WinnersDiceGame {
         const [r1, r2] = result.rolls;
 
         const fmtRoll = (name: string, roll: DiceRoll) => {
-            const natural = roll.dice === 1 ? " (natural 1!)" : roll.dice === 20 ? " (natural 20!)" : "";
-            return `${name} rolled ${roll.dice}${roll.bonus > 0 ? ` +${roll.bonus}` : ""} = ${roll.total}${natural}`;
+            const breakdown = roll.bonus > 0 ? `${roll.dice} +${roll.bonus} = ${roll.total}` : `${roll.total}`;
+            const natural = roll.dice === 1 ? " 🎲 Natural 1!" : roll.dice === 20 ? " 🎲 Natural 20!" : "";
+            return `Round ${result.round}: ${name} rolls... ${breakdown}${natural}`;
         };
 
-        const choices = ["!bank to lock in the pot", "!press to keep your advantage and continue"];
-        if (this.state.round >= this.state.config!.minRounds) {
-            choices.push("!endgame to end the match now");
-        }
-
+        this.bot.sendChat(fmtRoll(p1.name, r1));
+        this.bot.sendChat(fmtRoll(p2.name, r2));
         this.bot.sendChat(
-            `Round ${result.round}: ${fmtRoll(p1.name, r1)} | ${fmtRoll(p2.name, r2)}. ` +
-            `${winner.name} wins the round and adds ${result.pot} points to their pot (now ${winner.unbankedPot}). ` +
-            `Streak: ${result.winnerStreak} (next roll advantage: +${result.winnerAdvantage}). ` +
-            `${winner.name}, choose: ${choices.join(", ")}.`
+            `${winner.name} wins the round — +${result.pot} points to the pot (total: ${winner.unbankedPot}). ` +
+            `Streak: ${result.winnerStreak}`
+        );
+
+        this.bot.whisper(
+            winner.memberNumber,
+            "Your move: !bank to lock in your pot, !press to keep your streak and continue, " +
+            "or !endgame to call the match (after min rounds)."
         );
     }
 
