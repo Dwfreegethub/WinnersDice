@@ -19,11 +19,20 @@ import {
 } from "./types";
 
 const FEEDBACK_STATUS_LABELS: Record<FeedbackItemStatus, string> = {
+    pending: "⏳ Pending review",
     reviewing: "🔍 Reviewing",
     testing: "🧪 Testing",
     implemented: "✅ Implemented",
+    declined: "❌ Declined",
     partly_implemented: "🔧 Partly implemented",
 };
+
+// Statuses that count as "resolved" - shown to the submitter only once.
+const RESOLVED_FEEDBACK_STATUSES: ReadonlySet<FeedbackItemStatus> = new Set([
+    "implemented",
+    "declined",
+    "partly_implemented",
+]);
 
 // ============================================================
 // WinnersDice
@@ -816,6 +825,7 @@ export class WinnersDiceGame {
 
         for (const item of entry.items) {
             item.status = status;
+            item.statusShown = false;
         }
         this.saveFeedbackStatus();
         this.bot.whisper(sender, `Updated ${entry.items.length} feedback item(s) for ${entry.name} (#${playerId}) to "${status}".`);
@@ -840,12 +850,29 @@ export class WinnersDiceGame {
         if (!entry || entry.items.length === 0) return;
         this.feedbackNotified.add(memberNumber);
 
-        const latest = entry.items[entry.items.length - 1];
-        this.bot.whisper(memberNumber,
-            `Hi ${name}! Here's an update on your most recent suggestion:\n` +
-            `"${latest.text}" — ${FEEDBACK_STATUS_LABELS[latest.status] ?? latest.status}\n\n` +
-            `Thanks for helping us improve the game! 💕`
+        const itemsToShow = entry.items.filter(item =>
+            !(RESOLVED_FEEDBACK_STATUSES.has(item.status) && item.statusShown)
         );
+        if (itemsToShow.length === 0) return;
+
+        const lines = itemsToShow.map((item, i) =>
+            `${i + 1}. "${item.text}" — ${FEEDBACK_STATUS_LABELS[item.status] ?? item.status}`
+        );
+
+        this.sendLongWhisper(memberNumber,
+            `Hi ${name}! Here's an update on the feedback you've sent us:\n` +
+            lines.join("\n") +
+            `\n\nThanks for helping us improve the game! 💕`
+        );
+
+        let changed = false;
+        for (const item of itemsToShow) {
+            if (RESOLVED_FEEDBACK_STATUSES.has(item.status) && !item.statusShown) {
+                item.statusShown = true;
+                changed = true;
+            }
+        }
+        if (changed) this.saveFeedbackStatus();
     }
 
     // Whispers tend to get silently dropped by the BC server if they exceed

@@ -132,12 +132,17 @@ export interface PlayerRecord {
     feedbackGiven: boolean;
 }
 
-export type FeedbackItemStatus = "reviewing" | "testing" | "implemented" | "partly_implemented";
+export type FeedbackItemStatus = "pending" | "reviewing" | "testing" | "implemented" | "declined" | "partly_implemented";
 
 export interface FeedbackItem {
     timestamp: string;
     text: string;
     status: FeedbackItemStatus;
+    // Resolved statuses (implemented/declined/partly_implemented) are only
+    // whispered to the submitter once; this flag is set after that whisper
+    // so the entry isn't repeated on later joins. Pending entries are never
+    // marked shown.
+    statusShown?: boolean;
 }
 
 export interface FeedbackStatusEntry {
