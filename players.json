@@ -1,1 +1,38 @@
-{}
+{
+  "42254": {
+    "memberNumber": 42254,
+    "name": "Lupa",
+    "firstSeen": "2026-06-14T21:17:53.504-05:00",
+    "lastSeen": "2026-06-14T21:17:53.504-05:00",
+    "gamesPlayed": 1,
+    "gamesWon": 0,
+    "feedbackGiven": false
+  },
+  "162142": {
+    "memberNumber": 162142,
+    "name": "Sophie",
+    "firstSeen": "2026-06-14T21:15:26.812-05:00",
+    "lastSeen": "2026-06-14T21:15:26.812-05:00",
+    "gamesPlayed": 0,
+    "gamesWon": 0,
+    "feedbackGiven": false
+  },
+  "208543": {
+    "memberNumber": 208543,
+    "name": "Missy",
+    "firstSeen": "2026-06-14T18:29:53.446-05:00",
+    "lastSeen": "2026-06-15T22:35:31.830-05:00",
+    "gamesPlayed": 2,
+    "gamesWon": 2,
+    "feedbackGiven": false
+  },
+  "247062": {
+    "memberNumber": 247062,
+    "name": "MissyMissy",
+    "firstSeen": "2026-06-14T18:29:29.852-05:00",
+    "lastSeen": "2026-06-15T22:35:31.831-05:00",
+    "gamesPlayed": 1,
+    "gamesWon": 0,
+    "feedbackGiven": false
+  }
+}

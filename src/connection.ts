@@ -228,6 +228,7 @@ export class BCConnection {
             "ChatRoomSyncMemberLeave",
             "ChatRoomMessage",
             "ChatRoomSyncItem",
+            "ChatRoomSyncSingle",
             "ChatRoomSyncCharacter",
             "ChatRoomSyncExpression",
             "ServerInfo",
@@ -250,6 +251,10 @@ export class BCConnection {
 
     public onItemChange(handler: (data: any) => void): void {
         this.socket.on("ChatRoomSyncItem", handler);
+    }
+
+    public onSyncSingle(handler: (data: any) => void): void {
+        this.socket.on("ChatRoomSyncSingle", handler);
     }
 
     public onMemberJoin(handler: (data: any) => void): void {

@@ -52,6 +52,15 @@ async function main() {
         const memberNumber: number = data.Sender;
         const name = getNameFor(memberNumber);
 
+        // BC delivers a safeword as an Action message, not a dedicated event.
+        if (data.Type === "Action" &&
+            (data.Content === "ActionActivateSafewordRevert" ||
+                data.Content === "ActionActivateSafewordReleaseAll")) {
+            log(`Safeword detected from ${name} (#${memberNumber}): ${data.Content}`);
+            game.handleSafewordUsed(memberNumber);
+            return;
+        }
+
         if (data.Type === "Whisper") {
             const msg = stripOOC(data.Content);
             log(`Whisper from ${name} (#${memberNumber}): ${msg}`);
@@ -111,13 +120,17 @@ async function main() {
         const name = data.Character?.Nickname || data.Character?.Name || `Player #${memberNumber}`;
         log(`${name} (#${memberNumber}) joined the room.`);
         roomMembers.set(memberNumber, { memberNumber, name });
-        game.onMemberJoin(memberNumber, name);
+        game.onMemberJoin(memberNumber, name, data.Character);
     });
 
     bot.onMemberLeave((data: BCMemberEvent) => {
         const memberNumber = data.SourceMemberNumber;
         log(`Member #${memberNumber} left the room.`);
         roomMembers.delete(memberNumber);
+    });
+
+    bot.onSyncSingle((data: any) => {
+        game.onSyncSingle(data);
     });
 
     bot.onReconnect(() => {

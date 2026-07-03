@@ -12,17 +12,20 @@ export function centralTimestamp(): string {
     return centralNow().toISOString().replace("Z", "-05:00");
 }
 
+// HH:MM:SS in US Central time. Built from the UTC ISO string rather than
+// toLocaleTimeString so it isn't double-shifted by the system's local timezone.
+function centralTimeString(): string {
+    return centralNow().toISOString().substring(11, 19);
+}
+
 export function log(msg: string): void {
-    const time = centralNow().toLocaleTimeString();
-    console.log(`[${time}] ${msg}`);
+    console.log(`[${centralTimeString()}] ${msg}`);
 }
 
 export function logError(msg: string): void {
-    const time = centralNow().toLocaleTimeString();
-    console.error(`[${time}] ERROR: ${msg}`);
+    console.error(`[${centralTimeString()}] ERROR: ${msg}`);
 }
 
 export function logEvent(event: string, data?: any): void {
-    const time = centralNow().toLocaleTimeString();
-    console.log(`[${time}] EVENT: ${event}`, JSON.stringify(data, null, 2));
+    console.log(`[${centralTimeString()}] EVENT: ${event}`, JSON.stringify(data, null, 2));
 }
