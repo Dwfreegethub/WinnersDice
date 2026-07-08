@@ -59,36 +59,19 @@
 
 _(add items here as they come up during playtesting)_
 
-### End Game — Winner-Initiated (from bank/shop)
-When the winner calls end game from the bank, the bot runs a structured negotiation:
+### End Game — Winner-Initiated (from bank/shop) — IMPLEMENTED
+See `Completed` below — the 5-question proposal, up-to-5-step negotiation, block/execution flow, lock-time vote, timer/password lock, and safeword/reset teardown are all in `game.ts`. Remaining open items from the original design, now tracked as their own TODOs:
 
-**Winner's proposal (bot asks a series of questions):**
-1. How many points do you want to spend toward time? (points → time, non-1:1 ratio, TBD)
-2. Stay in this room or take the loser somewhere else?
-3. If staying: public (open for others to watch/participate) or private?
-4. Locks on the loser? (which slots, what type — timer locks for time tracking, password locks hand password to winner)
-5. Free-text description of what the winner plans to do
+- **Per-pair points bank** — currently a stub (see "End game per-pair bank" below); points committed on execution/block are just deducted and logged, not persisted anywhere.
+- **`!points` command** — not implemented; players currently only see balances via the whispers sent at the start of the end game proposal and inside the delivered proposal, not on demand.
 
-**Loser's response:**
-- Both players can see each other's point balances at the top of the proposal
-- Loser can spend points to reduce the time, or spend enough to cancel the end game entirely
-- One round of back-and-forth adjustment allowed
+- **End game anti-stalling**: consider requiring each counter to close at least 25% of the gap between the two sides' positions. Only implement if stalling becomes a real problem in playtesting.
 
-**If blocked (loser spends enough to cancel):**
-- Both players lose ALL points spent on the proposal and the block — no refunds
-- Game continues as normal
+- **End game save/resume**: when safeword or reset is called during active end game, consider saving the agreed terms so the session can be resumed later. Design TBD.
 
-**If accepted:**
-- Terms execute: timer locks placed, password locks give password to winner
-- Note: investigate whether BC has a dedicated slot for timer locks just for time tracking
-- Leftover points from both players bank to a per-player-pair persistent account
+- **End game per-pair bank**: `executeEndGame()` currently just deducts both sides' committed points and logs a `[STUB]` line — implement the persistent per-pair points bank described above instead of discarding them.
 
-**Per-pair points bank:**
-- Points persist across sessions between those exact two players
-- Future idea: "public points" usable against any opponent, but earned/spent at higher cost
-
-**`!points` command (also needed in regular shop):**
-- Show both players' current balances — needed for informed decision-making in end-game negotiation
+- **End game timer/password lock slot**: `bc_items.json` has no literal "ItemLeash" BC group — `executeEndGame()`/`expireEndGame()` currently use `ItemNeckRestraints` + `CollarLeash` as a stand-in. Revisit once there's a clearer idea of what BC asset should represent the timer lock.
 
 ---
 
@@ -116,6 +99,7 @@ When the winner calls end game from the bank, the bot runs a structured negotiat
 - Wrap unprotected `fs` calls in try/catch and log failures: `saveFeedbackStatus()`, `savePlayerRecords()`, `handleFeedback()`'s `fs.appendFileSync`, `checkPendingUpdate()`'s `fs.unlinkSync`
 - Fix `logger.ts` double timezone-shift bug (ported BD's `centralTimeString()` pattern)
 - Fix feedback rejoin regression with `REVIEWING_FEEDBACK_STATUSES` + `reviewingAckDate` de-dup pattern (ported from BD)
+- End game: 5-question winner proposal, up-to-5-step time negotiation with the loser, block/execution outcomes, a 30-second lock-time vote (loser(s) nudge the suggested duration ±5 min per vote before it's applied), timer/password lock on the loser's leash slot plus optional extra lock slots, and safeword/reset teardown (per-pair bank still a stub — see Queued Features)
 
 ---
 
