@@ -20,6 +20,7 @@ import {
     GameConfig,
     GameState,
     LockDeal,
+    MercyRequest,
     NegotiationKey,
     NegotiationState,
     PlayerRecord,
@@ -497,6 +498,8 @@ export class WinnersDiceGame {
             awaitingBoostLevel: null,
             awaitingBuyback: null,
             waitingForWardrobe: null,
+            mercyRequest: null,
+            mercyCooldowns: new Map(),
         };
     }
 
@@ -583,6 +586,9 @@ export class WinnersDiceGame {
             case "!endgame":
                 this.handleEndgame(sender);
                 break;
+            case "!mercy":
+                this.handleMercyCommand(sender);
+                break;
             case "!reset":
                 this.handleReset(sender);
                 break;
@@ -635,6 +641,18 @@ export class WinnersDiceGame {
         // the timer/password lock goes on) only accepts 1/2/3 replies from
         // the losers being polled.
         if (this.state.endGameLockVote && this.handleEndGameLockVoteMessage(sender, msg)) {
+            return;
+        }
+
+        // An in-progress !mercy request pauses everything else — route both
+        // players' messages through it first, same as the end game proposal.
+        if (this.state.mercyRequest && this.handleMercyMessage(sender, msg, lower)) {
+            return;
+        }
+
+        // "mercy" spoken conversationally is equivalent to !mercy.
+        if (lower === "mercy" && this.state.phase === "playing" && !this.state.mercyRequest) {
+            this.handleMercyCommand(sender);
             return;
         }
 
@@ -778,7 +796,8 @@ export class WinnersDiceGame {
             `Only the winner of a roll gets to choose what's next — the loser waits.\n` +
             `bank - Lock in your pot and ask what's next (spend / continue / endgame) (!bank also works)\n` +
             `press / roll / roll again - Keep your streak and roll again in the same round, risking it all (!press also works)\n` +
-            `endgame - Call the match early (after the minimum rounds) (!endgame also works)\n\n` +
+            `endgame - Call the match early (after the minimum rounds) (!endgame also works)\n` +
+            `mercy - Ask to concede early, forfeiting half your points and owing a service (after the minimum rounds) (!mercy also works)\n\n` +
             `=== Streaks, Boosts & Curses ===\n` +
             `Winning a roll adds your dice + streak + boost to your pot, then × the round multiplier.\n` +
             `Rolling a Natural 20 adds +2 to your streak instead of +1 (announced in chat).\n` +
@@ -945,6 +964,8 @@ export class WinnersDiceGame {
             awaitingBoostLevel: null,
             awaitingBuyback: null,
             waitingForWardrobe: null,
+            mercyRequest: null,
+            mercyCooldowns: new Map(),
         };
 
         this.bot.sendChat(`${challenger.name} has challenged ${opponent.name} to WinnersDice!`);
@@ -1470,6 +1491,8 @@ export class WinnersDiceGame {
             awaitingBoostLevel: null,
             awaitingBuyback: null,
             waitingForWardrobe: null,
+            mercyRequest: null,
+            mercyCooldowns: new Map(),
         };
 
         const summary = [
@@ -1622,6 +1645,7 @@ export class WinnersDiceGame {
         const state = this.state;
         if (state.phase !== "playing" || !state.players || !state.config || state.awaitingDecision !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByMercy(sender)) return;
 
         const winner = state.players.find(p => p.memberNumber === sender)!;
         winner.balance += state.pot;
@@ -1670,6 +1694,7 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || !state.config) return;
 
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByMercy(sender)) return;
 
         if (state.spendMenuOpen) {
             this.handleSpendMenuChoice(sender, lower, raw);
@@ -1706,6 +1731,7 @@ export class WinnersDiceGame {
         const state = this.state;
         if (state.phase !== "playing" || !state.players || state.awaitingDecision !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByMercy(sender)) return;
 
         const winner = state.players.find(p => p.memberNumber === sender)!;
 
@@ -1758,6 +1784,7 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || !state.config) return;
         if (state.awaitingDecision !== sender && state.awaitingPostBank !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByMercy(sender)) return;
         if (state.endGameProposal || state.endGameLockVote || state.activeEndGame) return;
 
         if (state.currentRound < state.config.minRounds) {
@@ -1817,6 +1844,229 @@ export class WinnersDiceGame {
         this.recordGameCompletion(finalWinnerMemberNumber, [p1, p2]);
 
         this.clearPendingWardrobeChecks();
+        this.releaseAllActiveLocks();
+        this.releaseAllActiveBondage();
+        this.releaseActiveToy();
+        this.state = this.createIdleState();
+
+        this.checkPendingUpdate();
+    }
+
+    // ============================================================
+    // MERCY / CONCESSION
+    // ============================================================
+    //
+    // Either player can whisper !mercy (or just "mercy") once minRounds is
+    // reached to offer to end the game early: they forfeit 50% of their
+    // points and owe the other player a service of their choosing. The
+    // other player ("winner" below, i.e. whoever mercy is being requested
+    // from) can reject (the requester gets a one-round cooldown) or accept
+    // and negotiate the service's duration through a single counter-offer.
+    // ============================================================
+
+    private handleMercyCommand(sender: number): void {
+        const state = this.state;
+        if (state.phase !== "playing" || !state.players || !state.config) return;
+        if (!state.players.some(p => p.memberNumber === sender)) return;
+        if (this.blockedByWardrobe(sender)) return;
+
+        if (state.mercyRequest) {
+            this.bot.whisper(sender, "A mercy request is already in progress.");
+            return;
+        }
+
+        if (state.endGameProposal || state.endGameLockVote || state.activeEndGame ||
+            state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal) {
+            this.bot.whisper(sender, "Can't request mercy while another negotiation is in progress.");
+            return;
+        }
+
+        const cooldownRound = state.mercyCooldowns.get(sender);
+        if (cooldownRound !== undefined && state.currentRound < cooldownRound) {
+            this.bot.whisper(sender, "Your last mercy request was rejected — you can't ask again until next round.");
+            return;
+        }
+
+        if (state.currentRound < state.config.minRounds) {
+            this.bot.whisper(sender, `Mercy isn't available until the minimum of ${state.config.minRounds} rounds is complete.`);
+            return;
+        }
+
+        state.mercyRequest = {
+            requesterId: sender,
+            stage: "awaiting_details",
+            serviceText: null,
+            winnerDuration: null,
+            concederCounter: null,
+        };
+
+        this.bot.whisper(sender,
+            "⚠️ **Mercy request** — You're asking to end the game early. If accepted, you'll forfeit **50% of your current points** " +
+            "and owe your opponent a service or punishment of their choosing. This is the fastest way to exit a game if you have a " +
+            "reason to stop without calling safeword. To proceed, whisper me your reason for ending and what you're offering as a " +
+            "service. If you've changed your mind, whisper **cancel** to withdraw the request."
+        );
+    }
+
+    // Dispatches a message to the in-progress mercy request. Returns true if
+    // the message was consumed — only intercepts messages from whichever
+    // player is relevant to the current stage; anything else falls through
+    // to the normal conversational handling.
+    private handleMercyMessage(sender: number, raw: string, lower: string): boolean {
+        const req = this.state.mercyRequest;
+        if (!req || !this.state.players) return false;
+
+        const conceder = this.state.players.find(p => p.memberNumber === req.requesterId)!;
+        const winner = this.state.players.find(p => p.memberNumber !== req.requesterId)!;
+
+        if (sender === conceder.memberNumber && lower.trim() === "cancel"
+            && (req.stage === "awaiting_details" || req.stage === "awaiting_winner_response")) {
+            this.state.mercyRequest = null;
+            this.bot.whisper(conceder.memberNumber, "Mercy request withdrawn.");
+            if (req.stage === "awaiting_winner_response") {
+                this.bot.whisper(winner.memberNumber, `${conceder.name} withdrew their mercy request.`);
+            }
+            return true;
+        }
+
+        switch (req.stage) {
+            case "awaiting_details": {
+                if (sender !== conceder.memberNumber) return false;
+                const text = raw.trim();
+                if (!text) return true;
+
+                req.serviceText = text;
+                req.stage = "awaiting_winner_response";
+                this.bot.whisper(winner.memberNumber,
+                    `🏳️ **${conceder.name} is requesting mercy** and wants to end the game early. They've offered: "${text}" ` +
+                    `If you accept, they lose 50% of their points and you bank everything. You'll then name a duration for the ` +
+                    `service. Please keep it reasonable — this is someone choosing accountability over safeword. Reply **accept** ` +
+                    `or **reject**.`
+                );
+                return true;
+            }
+
+            case "awaiting_winner_response": {
+                if (sender !== winner.memberNumber) return false;
+                const trimmed = lower.trim();
+
+                if (trimmed === "accept" || trimmed === "yes" || trimmed === "y") {
+                    req.stage = "awaiting_duration";
+                    this.bot.whisper(winner.memberNumber, `Name a duration for the service (e.g. '30 minutes', '1 hour').`);
+                    return true;
+                }
+                if (trimmed === "reject" || trimmed === "no" || trimmed === "n" || trimmed === "decline") {
+                    this.state.mercyCooldowns.set(conceder.memberNumber, this.state.currentRound + 1);
+                    this.state.mercyRequest = null;
+                    this.bot.whisper(conceder.memberNumber,
+                        `${winner.name} rejected your mercy request. The game continues — you can ask again next round.`);
+                    this.bot.whisper(winner.memberNumber, `You rejected ${conceder.name}'s mercy request. The game continues.`);
+                    return true;
+                }
+                this.bot.whisper(winner.memberNumber, `Please reply **accept** or **reject**.`);
+                return true;
+            }
+
+            case "awaiting_duration": {
+                if (sender !== winner.memberNumber) return false;
+                const text = raw.trim();
+                if (!text) return true;
+
+                req.winnerDuration = text;
+                req.stage = "awaiting_conceder_response";
+                this.bot.whisper(conceder.memberNumber,
+                    `${winner.name} proposes a duration of **${text}** for your service. You may **accept** or make a ` +
+                    `**counter** offer once. If your counter is rejected, the original time stands.`
+                );
+                return true;
+            }
+
+            case "awaiting_conceder_response": {
+                if (sender !== conceder.memberNumber) return false;
+                const trimmed = lower.trim();
+
+                if (trimmed === "accept" || trimmed === "yes" || trimmed === "y") {
+                    this.resolveMercy(req, req.winnerDuration!);
+                    return true;
+                }
+
+                const counterMatch = trimmed.match(/^counter(?:\s+(.+))?$/);
+                if (counterMatch) {
+                    const valueText = raw.trim().replace(/^counter\s*/i, "").trim();
+                    if (!valueText) {
+                        this.bot.whisper(conceder.memberNumber, `What duration would you like to counter with?`);
+                        return true;
+                    }
+                    req.concederCounter = valueText;
+                    req.stage = "awaiting_winner_counter_response";
+                    this.bot.whisper(winner.memberNumber,
+                        `${conceder.name} counters with a duration of **${valueText}**. Reply **accept** or **reject** — ` +
+                        `if rejected, the original time of ${req.winnerDuration} stands.`
+                    );
+                    return true;
+                }
+
+                this.bot.whisper(conceder.memberNumber, `Please reply **accept** or **counter <duration>**.`);
+                return true;
+            }
+
+            case "awaiting_winner_counter_response": {
+                if (sender !== winner.memberNumber) return false;
+                const trimmed = lower.trim();
+
+                if (trimmed === "accept" || trimmed === "yes" || trimmed === "y") {
+                    this.resolveMercy(req, req.concederCounter!);
+                    return true;
+                }
+                if (trimmed === "reject" || trimmed === "no" || trimmed === "n" || trimmed === "decline") {
+                    this.resolveMercy(req, req.winnerDuration!);
+                    return true;
+                }
+                this.bot.whisper(winner.memberNumber, `Please reply **accept** or **reject**.`);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Settles an accepted mercy request: the conceder forfeits 50% of their
+    // current points (rounded down) to the winner, who also banks any
+    // unclaimed pot as part of the concession, then the match ends — same
+    // teardown as a normal bank/end (finishMatch).
+    private resolveMercy(req: MercyRequest, finalDuration: string): void {
+        const state = this.state;
+        if (!state.players) return;
+
+        const conceder = state.players.find(p => p.memberNumber === req.requesterId)!;
+        const winner = state.players.find(p => p.memberNumber !== req.requesterId)!;
+
+        // Commit any balance still sitting in an active spend session before
+        // computing the forfeiture, so nothing already spent is double-counted.
+        if (state.awaitingPostBank === conceder.memberNumber) conceder.balance = state.spendingBalance;
+        if (state.awaitingPostBank === winner.memberNumber) winner.balance = state.spendingBalance;
+
+        let banked = 0;
+        if (state.pot > 0) {
+            banked += state.pot;
+            state.pot = 0;
+        }
+
+        const forfeited = Math.floor(conceder.balance * 0.5);
+        conceder.balance -= forfeited;
+        winner.balance += forfeited + banked;
+        const totalBanked = forfeited + banked;
+
+        this.bot.sendChat(
+            `🏳️ ${conceder.name} conceded the game. ${winner.name} banks ${totalBanked} points. ` +
+            `${conceder.name} owes: "${req.serviceText}" for ${finalDuration}.`
+        );
+
+        this.state.mercyRequest = null;
+        this.recordGameCompletion(winner.memberNumber, state.players);
+
+        this.clearPendingWardrobeChecks();
+        this.clearEndGameState();
         this.releaseAllActiveLocks();
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
@@ -3022,6 +3272,14 @@ export class WinnersDiceGame {
         const waiting = this.state.waitingForWardrobe;
         if (!waiting) return false;
         this.bot.whisper(sender, `⏳ The game is paused until ${this.playerName(waiting.memberNumber)} updates their wardrobe.`);
+        return true;
+    }
+
+    // A pending mercy request pauses bank/press/endgame for both players
+    // until it's resolved (accepted/rejected/cancelled) — see handleMercyMessage.
+    private blockedByMercy(sender: number): boolean {
+        if (!this.state.mercyRequest) return false;
+        this.bot.whisper(sender, `⏳ The game is paused while a mercy request is being decided.`);
         return true;
     }
 

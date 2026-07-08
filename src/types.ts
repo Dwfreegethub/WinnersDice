@@ -403,6 +403,17 @@ export interface EndGameLockVote {
     timeout: NodeJS.Timeout;
 }
 
+// The requester's !mercy concession request, walking through the winner's
+// accept/reject and the subsequent duration negotiation (see game.ts's
+// handleMercyCommand/handleMercyMessage/resolveMercy).
+export interface MercyRequest {
+    requesterId: number;
+    stage: "awaiting_details" | "awaiting_winner_response" | "awaiting_duration" | "awaiting_conceder_response" | "awaiting_winner_counter_response";
+    serviceText: string | null;
+    winnerDuration: string | null;
+    concederCounter: string | null;
+}
+
 export interface GameState {
     phase: GamePhase;
     config: GameConfig | null;
@@ -462,6 +473,11 @@ export interface GameState {
     // Set after a clothing deal or buyback closes, while waiting for the
     // named member to update their wardrobe. Blocks all game commands.
     waitingForWardrobe: { memberNumber: number; item: string; timeoutAt: number } | null;
+    // In-progress !mercy concession request, if any.
+    mercyRequest: MercyRequest | null;
+    // Member number -> round number a rejected requester must wait until
+    // before they can request mercy again (see handleMercyCommand).
+    mercyCooldowns: Map<number, number>;
 }
 
 // A single player's d20 roll for a roll, including their streak/boost
