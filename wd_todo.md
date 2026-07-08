@@ -11,6 +11,9 @@
 
 ## Queued Features / Changes
 
+- **Challenge acceptance prompt**
+  When a player is challenged, the first thing the bot asks them is whether they accept the challenge (yes/no) before proceeding to any negotiation or game setup.
+
 - **Banking + clothing menus whisper-only**
   All bank menus (continue/spend/endgame), spend menus, and clothing negotiation messages should be sent via whisper, not public chat. Currently some of these go to chat.
 
@@ -35,7 +38,57 @@
     - Possible guard: forced sale price is capped at buyer's current spendingBalance, or counter offers above a reasonable ceiling are rejected by the bot
   - These edge cases need design thought before coding — DW to revisit
 
+- **Context-sensitive `!help`**
+  `!help` should respond based on current game phase rather than always showing the full help text.
+  - Pre-game / idle: full help, possibly broken into submenus (like StripDiceBot's help is structured)
+  - Mid-round (phase = `"playing"`, `awaitingDecision` is set): show roll/gameplay help only
+  - Banking phase (`awaitingPostBank` is set): show banking options help only
+  - Negotiation phase: show negotiation commands help only
+  Reference BD's help subcommand structure in `D:\Games\BC-Bot\StripDiceBot\src\` for the submenu pattern.
+
+### Toys — shop option for the active banker (future feature)
+- The player currently in the bank (spending phase) can buy toys to use on their opponent
+- Items include: vibrator, feather, BDSM implements
+- Each toy has a point cost and a duration (time the toy can be applied/used)
+- Similar to the bondage shop option, but for toys/implements rather than restraints
+- Design questions still open:
+  - Exact item list and BC asset names
+  - Cost and duration values per item
+  - Whether duration is in rounds or real time
+  - Whether the toy gets removed automatically by the bot (like exclusive locks) or has a manual removal flow
+
 _(add items here as they come up during playtesting)_
+
+### End Game — Winner-Initiated (from bank/shop)
+When the winner calls end game from the bank, the bot runs a structured negotiation:
+
+**Winner's proposal (bot asks a series of questions):**
+1. How many points do you want to spend toward time? (points → time, non-1:1 ratio, TBD)
+2. Stay in this room or take the loser somewhere else?
+3. If staying: public (open for others to watch/participate) or private?
+4. Locks on the loser? (which slots, what type — timer locks for time tracking, password locks hand password to winner)
+5. Free-text description of what the winner plans to do
+
+**Loser's response:**
+- Both players can see each other's point balances at the top of the proposal
+- Loser can spend points to reduce the time, or spend enough to cancel the end game entirely
+- One round of back-and-forth adjustment allowed
+
+**If blocked (loser spends enough to cancel):**
+- Both players lose ALL points spent on the proposal and the block — no refunds
+- Game continues as normal
+
+**If accepted:**
+- Terms execute: timer locks placed, password locks give password to winner
+- Note: investigate whether BC has a dedicated slot for timer locks just for time tracking
+- Leftover points from both players bank to a per-player-pair persistent account
+
+**Per-pair points bank:**
+- Points persist across sessions between those exact two players
+- Future idea: "public points" usable against any opponent, but earned/spent at higher cost
+
+**`!points` command (also needed in regular shop):**
+- Show both players' current balances — needed for informed decision-making in end-game negotiation
 
 ---
 
@@ -60,6 +113,9 @@ _(add items here as they come up during playtesting)_
 - Conversational commands (yes/no/counter without !)
 - Round vs roll distinction + round multiplier
 - Bot or self-roll mode
+- Wrap unprotected `fs` calls in try/catch and log failures: `saveFeedbackStatus()`, `savePlayerRecords()`, `handleFeedback()`'s `fs.appendFileSync`, `checkPendingUpdate()`'s `fs.unlinkSync`
+- Fix `logger.ts` double timezone-shift bug (ported BD's `centralTimeString()` pattern)
+- Fix feedback rejoin regression with `REVIEWING_FEEDBACK_STATUSES` + `reviewingAckDate` de-dup pattern (ported from BD)
 
 ---
 
@@ -67,17 +123,10 @@ _(add items here as they come up during playtesting)_
 
 _Source: `bc_bot_framework_report.md` prioritized action list (§5). Live-risk items first — fix these before the framework extraction (see `StripDiceBot/todo_framework.md`)._
 
-### Live risk — fix first
-- [ ] **Wrap unprotected `fs` calls in try/catch and log failures**: `saveFeedbackStatus()` (`game.ts:1993-1995`), `savePlayerRecords()` (`game.ts:2094-2096`), `handleFeedback()`'s `fs.appendFileSync` (`game.ts:1907`), `checkPendingUpdate()`'s `fs.unlinkSync` (`game.ts:2169`) — match BD's pattern. Because the top-level `unhandledRejection`/`uncaughtException` handlers call `process.exit(1)`, a single transient disk error during something as routine as saving a feedback note currently kills the whole bot mid-match for every player in the room.
-- [ ] **Fix `logger.ts` double timezone-shift bug** — `log()`/`logError()` (`logger.ts:16-17, 20-21`) call `.toLocaleTimeString()` on a `Date` already shifted by `centralNow()`, re-applying the host machine's local timezone on top. Port BD's `centralTimeString()` fix verbatim (`StripDiceBot/src/logger.ts:19-24`).
-- [ ] **Fix feedback rejoin regression** — `notifyFeedbackStatus()` (`game.ts:1997-2026`) has no de-duplication, so a player with unresolved feedback gets the full "we're reviewing it" whisper every single time they rejoin the room. Port BD's `REVIEWING_FEEDBACK_STATUSES` + `reviewingAckDate` de-dup pattern (`StripDiceBot/src/game.ts:2639-2650`).
-
 ### Quick wins
 - [ ] Deduplicate the room-config literal in `connection.ts`'s `joinRoom()` (139-155) and `makeRoomPrivate()` (157-176) using BD's existing `roomConfig()` helper pattern (`StripDiceBot/src/connection.ts:147-162`)
 - [ ] Replace raw `console.error('[CRASH] ...', err)` in `index.ts`'s crash handlers (`index.ts:8-16`) with `logError()` so crash logs get the project's standard timestamp formatting like every other log line
 
 ### Medium effort
 - [ ] Split `handleConversational()` (`game.ts:329-425`, ~96 lines) by game phase: in-progress clothing-deal dispatch, post-bank free-text answers, mid-negotiation counter-value capture, mid-negotiation numeric-proposal capture, plain-English yes/no/counter/roll synonyms
-- [ ] Design and add a turn/inactivity timeout for "self" roll mode — `playRound()` (`game.ts:882-897`) and `handleRoll()` (`game.ts:899-935`) wait indefinitely if either player goes AFK, hanging the match. No existing BD pattern to port 1:1 (BD's turn timer is tied to its enum-based turn engine) — needs its own small design pass.
 - [ ] Add `gamesLost` field + a `!leaderboard` command for parity with BD — `PlayerRecord` in `types.ts:231-239` currently has no `gamesLost`; BD's leaderboard command is at `StripDiceBot/src/game.ts:2564-2590`
-- [ ] Add a top-of-file negotiation-protocol overview comment — `NegotiationState`, `nextNegotiationKey()`, `promptNextSetting()`, `handlePropose/Accept/Counter/Decline` are each commented locally, but nothing explains up front that three different sub-protocols cycle through the same state (yes/no toggles, propose/accept/counter/decline, final plain bot/self question)

@@ -3,6 +3,7 @@ import * as path from "path";
 import { BCConnection } from "./connection";
 import { WinnersDiceGame } from "./game";
 import { log, logError } from "./logger";
+import { decodeMessage } from "./decodeMessage";
 import { Player, BCChatMessage, BCRoomSync, BCMemberEvent } from "./types";
 
 process.on('uncaughtException', (err) => {
@@ -62,13 +63,13 @@ async function main() {
         }
 
         if (data.Type === "Whisper") {
-            const msg = stripOOC(data.Content);
+            const msg = stripOOC(decodeMessage(data));
             log(`Whisper from ${name} (#${memberNumber}): ${msg}`);
             game.handleChatMessage(memberNumber, msg, true);
         }
 
         if (data.Type === "Chat") {
-            const msg = stripOOC(data.Content);
+            const msg = stripOOC(decodeMessage(data));
             game.handleChatMessage(memberNumber, msg, false);
         }
     });

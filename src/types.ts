@@ -62,19 +62,17 @@ export interface GameConfig {
     stripping: boolean;
     bondage: boolean;
     bondageAppliedBy: BondageAppliedBy | null;
+    // TODO: not asked up front anymore — will be set per-purchase from the
+    // spend menu once bondage purchases are implemented. Defaults to 0.
     lockDuration: number;
     toys: boolean;
     services: boolean;
-    // "bot" = the bot rolls automatically each round; "self" = both players
-    // type !roll themselves each round.
-    rollMode: "bot" | "self";
     // Cap on each player's earned streak. Admin-settable via !setstreak between games.
     maxStreak: number;
 }
 
-// Settled via the !propose/!accept/!counter/!decline flow (or the yes/no
-// flow). rollMode is asked separately as a plain bot/self question.
-export type NegotiationKey = Exclude<keyof GameConfig, "rollMode">;
+// Settled via the !propose/!accept/!counter/!decline flow (or the yes/no flow).
+export type NegotiationKey = keyof GameConfig;
 
 // A proposed value for one setting, awaiting a response from the other player.
 export interface NegotiationProposal {
@@ -86,6 +84,13 @@ export interface NegotiationProposal {
 export interface NegotiationState {
     challenger: Player;
     opponent: Player;
+    // "awaiting" -> the challenged player has been whispered and hasn't yet
+    // said whether they accept the challenge at all; "accepted" -> they said
+    // yes and normal negotiation (below) proceeds.
+    acceptanceStage: "awaiting" | "accepted";
+    // Fires if the challenged player doesn't answer in time; cleared as soon
+    // as they answer (or the challenge/negotiation is cancelled some other way).
+    acceptanceTimer: NodeJS.Timeout | null;
     config: Partial<GameConfig>;
     pending: NegotiationProposal | null;
     // Yes/no answers for the setting currently being asked, keyed by member number.
@@ -93,8 +98,14 @@ export interface NegotiationState {
     // Set while waiting for a player to send their counter-proposal value
     // after they typed "counter"/"!counter" with no value.
     awaitingCounterFrom: number | null;
-    // Roll-mode answers ("bot"/"self") for the final negotiation question, keyed by member number.
-    rollModeAnswers: Partial<Record<number, "bot" | "self">>;
+    // Tracks the single up-front "do you agree to all of this" consent question,
+    // asked once before the individual stripping/bondage/toys/services questions.
+    // "not_asked" -> ask it the next time a yes/no setting comes up; "awaiting" ->
+    // question sent, waiting on one or both replies; "done" -> resolved (either all
+    // four settings were enabled directly, or at least one player said no and the
+    // individual questions proceed as the fallback).
+    consentAllStage: "not_asked" | "awaiting" | "done";
+    consentAllAnswers: Partial<Record<number, boolean>>;
 }
 
 // An item this player has sold to their opponent, available to buy back
@@ -161,6 +172,178 @@ export interface ClothingDeal {
     stage: ClothingDealStage;
 }
 
+// A piece of bondage currently applied in a match. `slot` is the picker-facing
+// display name (see bondagePicker.ts PICK_SLOTS) — the BC item group is
+// derived from it via PICK_SLOTS rather than stored redundantly.
+export interface ActiveBondage {
+    slot: string;
+    itemName: string;
+    assetName: string; // BC asset name for removal — same as itemName in this catalog
+    placerMemberNumber: number;
+    wearerMemberNumber: number;
+    removalPrice?: number; // set once the wearer's buyback negotiation lands on a price
+}
+
+// An Exclusive lock the bot applied to a worn bondage item. The bot bypasses
+// BC's normal lock permissions entirely (apply/remove both go straight
+// through the socket), so this is purely bookkeeping for the removal price.
+export interface ActiveLock {
+    slot: string;
+    placerMemberNumber: number;
+    wearerMemberNumber: number;
+    // The price agreed during the lock deal negotiation. Removal costs a
+    // fixed multiple of this — the same multiplier as clothing buyback
+    // (see LOCK_REMOVAL_MULTIPLIER in game.ts).
+    agreedPrice: number;
+}
+
+export type LockDealStage =
+    // Waiting for the placer's slot choice (or "all").
+    | "awaiting_slot"
+    // Waiting for the placer to propose a removal price for the chosen slot(s).
+    | "awaiting_price"
+    // Waiting for the wearer to accept/decline/counter.
+    | "awaiting_opponent_response"
+    // Wearer said "counter" with no value — waiting for the number.
+    | "awaiting_opponent_counter_value"
+    // Waiting for the placer to accept/decline/counter the wearer's counter.
+    | "awaiting_buyer_counter_response"
+    // Placer said "counter" with no value — waiting for the number.
+    | "awaiting_buyer_counter_value";
+
+// In-progress lock purchase from the spend menu: the placer picks which of
+// the wearer's bondage slots to lock (or "all") and proposes a removal
+// price; the wearer and placer then negotiate through the structured 5-step
+// price negotiation (see applyInitiatorOffer/applyResponderCounter in
+// game.ts) — same shape as a bondage "apply" deal. Only on acceptance does
+// the bot actually apply the lock(s).
+export interface LockDeal {
+    placer: number;
+    wearer: number;
+    // Slot display names chosen to lock, resolved once stage moves to "awaiting_price".
+    slots: string[];
+    // The placer's (initiator's) most recent offer.
+    price: number | null;
+    // The wearer's (responder's) most recent counter.
+    counterPrice: number | null;
+    stage: LockDealStage;
+    // 0 before the placer's first offer; 1-5 tracking the structured
+    // negotiation steps described in game.ts (applyInitiatorOffer/applyResponderCounter).
+    negotiationStep: number;
+    // The placer's opening offer — their counters can never go below this.
+    initiatorFloor: number | null;
+    // The wearer's first counter — their later counters can never go above this.
+    responderCeiling: number | null;
+}
+
+export type BondageDealKind = "apply" | "removal";
+
+export type BondageDealStage =
+    // Waiting for the placer's slot choice (apply deals only).
+    | "awaiting_slot"
+    // Waiting for the placer's item choice (apply deals only).
+    | "awaiting_item"
+    // Placer typed a name that only fuzzy-matched (not exact) — waiting for
+    // yes/no confirmation before locking in the item.
+    | "awaiting_item_confirm"
+    // Waiting for the placer to name a price (both apply and removal deals).
+    | "awaiting_price"
+    // Waiting for the wearer to accept/decline/counter.
+    | "awaiting_opponent_response"
+    // Wearer said "counter" with no value — waiting for the number.
+    | "awaiting_opponent_counter_value"
+    // Waiting for the placer to accept/decline/counter the wearer's counter.
+    | "awaiting_buyer_counter_response"
+    // Placer said "counter" with no value — waiting for the number.
+    | "awaiting_buyer_counter_value";
+
+// In-progress bondage purchase (apply or paid removal), negotiated via the
+// spend menu (apply) or the !buybondage command (removal). The placer always
+// names the price first; the placer and wearer then negotiate through the
+// structured 5-step price negotiation (see applyInitiatorOffer/
+// applyResponderCounter in game.ts) and the wearer always pays/receives
+// according to deal kind.
+export interface BondageDeal {
+    kind: BondageDealKind;
+    placer: number;
+    wearer: number;
+    slot: string | null;
+    itemName: string | null;
+    itemOptions: string[];
+    // The placer's (initiator's) most recent offer.
+    price: number | null;
+    // The wearer's (responder's) most recent counter.
+    counterPrice: number | null;
+    stage: BondageDealStage;
+    // Candidate item name awaiting yes/no confirmation, set only when the
+    // placer's text only fuzzy-matched (startsWith/includes, not exact).
+    pendingFuzzyItem: string | null;
+    // 0 before the placer's first offer; 1-5 tracking the structured
+    // negotiation steps described in game.ts (applyInitiatorOffer/applyResponderCounter).
+    negotiationStep: number;
+    // The placer's opening offer — their counters can never go below this.
+    initiatorFloor: number | null;
+    // The wearer's first counter — their later counters can never go above this.
+    responderCeiling: number | null;
+}
+
+export type ToyDealStage =
+    // Waiting for the winner to pick a toy from the catalog.
+    | "awaiting_toy"
+    // Waiting for the winner to propose an initial price.
+    | "awaiting_price"
+    // Waiting for the loser to accept or counter (no decline option for toys).
+    | "awaiting_opponent_response"
+    // Loser said "counter" with no value — waiting for the number.
+    | "awaiting_opponent_counter_value"
+    // Waiting for the winner to accept/decline/counter the loser's counter.
+    | "awaiting_buyer_counter_response"
+    // Winner said "counter" with no value — waiting for the number.
+    | "awaiting_buyer_counter_value"
+    // Price is agreed — waiting for the winner to pick a duration in minutes.
+    | "awaiting_duration";
+
+// In-progress toy rental negotiated via the spend menu: the winner picks a
+// toy and proposes a price for the loser's consent, negotiated through the
+// same structured 5-step price negotiation as bondage/lock deals (see
+// applyInitiatorOffer/applyResponderCounter in game.ts) — except the loser
+// can only accept or counter, never decline outright. Once the price is
+// agreed, the winner picks a duration and the toy is placed on the WINNER
+// (see ActiveToy) rather than the loser.
+export interface ToyDeal {
+    winner: number;
+    loser: number;
+    toyAssetName: string | null;
+    toyLabel: string | null;
+    // The winner's (initiator's) most recent offer.
+    price: number | null;
+    // The loser's (responder's) most recent counter.
+    counterPrice: number | null;
+    stage: ToyDealStage;
+    // 0 before the winner's first offer; 1-5 tracking the structured
+    // negotiation steps described in game.ts (applyInitiatorOffer/applyResponderCounter).
+    negotiationStep: number;
+    // The winner's opening offer — their counters can never go below this.
+    initiatorFloor: number | null;
+    // The loser's first counter — their later counters can never go above this.
+    responderCeiling: number | null;
+    // The price agreed once negotiation concludes, held here while the
+    // winner picks a duration (stage "awaiting_duration").
+    agreedPrice: number | null;
+}
+
+// A toy currently placed on a match winner's ItemHandheld slot, rented from
+// their opponent for a fixed real-time duration. Only one can be active at a
+// time (per match) since it always occupies the same slot.
+export interface ActiveToy {
+    slot: "ItemHandheld";
+    assetName: string;
+    itemLabel: string;
+    holderMemberNumber: number;
+    timer: NodeJS.Timeout;
+    agreedPrice: number;
+}
+
 export interface GameState {
     phase: GamePhase;
     config: GameConfig | null;
@@ -184,9 +367,22 @@ export interface GameState {
     spendMenuOpen: boolean;
     // In-progress clothing purchase, if any.
     clothingDeal: ClothingDeal | null;
+    // In-progress bondage purchase (apply or paid removal), if any.
+    bondageDeal: BondageDeal | null;
+    // Bondage currently applied to either player in this match.
+    activeBondage: ActiveBondage[];
+    // Items a placer just removed for free, still eligible for a free
+    // re-apply (ALLOW_FREE_REAPPLY) as long as nothing new has filled the slot.
+    removableBondage: ActiveBondage[];
+    // Exclusive locks currently applied to either player's worn bondage.
+    activeLocks: ActiveLock[];
+    // In-progress lock purchase (negotiated via the spend menu), if any.
+    lockDeal: LockDeal | null;
+    // In-progress toy rental (negotiated via the spend menu), if any.
+    toyDeal: ToyDeal | null;
+    // The toy currently placed on a winner's ItemHandheld slot, if any.
+    activeToy: ActiveToy | null;
     negotiation: NegotiationState | null;
-    // In "self" roll mode, dice already rolled this round, keyed by member number.
-    pendingRolls: Partial<Record<number, number>> | null;
     // The awaitingPostBank player's balance during the current bank/spend
     // session. Initialized to their balance when the session starts; every
     // purchase deducts from this immediately, and it's committed back to
