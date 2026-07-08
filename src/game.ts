@@ -3889,7 +3889,7 @@ export class WinnersDiceGame {
     // ============================================================
 
     private isAdmin(memberNumber: number): boolean {
-        return memberNumber === secrets.adminMemberNumber || memberNumber === this.bot.getMemberNumber();
+        return secrets.adminMemberNumbers.includes(memberNumber) || memberNumber === this.bot.getMemberNumber();
     }
 
     private handleReset(sender: number): void {

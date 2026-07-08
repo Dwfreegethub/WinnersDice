@@ -17,7 +17,7 @@ reconnect handling, and basic player tracking). Game logic lives in
        username: "YourBotUsername",
        password: "YourBotPassword",
        roomName: "Winners Dice Game",
-       adminMemberNumber: 208543,
+       adminMemberNumbers: [208543],
    };
    ```
 3. `npm run build`
