@@ -1823,7 +1823,7 @@ export class WinnersDiceGame {
         const state = this.state;
         if (state.phase !== "playing" || !state.players || !state.config || state.awaitingDecision !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
-        if (this.blockedByServiceDeal(sender)) return;
+        if (this.blockedByShopDeal(sender)) return;
         if (this.blockedByMercy(sender)) return;
 
         const winner = state.players.find(p => p.memberNumber === sender)!;
@@ -1916,7 +1916,7 @@ export class WinnersDiceGame {
         const state = this.state;
         if (state.phase !== "playing" || !state.players || state.awaitingDecision !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
-        if (this.blockedByServiceDeal(sender)) return;
+        if (this.blockedByShopDeal(sender)) return;
         if (this.blockedByMercy(sender)) return;
 
         if (state.rollNumber >= MAX_ROLLS_PER_ROUND) {
@@ -1975,7 +1975,7 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || !state.config) return;
         if (state.awaitingDecision !== sender && state.awaitingPostBank !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
-        if (this.blockedByServiceDeal(sender)) return;
+        if (this.blockedByShopDeal(sender)) return;
         if (this.blockedByMercy(sender)) return;
         if (state.endGameProposal || state.endGameLockVote || state.activeEndGame) return;
 
@@ -3879,6 +3879,22 @@ export class WinnersDiceGame {
     private blockedByServiceDeal(sender: number): boolean {
         if (!this.state.serviceDeal) return false;
         this.bot.whisper(sender, "⏳ A service is in progress — game is paused.");
+        return true;
+    }
+
+    // True if any shop deal (clothing, bondage, lock, toy, or service) is
+    // currently being negotiated or is otherwise still active.
+    private hasActiveDeal(): boolean {
+        const state = this.state;
+        return !!(state.bondageDeal || state.clothingDeal || state.lockDeal || state.toyDeal || state.serviceDeal);
+    }
+
+    // Whispers `sender` that the game is paused if any shop deal is active.
+    // Returns true if the command should be blocked. Used to keep !bank,
+    // !press, and !endgame from orphaning a deal that's mid-negotiation.
+    private blockedByShopDeal(sender: number): boolean {
+        if (!this.hasActiveDeal()) return false;
+        this.bot.whisper(sender, "⏳ A shop deal is in progress — finish or cancel it first.");
         return true;
     }
 
