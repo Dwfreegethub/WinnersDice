@@ -2971,6 +2971,7 @@ export class WinnersDiceGame {
         const player = state.players.find(p => p.memberNumber === sender)!;
         state.awaitingBoostLevel = sender;
 
+        this.bot.sendChat(`⚡ ${this.playerName(sender)} is picking up a power-up...`);
         this.bot.whisper(sender,
             `A boost adds straight to your roll total and persists across rounds — it only drains by 1 each time you lose, so a +3 boost survives 3 losses.\n\n` +
             `Streak Boost prices:\n` +
@@ -3034,6 +3035,8 @@ export class WinnersDiceGame {
         const player = state.players.find(p => p.memberNumber === sender)!;
 
         state.awaitingBuyback = sender;
+
+        this.bot.sendChat(`💸 ${this.playerName(sender)} is trying to buy something back...`);
 
         if (player.soldItems.length === 1) {
             const sold = player.soldItems[0];
@@ -3136,6 +3139,7 @@ export class WinnersDiceGame {
             stage: "awaiting_item_price",
         };
 
+        this.bot.sendChat(`👗 ${this.playerName(buyer)} is eyeing ${this.playerName(opponent.memberNumber)}'s wardrobe...`);
         this.bot.whisper(buyer, "What would you like to buy and for how much? (e.g. 'I'd like their red dress for 50 points')");
     }
 
@@ -3411,6 +3415,7 @@ export class WinnersDiceGame {
             warningHandle: null,
         };
 
+        this.bot.sendChat(`🎭 ${this.playerName(buyer)} is browsing the services menu...`);
         this.bot.whisper(buyer, "What action or service would you like to request? Describe it and name your price in points.");
     }
 
@@ -4506,6 +4511,7 @@ export class WinnersDiceGame {
             initiatorFloor: null,
             responderCeiling: null,
         };
+        this.bot.sendChat(`🔒 ${this.playerName(sender)} is thinking about adding some extra security to ${this.playerName(wearer.memberNumber)}'s situation...`);
         this.bot.whisper(sender,
             `Which of ${wearer.name}'s items should get an Exclusive lock?\n` +
             lockable.map((b, i) => `${i + 1}. ${b.slot} — ${b.itemName}`).join("\n") +
@@ -4866,6 +4872,7 @@ export class WinnersDiceGame {
             agreedPrice: null,
         };
 
+        this.bot.sendChat(`🎲 ${this.playerName(winner)} has something devious in mind for ${this.playerName(loser.memberNumber)}...`);
         this.sendLongWhisper(winner,
             `Pick a toy:\n` +
             this.toyCatalog.map((t, i) => `${i + 1}. ${t.label}`).join("\n") +
