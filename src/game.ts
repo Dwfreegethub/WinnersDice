@@ -404,6 +404,22 @@ function parseToyCatalogLine(line: string): ToyCatalogEntry | null {
     return { assetName: trimmed.split(/\s+/)[0], label: trimmed };
 }
 
+// Curated popular toys shown by default in the toy picker, mirroring
+// buildBondagePickList's top-N list — toys have no per-item usage tracking,
+// so this is a static curated set instead of a usage-ranked one. Filled out
+// to PICK_LIST_TOP_N with random catalog picks not already in this list.
+const POPULAR_TOY_ASSET_NAMES = [
+    "Flogger",
+    "Crop",
+    "Paddle",
+    "Cane",
+    "Whip",
+    "Vibrator",
+    "VibratingWand",
+    "Feather",
+    "CattleProd",
+];
+
 // Missing/invalid file disables the toys menu option entirely (empty array)
 // rather than crashing the bot — mirrors loadBcItemCatalog's behavior.
 function loadToyCatalog(filePath: string, log: (message: string) => void): ToyCatalogEntry[] {
@@ -1447,7 +1463,7 @@ export class WinnersDiceGame {
         if (!deal) return;
 
         const otherParty = sender === deal.winner ? deal.loser : deal.winner;
-        const alreadyVisibleToBoth = deal.stage !== "awaiting_toy" && deal.stage !== "awaiting_price";
+        const alreadyVisibleToBoth = deal.stage !== "awaiting_toy" && deal.stage !== "awaiting_toy_confirm" && deal.stage !== "awaiting_price";
 
         this.bot.whisper(sender, "Toy deal cancelled.");
         if (alreadyVisibleToBoth) {
@@ -4900,13 +4916,18 @@ export class WinnersDiceGame {
     // real-time setTimeout.
     // ============================================================
 
-    private fuzzyMatchToy(input: string): { match?: ToyCatalogEntry; candidates?: ToyCatalogEntry[] } {
+    // Case-insensitive fuzzy match against the full toy catalog: exact
+    // (spaces stripped), then startsWith, then includes. Multiple hits ask
+    // the winner to clarify. Mirrors fuzzyMatchBondageItem. `exact: true` is
+    // only set for the exact tier — callers use this to decide whether the
+    // match needs a yes/no confirmation before it's used.
+    private fuzzyMatchToy(input: string): { match?: ToyCatalogEntry; exact?: boolean; candidates?: ToyCatalogEntry[] } {
         const norm = (s: string) => s.toLowerCase().replace(/[\s_-]/g, "");
         const q = norm(input);
         if (!q) return {};
 
         const exact = this.toyCatalog.filter(t => norm(t.label) === q);
-        if (exact.length >= 1) return { match: exact[0] };
+        if (exact.length >= 1) return { match: exact[0], exact: true };
         const starts = this.toyCatalog.filter(t => norm(t.label).startsWith(q));
         if (starts.length === 1) return { match: starts[0] };
         if (starts.length > 1) return { candidates: starts };
@@ -4914,6 +4935,42 @@ export class WinnersDiceGame {
         if (includes.length === 1) return { match: includes[0] };
         if (includes.length > 1) return { candidates: includes };
         return {};
+    }
+
+    // Top-N curated popular toys, filled out with random catalog items so
+    // the list is never sparse — mirrors buildBondagePickList.
+    private buildToyPickList(): { options: ToyCatalogEntry[]; hasRandom: boolean } {
+        const popular = POPULAR_TOY_ASSET_NAMES
+            .map(name => this.toyCatalog.find(t => t.assetName === name))
+            .filter((t): t is ToyCatalogEntry => t !== undefined);
+        const popularCount = popular.length;
+
+        const rest = this.toyCatalog.filter(t => !popular.includes(t));
+        const shuffled = [...rest].sort(() => Math.random() - 0.5);
+        const options = [...popular];
+        while (options.length < PICK_LIST_TOP_N && shuffled.length > 0) {
+            options.push(shuffled.shift()!);
+        }
+
+        return { options, hasRandom: options.length > popularCount };
+    }
+
+    private formatToyPickList(options: ToyCatalogEntry[], hasRandom: boolean): string {
+        const lines = [`Pick a toy:`];
+        options.forEach((t, i) => {
+            const marker = hasRandom && i === options.length - 1 ? ` ← random pick (not in top ${PICK_LIST_TOP_N})` : "";
+            lines.push(`${i + 1}. ${t.label}${marker}`);
+        });
+        lines.push("0. Back");
+        lines.push(`Or type any toy name, or "list" to see the full catalog.`);
+        return lines.join("\n");
+    }
+
+    private formatFullToyList(): string {
+        return `Full toy catalog:\n` +
+            this.toyCatalog.map((t, i) => `${i + 1}. ${t.label}`).join("\n") +
+            `\n0. Back` +
+            `\nOr type any toy name.`;
     }
 
     // Entry point from the spend menu's 'toys' option. The winner picks a
@@ -4940,14 +4997,17 @@ export class WinnersDiceGame {
         }
 
         const loser = state.players.find(p => p.memberNumber !== winner)!;
+        const { options, hasRandom } = this.buildToyPickList();
         state.toyDeal = {
             winner,
             loser: loser.memberNumber,
             toyAssetName: null,
             toyLabel: null,
+            toyOptions: options.map(t => t.assetName),
             price: null,
             counterPrice: null,
             stage: "awaiting_toy",
+            pendingFuzzyToy: null,
             negotiationStep: 0,
             initiatorFloor: null,
             responderCeiling: null,
@@ -4955,12 +5015,7 @@ export class WinnersDiceGame {
         };
 
         this.bot.sendChat(`🎲 ${this.playerName(winner)} has something devious in mind for ${this.playerName(loser.memberNumber)}...`);
-        this.sendLongWhisper(winner,
-            `Pick a toy:\n` +
-            this.toyCatalog.map((t, i) => `${i + 1}. ${t.label}`).join("\n") +
-            `\n0. Back` +
-            `\nOr type any item name.`
-        );
+        this.sendLongWhisper(winner, this.formatToyPickList(options, hasRandom));
     }
 
     // Dispatches a message to the in-progress toy deal, if any. Returns true
@@ -4973,6 +5028,10 @@ export class WinnersDiceGame {
             case "awaiting_toy":
                 if (sender !== deal.winner) return false;
                 return this.handleToyChoice(deal, raw);
+
+            case "awaiting_toy_confirm":
+                if (sender !== deal.winner) return false;
+                return this.handleToyItemConfirm(deal, lower);
 
             case "awaiting_price":
                 if (sender !== deal.winner) return false;
@@ -5009,31 +5068,73 @@ export class WinnersDiceGame {
             return true;
         }
 
+        if (trimmed.toLowerCase() === "list" || trimmed.toLowerCase() === "show list") {
+            deal.toyOptions = this.toyCatalog.map(t => t.assetName);
+            this.sendLongWhisper(deal.winner, this.formatFullToyList());
+            return true;
+        }
+
         if (/^\d+$/.test(trimmed)) {
             const idx = parseInt(trimmed, 10);
-            if (idx >= 1 && idx <= this.toyCatalog.length) {
-                chosen = this.toyCatalog[idx - 1];
+            if (idx >= 1 && idx <= deal.toyOptions.length) {
+                const assetName = deal.toyOptions[idx - 1];
+                chosen = this.toyCatalog.find(t => t.assetName === assetName) ?? null;
             } else {
-                this.bot.whisper(deal.winner, `Pick a number 1-${this.toyCatalog.length} or type an item name. (0. Back)`);
+                this.bot.whisper(deal.winner, `Pick a number 1-${deal.toyOptions.length} or type a toy name. (0. Back)`);
                 return true;
             }
         } else {
             const result = this.fuzzyMatchToy(trimmed);
-            if (result.match) {
+            if (result.match && result.exact) {
                 chosen = result.match;
+            } else if (result.match) {
+                // Only startsWith/includes matched, not exact — confirm
+                // with the winner before locking it in.
+                deal.pendingFuzzyToy = result.match.assetName;
+                deal.stage = "awaiting_toy_confirm";
+                this.bot.whisper(deal.winner, `Did you mean ${result.match.label}? (yes/no)`);
+                return true;
             } else if (result.candidates) {
                 this.bot.whisper(deal.winner, `Multiple matches: ${result.candidates.slice(0, 8).map(c => c.label).join(", ")} — be more specific.`);
                 return true;
             } else {
-                this.bot.whisper(deal.winner, `No toy matching "${trimmed}" — pick a number from the list, or type part of the name.`);
+                this.bot.whisper(deal.winner, `No toy matching "${trimmed}" — pick a number from the list, type part of the name, or "list" for the full catalog.`);
                 return true;
             }
+        }
+
+        if (!chosen) {
+            this.bot.whisper(deal.winner, `Pick a number 1-${deal.toyOptions.length} or type a toy name. (0. Back)`);
+            return true;
         }
 
         deal.toyAssetName = chosen.assetName;
         deal.toyLabel = chosen.label;
         deal.stage = "awaiting_price";
         this.bot.whisper(deal.winner, `Got it — ${chosen.label}. How many points are you offering ${this.playerName(deal.loser)} for a turn with it?`);
+        return true;
+    }
+
+    // Winner's yes/no reply to a "Did you mean X?" fuzzy-match confirmation.
+    private handleToyItemConfirm(deal: ToyDeal, lower: string): boolean {
+        const trimmed = lower.trim();
+        if (trimmed === "yes" || trimmed === "y") {
+            const chosen = this.toyCatalog.find(t => t.assetName === deal.pendingFuzzyToy)!;
+            deal.toyAssetName = chosen.assetName;
+            deal.toyLabel = chosen.label;
+            deal.pendingFuzzyToy = null;
+            deal.stage = "awaiting_price";
+            this.bot.whisper(deal.winner, `Got it — ${chosen.label}. How many points are you offering ${this.playerName(deal.loser)} for a turn with it?`);
+            return true;
+        }
+        if (trimmed === "no" || trimmed === "n") {
+            deal.pendingFuzzyToy = null;
+            deal.stage = "awaiting_toy";
+            this.bot.whisper(deal.winner, `No problem — type the toy name again (or reply with a number from the list).`);
+            return true;
+        }
+        const pending = this.toyCatalog.find(t => t.assetName === deal.pendingFuzzyToy);
+        this.bot.whisper(deal.winner, `Did you mean ${pending?.label}? Please reply yes or no.`);
         return true;
     }
 

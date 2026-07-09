@@ -324,6 +324,9 @@ export interface BondageDeal {
 export type ToyDealStage =
     // Waiting for the winner to pick a toy from the catalog.
     | "awaiting_toy"
+    // Winner's text only fuzzy-matched (not exact) — waiting for yes/no
+    // confirmation before locking in pendingFuzzyToy.
+    | "awaiting_toy_confirm"
     // Waiting for the winner to propose an initial price.
     | "awaiting_price"
     // Waiting for the loser to accept or counter (no decline option for toys).
@@ -349,11 +352,19 @@ export interface ToyDeal {
     loser: number;
     toyAssetName: string | null;
     toyLabel: string | null;
+    // Asset names of the toys currently shown as numbered options — mirrors
+    // BondageDeal.itemOptions. Numbers the winner types resolve against this
+    // list, not the full catalog.
+    toyOptions: string[];
     // The winner's (initiator's) most recent offer.
     price: number | null;
     // The loser's (responder's) most recent counter.
     counterPrice: number | null;
     stage: ToyDealStage;
+    // Candidate toy asset name awaiting yes/no confirmation, set only when
+    // the winner's text only fuzzy-matched (startsWith/includes, not
+    // exact) — mirrors BondageDeal.pendingFuzzyItem.
+    pendingFuzzyToy: string | null;
     // 0 before the winner's first offer; 1-5 tracking the structured
     // negotiation steps described in game.ts (applyInitiatorOffer/applyResponderCounter).
     negotiationStep: number;
