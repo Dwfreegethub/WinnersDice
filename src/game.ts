@@ -4801,6 +4801,13 @@ export class WinnersDiceGame {
             return true;
         }
 
+        if (this.state.spendingBalance < n) {
+            this.bot.whisper(deal.placer,
+                `You can't afford that — ${n} points is more than your ${this.state.spendingBalance} balance. ` +
+                `Offer a lower price, or type !cancel to back out.`);
+            return true;
+        }
+
         const result = applyInitiatorOffer(deal, n);
         if (!result.ok) {
             this.bot.whisper(deal.placer, result.error!);
