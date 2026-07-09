@@ -798,21 +798,19 @@ export class WinnersDiceGame {
     private handleHelp(sender: number): void {
         let text =
             `=== WinnersDice Commands ===\n` +
-            `challenge @PlayerName - Challenge a player to a match (!challenge also works)\n` +
-            `help - Show this message (!help also works)\n\n` +
-            `=== Help Topics ===\n` +
             `!readme - Read about this game\n` +
-            `help setup - Challenge and match setup (negotiation, settings)\n` +
-            `help game - During the match (bank, press, endgame, mercy, streaks & boosts)\n` +
-            `help shop - The shop and spending (post-bank menu, shop items, bondage removal)\n`;
+            `!challenge @PlayerName - Challenge a player to a match\n` +
+            `!help setup - Challenge and match setup\n` +
+            `!help game - During the match\n` +
+            `!help shop - The shop and spending\n`;
 
         if (this.isAdmin(sender)) {
-            text += `help admin - Admin commands\n`;
+            text += `!help admin - Admin commands\n`;
         }
 
         text +=
-            `\n=== Feedback ===\n` +
-            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
+            `!feedback <text> - Send feedback (whisper only)\n` +
+            `Tip: all commands work in chat or as a whisper to me.`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -830,71 +828,55 @@ export class WinnersDiceGame {
 
     private handleHelpSetup(sender: number): void {
         const text =
-            `=== Setup (Negotiating Match Rules) ===\n` +
-            `challenge @PlayerName - Challenge a player to a match (!challenge also works)\n` +
-            `yes / no - Answer the bot's yes-or-no questions (!yes / !no also work)\n` +
-            `When asked for a number, just say it (e.g. "4" or "4 rounds")\n` +
-            `accept - Accept the other player's proposal (!accept also works)\n` +
-            `counter <value> - Counter-propose a different value (!counter also works; just "counter" will prompt you for the value)\n` +
-            `decline - Decline and end the negotiation (!decline also works)\n` +
-            `cancel - Abort the negotiation entirely (!cancel also works)\n\n` +
-            `=== What Each Setting Means ===\n` +
-            `minRounds - how many minimum rounds before the winner can end the game (default 3)\n` +
-            `stripping - whether losing a roll can require removing clothing\n` +
-            `bondage - whether bondage and locks can be applied to the loser\n` +
-            `toys - whether toys can be purchased and used on the loser\n` +
-            `services - whether sexual services can be bought as part of the shop\n\n` +
-            `=== Feedback ===\n` +
-            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
+            `=== Match Setup ===\n` +
+            `!challenge @PlayerName - Start a challenge\n` +
+            `yes / no - Answer yes/no questions\n` +
+            `[number] - Enter a value when prompted\n` +
+            `accept - Accept the current proposal\n` +
+            `counter <value> - Counter with a different value (or just "counter" to be prompted)\n` +
+            `decline - End the negotiation\n` +
+            `cancel - Abort entirely`;
 
         this.sendLongWhisper(sender, text);
     }
 
     private handleHelpGame(sender: number): void {
         const text =
-            `=== During the Game ===\n` +
-            `Only the winner of a roll gets to choose what's next — the loser waits.\n` +
-            `bank - Lock in your pot and ask what's next (spend / continue / endgame) (!bank also works)\n` +
-            `press / roll / roll again - Keep your streak and roll again in the same round, risking it all (!press also works)\n` +
-            `endgame - Call the match early (after the minimum rounds) (!endgame also works)\n` +
-            `mercy - Ask to concede early, forfeiting half your points and owing a service (after the minimum rounds) (!mercy also works)\n\n` +
+            `=== During the Match ===\n` +
+            `Winner of each roll chooses what's next — loser waits.\n` +
+            `!bank - Lock in your pot (spend / continue / endgame)\n` +
+            `!press - Roll again, risking your current pot\n` +
+            `!endgame - End the match early (after minimum rounds)\n` +
+            `!mercy - Concede early: forfeit half your points and owe a service\n\n` +
             `=== Streaks, Boosts & Curses ===\n` +
-            `Winning a roll adds your dice + streak + boost to your pot, then × the round multiplier.\n` +
-            `Rolling a Natural 20 adds +2 to your streak instead of +1 (announced in chat).\n` +
-            `Rolling a Natural 1 curses you with -1 to your rolls until you win one (also announced).\n` +
-            `Streak resets to 0 when you lose a roll or a round ends (banker picks "continue").\n` +
-            `Boost is purchased from the shop, persists across rounds, and drains by 1 on each loss.`;
+            `Each win: dice + streak + boost → pot × round multiplier\n` +
+            `Natural 20: +2 streak. Natural 1: -1 to your rolls until you win.\n` +
+            `Streak resets on a loss or when banker picks "continue". Boost persists across rounds, drains -1 per loss.`;
 
         this.sendLongWhisper(sender, text);
     }
 
     private handleHelpShop(sender: number): void {
         const text =
-            `=== After Banking ===\n` +
-            `You'll get a numbered menu — just reply with the number:\n` +
-            `1. continue - Start the next round (multiplier goes up, streaks reset, boosts persist)\n` +
-            `2. spend - Open the shop to trade with your opponent\n` +
-            `3. endgame - Call the match (available after the minimum rounds)\n` +
-            `4. remove locks - Only shown if you have Exclusive locks on you; pays the pre-set price to remove them instantly, no need to wait on your opponent\n\n` +
-            `=== The Shop ===\n` +
-            `Also a numbered menu (options vary by match settings) — reply with the number for:\n` +
-            `boost - Purchase a streak boost (+1 to +5, persists across rounds, max +${MAX_BOOST})\n` +
-            `clothing - Offer to buy an item of clothing from your opponent for a price; ` +
-            `they can accept, decline, or counter\n` +
-            `bondage (or !bondage) - Pick a slot (also numbered) and item to apply to your opponent, then offer a price you'll pay; ` +
-            `they can accept, decline, or counter (they receive half, like clothing)\n` +
-            `locks - Only shown if your opponent has unlocked bondage; pick a slot (or "all") and propose a removal price; ` +
-            `they can accept, decline, or counter, like bondage. Once agreed, an Exclusive lock goes on and removal costs double ` +
-            `the agreed price, payable anytime from their post-bank menu\n` +
-            `buyback - Buy back an item you've sold, for double its sale price\n` +
-            `toys - Pick a toy and offer a price for a turn with it (they can accept or counter, no declining); ` +
-            `once agreed, pick a duration and it's placed in your hand until time's up\n` +
-            `services - coming soon\n` +
-            `back - Return to the continue/spend/endgame prompt\n` +
-            `cancel - Back out of a purchase or offer you can't afford (or just changed your mind on) (!cancel also works)\n\n` +
+            `=== Post-Bank Menu ===\n` +
+            `Reply with the number shown:\n` +
+            `1. continue - Next round (multiplier up, streaks reset)\n` +
+            `2. spend - Open the shop\n` +
+            `3. endgame - End the match (after minimum rounds)\n` +
+            `4. remove locks - Shown if you have Exclusive locks; pays to remove them instantly\n\n` +
+            `=== Shop ===\n` +
+            `boost - Buy a streak boost (+1–5, max +${MAX_BOOST})\n` +
+            `clothing - Buy a clothing item from your opponent\n` +
+            `bondage - Apply bondage to your opponent (you pay half goes to them)\n` +
+            `locks - Lock your opponent's bondage; they can buy out anytime from their post-bank menu\n` +
+            `buyback - Buy back something you sold, at double the price\n` +
+            `toys - Purchase a timed toy session\n` +
+            `actions & services - Request a service from your opponent\n` +
+            `back - Return to the post-bank menu\n` +
+            `cancel - Back out\n\n` +
             `=== Bondage Removal ===\n` +
-            `removebondage <slot> - (placer only) Remove bondage you applied, free of charge (say "!removebondage <slot>")\n` +
-            `buybondage <slot> - (wearer only) Ask to buy back a removal — the placer names the price (blocked on locked slots — use the post-bank "remove locks" option instead); say "!buybondage <slot>"`;
+            `!removebondage <slot> - (placer) Remove bondage you applied, free\n` +
+            `!buybondage <slot> - (wearer) Request a buyout — placer sets the price`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -907,10 +889,10 @@ export class WinnersDiceGame {
 
         const text =
             `=== Admin Commands ===\n` +
-            `reset - End the current match immediately and reset to idle (say "!reset")\n` +
-            `setstreak <n> - Set the streak bonus cap, default ${DEFAULT_MAX_STREAK} (say "!setstreak <n>")\n` +
-            `setstatus <memberNumber> <status> - Set a player's feedback status (reviewing, testing, implemented, partly_implemented) — say "!setstatus <memberNumber> <status>"\n` +
-            `feedback list - View a summary of all tracked feedback (say "!feedback list")`;
+            `!reset - End the current match and reset\n` +
+            `!setstreak <n> - Set streak bonus cap (default ${DEFAULT_MAX_STREAK})\n` +
+            `!setstatus <memberNumber> <status> - Update a player's feedback status\n` +
+            `!feedback list - View all feedback`;
 
         this.sendLongWhisper(sender, text);
     }
