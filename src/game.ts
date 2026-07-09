@@ -192,6 +192,11 @@ const END_GAME_STRIP_VERIFY_DELAY_MS = 1000;
 // telling the winner to remove it manually.
 const END_GAME_STRIP_MAX_ATTEMPTS = 3;
 
+// Hard cap on how many rolls (initial roll + presses) a round can go through
+// before the current winner must bank or end the match — prevents a single
+// round from pressing indefinitely.
+const MAX_ROLLS_PER_ROUND = 20;
+
 // ============================================================
 // END GAME
 // ============================================================
@@ -280,6 +285,67 @@ interface OfferOutcome {
     // earlier ceiling that the initiator's counter just crossed).
     matched?: boolean;
     price?: number;
+    // Set only when ok is true and the submitted amount was silently
+    // adjusted (Rule A's first-counter cap, or Rule B's gap-closing floor)
+    // — the caller should whisper this to whoever just countered.
+    notice?: string;
+}
+
+// Shop-negotiation-only counter-offer rules (not used by the initial
+// challenge negotiation or the end-game proposal, which have their own
+// independent negotiation code). Gap threshold below which either rule stops
+// constraining the next counter.
+const COUNTER_GAP_FLOOR = 50;
+// Subsequent counters (second counter onwards) must close at least this
+// fraction of the current gap between seller ask and buyer bid.
+const COUNTER_GAP_CLOSE_FRACTION = 0.10;
+
+// Rule A: when the original offer (the deal's opening price) is > 500, the
+// responder's first counter-offer is capped at 2x that original offer.
+function applyFirstCounterCap(originalOffer: number, amount: number): { amount: number; notice?: string } {
+    if (originalOffer <= 500) return { amount };
+    const cap = originalOffer * 2;
+    if (amount <= cap) return { amount };
+    return {
+        amount: cap,
+        notice: `Your first counter can't be more than 2× the original offer of ${originalOffer}. Using the maximum of ${cap} instead.`,
+    };
+}
+
+// Rule B: from the second counter-offer onwards, the mover must close the
+// gap between the current outstanding ask and bid by at least 10% (rounding
+// the minimum movement to the nearest integer). `movingUp` is true when the
+// mover's own value is increasing toward the other side (the initiator's
+// turn); false when it's decreasing (the responder's turn). Returns null if
+// the gap is small enough that any counter is valid.
+function gapCloseMinimum(ownPrevValue: number, otherValue: number, movingUp: boolean): number | null {
+    const gap = Math.abs(otherValue - ownPrevValue);
+    if (gap <= COUNTER_GAP_FLOOR) return null;
+    const movement = Math.round(gap * COUNTER_GAP_CLOSE_FRACTION);
+    return movingUp ? ownPrevValue + movement : ownPrevValue - movement;
+}
+
+function applyGapCloseRule(ownPrevValue: number, otherValue: number, amount: number, movingUp: boolean): { amount: number; notice?: string } {
+    const minimum = gapCloseMinimum(ownPrevValue, otherValue, movingUp);
+    if (minimum === null) return { amount };
+    if (movingUp ? amount >= minimum : amount <= minimum) return { amount };
+    return { amount: minimum, notice: `That's below the minimum — using ${minimum} instead.` };
+}
+
+// The "Minimum counter: X pts" hint appended to the prompt shown when asking
+// whoever's about to submit the next counter-offer for their number — empty
+// before Rule B is in effect (opening offer, or the very first counter-offer,
+// which is governed by Rule A instead) or while the gap is small enough to
+// leave any counter valid.
+function counterOfferHint(deal: PriceNegotiation): string {
+    if (deal.negotiationStep !== 2 && deal.negotiationStep !== 3 && deal.negotiationStep !== 4) return "";
+    const bid = deal.price;
+    const ask = deal.counterPrice;
+    if (bid === null || ask === null) return "";
+    const movingUp = deal.negotiationStep === 2 || deal.negotiationStep === 4;
+    const minimum = gapCloseMinimum(movingUp ? bid : ask, movingUp ? ask : bid, movingUp);
+    if (minimum === null) return "";
+    return ` Minimum counter: ${minimum} pts (must close the gap by at least 10%).`;
 }
 
 // Called with the initiator's (winner's, or removal-deal placer's) offer.
@@ -297,51 +363,63 @@ function applyInitiatorOffer(deal: PriceNegotiation, amount: number): OfferOutco
         if (amount < deal.initiatorFloor!) {
             return { ok: false, error: `Your counter must be higher than your opening offer of ${deal.initiatorFloor}.` };
         }
-        if (amount >= deal.responderCeiling!) {
+
+        const { amount: adjusted, notice } = applyGapCloseRule(deal.price!, deal.counterPrice!, amount, true);
+
+        if (adjusted >= deal.responderCeiling!) {
             deal.negotiationStep = 3;
-            return { ok: true, matched: true, price: deal.responderCeiling! };
+            return { ok: true, matched: true, price: deal.responderCeiling!, notice };
         }
-        deal.price = amount;
+        deal.price = adjusted;
         deal.negotiationStep = 3;
-        return { ok: true };
+        return { ok: true, notice };
     }
 
     if (deal.negotiationStep === 4) {
         if (amount < deal.price!) {
             return { ok: false, error: `Your final price must be at least your previous counter of ${deal.price}.` };
         }
-        deal.price = amount;
+
+        const { amount: adjusted, notice } = applyGapCloseRule(deal.price!, deal.counterPrice!, amount, true);
+
+        deal.price = adjusted;
         deal.negotiationStep = 5;
-        return { ok: true, final: true };
+        return { ok: true, final: true, notice };
     }
 
     return { ok: false, error: "This negotiation has already concluded." };
 }
 
 // Called with the responder's (loser's, or removal-deal wearer's) counter.
-// Valid at step 1 (their first counter, sets the ceiling) and step 3 (their
-// second counter, <= their step-2 counter / ceiling).
+// Valid at step 1 (their first counter, sets the ceiling — subject to Rule
+// A's first-counter cap) and step 3 (their second counter, <= their step-2
+// counter / ceiling — subject to Rule B's gap-closing requirement).
 function applyResponderCounter(deal: PriceNegotiation, amount: number): OfferOutcome {
     if (deal.negotiationStep === 1) {
-        deal.counterPrice = amount;
-        deal.responderCeiling = amount;
+        const { amount: capped, notice } = applyFirstCounterCap(deal.initiatorFloor!, amount);
+
+        deal.counterPrice = capped;
+        deal.responderCeiling = capped;
         deal.negotiationStep = 2;
-        if (amount <= deal.initiatorFloor!) {
-            return { ok: true, matched: true, price: amount };
+        if (capped <= deal.initiatorFloor!) {
+            return { ok: true, matched: true, price: capped, notice };
         }
-        return { ok: true };
+        return { ok: true, notice };
     }
 
     if (deal.negotiationStep === 3) {
         if (amount > deal.responderCeiling!) {
             return { ok: false, error: `Your counter must be lower than your previous counter of ${deal.responderCeiling}.` };
         }
-        deal.counterPrice = amount;
+
+        const { amount: adjusted, notice } = applyGapCloseRule(deal.counterPrice!, deal.price!, amount, false);
+
+        deal.counterPrice = adjusted;
         deal.negotiationStep = 4;
-        if (amount <= deal.price!) {
-            return { ok: true, matched: true, price: amount };
+        if (adjusted <= deal.price!) {
+            return { ok: true, matched: true, price: adjusted, notice };
         }
-        return { ok: true };
+        return { ok: true, notice };
     }
 
     return { ok: false, error: "This negotiation has already concluded." };
@@ -1836,6 +1914,11 @@ export class WinnersDiceGame {
         if (this.blockedByServiceDeal(sender)) return;
         if (this.blockedByMercy(sender)) return;
 
+        if (state.rollNumber >= MAX_ROLLS_PER_ROUND) {
+            this.bot.whisper(sender, `You've reached the maximum of ${MAX_ROLLS_PER_ROUND} rolls this round. You must bank or pass.`);
+            return;
+        }
+
         const winner = state.players.find(p => p.memberNumber === sender)!;
 
         let bonusText = `+${winner.streak} streak`;
@@ -3316,9 +3399,16 @@ export class WinnersDiceGame {
             return true;
         }
 
-        deal.counterPrice = n;
+        // This is the opponent's only counter-offer in a clothing deal (the
+        // buyer can only accept/decline it afterward) — so it's always the
+        // "first counter-offer" Rule A caps, using deal.price (still the
+        // buyer's untouched original offer at this point) as the baseline.
+        const { amount: capped, notice } = applyFirstCounterCap(deal.price!, n);
+        if (notice) this.bot.whisper(deal.opponent, notice);
+
+        deal.counterPrice = capped;
         deal.stage = "awaiting_buyer_counter_response";
-        this.bot.whisper(deal.buyer, `${this.playerName(deal.opponent)} counters: ${deal.item} for ${n} points. Accept or decline?`);
+        this.bot.whisper(deal.buyer, `${this.playerName(deal.opponent)} counters: ${deal.item} for ${capped} points. Accept or decline?`);
         return true;
     }
 
@@ -3588,7 +3678,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_seller_counter_value";
-                this.bot.whisper(deal.seller, "How many points would you like to counter with?");
+                this.bot.whisper(deal.seller, "How many points would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleServiceSellerCounterValue(deal, valueText);
@@ -3601,7 +3691,7 @@ export class WinnersDiceGame {
     private handleServiceSellerCounterValue(deal: ServiceDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.seller, "How many points would you like to counter with?");
+            this.bot.whisper(deal.seller, "How many points would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -3610,6 +3700,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.seller, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.seller, result.notice);
 
         if (result.matched) {
             this.finalizeServiceDeal(deal, result.price!);
@@ -3641,7 +3732,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_buyer_counter_value";
-                this.bot.whisper(deal.buyer, "How many points would you like to counter with?");
+                this.bot.whisper(deal.buyer, "How many points would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleServiceBuyerCounterValue(deal, valueText);
@@ -3654,7 +3745,7 @@ export class WinnersDiceGame {
     private handleServiceBuyerCounterValue(deal: ServiceDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.buyer, "How many points would you like to counter with?");
+            this.bot.whisper(deal.buyer, "How many points would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -3663,6 +3754,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.buyer, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.buyer, result.notice);
 
         if (result.final || result.matched) {
             this.finalizeServiceDeal(deal, result.matched ? result.price! : deal.price!);
@@ -4304,7 +4396,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_opponent_counter_value";
-                this.bot.whisper(deal.wearer, "What price would you like to counter with?");
+                this.bot.whisper(deal.wearer, "What price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleBondageWearerCounterValue(deal, valueText);
@@ -4317,7 +4409,7 @@ export class WinnersDiceGame {
     private handleBondageWearerCounterValue(deal: BondageDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.wearer, "What price would you like to counter with?");
+            this.bot.whisper(deal.wearer, "What price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -4326,6 +4418,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.wearer, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.wearer, result.notice);
 
         if (result.matched) {
             this.finalizeBondageDeal(deal, result.price!);
@@ -4357,7 +4450,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_buyer_counter_value";
-                this.bot.whisper(deal.placer, "What price would you like to counter with?");
+                this.bot.whisper(deal.placer, "What price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleBondagePlacerCounterValue(deal, valueText);
@@ -4370,7 +4463,7 @@ export class WinnersDiceGame {
     private handleBondagePlacerCounterValue(deal: BondageDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.placer, "What price would you like to counter with?");
+            this.bot.whisper(deal.placer, "What price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -4379,6 +4472,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.placer, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.placer, result.notice);
 
         if (result.final || result.matched) {
             this.finalizeBondageDeal(deal, result.matched ? result.price! : deal.price!);
@@ -4723,7 +4817,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_opponent_counter_value";
-                this.bot.whisper(deal.wearer, "What removal price would you like to counter with?");
+                this.bot.whisper(deal.wearer, "What removal price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleLockWearerCounterValue(deal, valueText);
@@ -4736,7 +4830,7 @@ export class WinnersDiceGame {
     private handleLockWearerCounterValue(deal: LockDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.wearer, "What removal price would you like to counter with?");
+            this.bot.whisper(deal.wearer, "What removal price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -4745,6 +4839,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.wearer, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.wearer, result.notice);
 
         if (result.matched) {
             this.finalizeLockDeal(deal, result.price!);
@@ -4776,7 +4871,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_buyer_counter_value";
-                this.bot.whisper(deal.placer, "What removal price would you like to counter with?");
+                this.bot.whisper(deal.placer, "What removal price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleLockPlacerCounterValue(deal, valueText);
@@ -4789,7 +4884,7 @@ export class WinnersDiceGame {
     private handleLockPlacerCounterValue(deal: LockDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.placer, "What removal price would you like to counter with?");
+            this.bot.whisper(deal.placer, "What removal price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -4798,6 +4893,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.placer, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.placer, result.notice);
 
         if (result.final || result.matched) {
             this.finalizeLockDeal(deal, result.matched ? result.price! : deal.price!);
@@ -5191,7 +5287,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_opponent_counter_value";
-                this.bot.whisper(deal.loser, "What price would you like to counter with?");
+                this.bot.whisper(deal.loser, "What price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleToyLoserCounterValue(deal, valueText);
@@ -5204,7 +5300,7 @@ export class WinnersDiceGame {
     private handleToyLoserCounterValue(deal: ToyDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.loser, "What price would you like to counter with?");
+            this.bot.whisper(deal.loser, "What price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -5213,6 +5309,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.loser, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.loser, result.notice);
 
         if (result.matched) {
             this.finalizeToyPriceNegotiation(deal, result.price!);
@@ -5244,7 +5341,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_buyer_counter_value";
-                this.bot.whisper(deal.winner, "What price would you like to counter with?");
+                this.bot.whisper(deal.winner, "What price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleToyWinnerCounterValue(deal, valueText);
@@ -5257,7 +5354,7 @@ export class WinnersDiceGame {
     private handleToyWinnerCounterValue(deal: ToyDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.winner, "What price would you like to counter with?");
+            this.bot.whisper(deal.winner, "What price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
@@ -5266,6 +5363,7 @@ export class WinnersDiceGame {
             this.bot.whisper(deal.winner, result.error!);
             return true;
         }
+        if (result.notice) this.bot.whisper(deal.winner, result.notice);
 
         if (result.final || result.matched) {
             this.finalizeToyPriceNegotiation(deal, result.matched ? result.price! : deal.price!);
