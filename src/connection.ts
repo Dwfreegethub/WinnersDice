@@ -140,7 +140,7 @@ export class BCConnection {
         log(`Creating room: ${secrets.roomName}`);
         this.socket.emit("ChatRoomCreate", {
             Name: secrets.roomName,
-            Description: "A WinnersDice game room - type !join to play!",
+            Description: "WinnersDice is a high-stakes, two-player dice duel with adult consequences. Challenge someone, negotiate what's on the line -rounds, stripping, bondage, toys, maybe more- then roll.",
             Background: "NightClub",
             Space: "X",
             Game: "",
@@ -160,7 +160,7 @@ export class BCConnection {
             Action: "Update",
             Room: {
                 Name: secrets.roomName,
-                Description: "A WinnersDice game room - type !join to play!",
+                Description: "WinnersDice is a high-stakes, two-player dice duel with adult consequences. Challenge someone, negotiate what's on the line -rounds, stripping, bondage, toys, maybe more- then roll.",
                 Background: "NightClub",
                 Space: "X",
                 Game: "",

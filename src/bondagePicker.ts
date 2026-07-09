@@ -972,7 +972,7 @@ export class BondagePicker<P extends BondagePickerPlayer = BondagePickerPlayer> 
 
         // Apply with the most popular learned configuration for this item
         // (restraining mode etc.); {} = BC default mode if nothing learned yet.
-        const setting = this.pickItemSetting(group, itemName);
+        const setting = { ...this.pickItemSetting(group, itemName), Difficulty: 20 };
 
         this.bot.sendChat(`⛓️ ${pickerName} chose ${itemName} for ${target.name}'s ${pending.slotDisplay}!`);
         this.bot.applyItem(target.memberNumber, group, itemName, "Default", setting);

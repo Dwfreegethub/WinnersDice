@@ -378,6 +378,76 @@ export interface ActiveToy {
     agreedPrice: number;
 }
 
+// The winner's 5-question end game proposal, followed by the up-to-5-step
+// time negotiation with the loser (see EndGameProposal.proposalStage and
+// game.ts's handleEndGameNegotiation). Only exists while the proposal is
+// being built or negotiated; once agreed, execution happens immediately and
+// this is cleared in favor of ActiveEndGame.
+export interface EndGameProposal {
+    winnerMemberNumber: number;
+    loserMemberNumber: number;
+    proposalStage: "q1_time" | "q2_location" | "q3_privacy" | "q4_locks" | "q5_description" | "negotiating" | "executing";
+    // Winner's answers
+    proposedMinutes: number;
+    location: "stay" | "move" | null;
+    privacy: "public" | "private" | null;
+    requestedLockSlots: string[];
+    description: string;
+    // Negotiation state (5-step) — see game.ts's handleEndGameNegotiation.
+    negotiationStep: number;
+    winnerFloor: number;
+    loserCeiling: number | null;
+    winnerLastOffer: number;
+    loserLastCounter: number | null;
+    // Points tracking — set once execution happens.
+    winnerPointsCommitted: number;
+    loserPointsCommitted: number;
+}
+
+// An agreed, in-progress end game: a real-time timer lock on the loser's
+// leash slot plus any additional requested lock slots, released together
+// when the timer expires (or the match is safeworded/reset early).
+export interface ActiveEndGame {
+    winnerMemberNumber: number;
+    loserMemberNumber: number;
+    agreedMinutes: number;
+    winnerPointsSpent: number;
+    loserPointsSpent: number;
+    timer: NodeJS.Timeout;
+    appliedLockSlots: string[];
+}
+
+// After the end game's extra lock slots are applied but before the timer/
+// password lock goes on the loser's leash, each loser gets a 30-second
+// window to nudge the suggested lock duration up or down in 5-minute
+// increments (see game.ts's startEndGameLockVote/finalizeEndGameLockVote).
+// Carries everything executeEndGame already settled (points spent, applied
+// lock slots) through to the vote's finalization, since EndGameProposal is
+// cleared once the vote starts.
+export interface EndGameLockVote {
+    winnerMemberNumber: number;
+    loserMemberNumbers: number[];
+    suggestedMinutes: number;
+    // memberNumber -> 1 (less) | 2 (accept) | 3 (more). Missing entry at
+    // finalization time = no reply = counts as accept.
+    votes: Map<number, 1 | 2 | 3>;
+    winnerPointsSpent: number;
+    loserPointsSpent: number;
+    appliedLockSlots: string[];
+    timeout: NodeJS.Timeout;
+}
+
+// The requester's !mercy concession request, walking through the winner's
+// accept/reject and the subsequent duration negotiation (see game.ts's
+// handleMercyCommand/handleMercyMessage/resolveMercy).
+export interface MercyRequest {
+    requesterId: number;
+    stage: "awaiting_details" | "awaiting_winner_response" | "awaiting_duration" | "awaiting_conceder_response" | "awaiting_winner_counter_response";
+    serviceText: string | null;
+    winnerDuration: string | null;
+    concederCounter: string | null;
+}
+
 export interface GameState {
     phase: GamePhase;
     config: GameConfig | null;
@@ -419,6 +489,13 @@ export interface GameState {
     // The toy currently placed on a winner's ItemHandheld slot, if any.
     activeToy: ActiveToy | null;
     negotiation: NegotiationState | null;
+    // In-progress winner-initiated end game proposal/negotiation, if any.
+    endGameProposal: EndGameProposal | null;
+    // Agreed, currently-running end game (timer lock + extra locks), if any.
+    activeEndGame: ActiveEndGame | null;
+    // In-progress lock-time vote, between bondage being applied and the
+    // timer/password lock going on, if any.
+    endGameLockVote: EndGameLockVote | null;
     // The awaitingPostBank player's balance during the current bank/spend
     // session. Initialized to their balance when the session starts; every
     // purchase deducts from this immediately, and it's committed back to
@@ -432,6 +509,11 @@ export interface GameState {
     // Set after a clothing deal or buyback closes, while waiting for the
     // named member to update their wardrobe. Blocks all game commands.
     waitingForWardrobe: { memberNumber: number; item: string; timeoutAt: number } | null;
+    // In-progress !mercy concession request, if any.
+    mercyRequest: MercyRequest | null;
+    // Member number -> round number a rejected requester must wait until
+    // before they can request mercy again (see handleMercyCommand).
+    mercyCooldowns: Map<number, number>;
 }
 
 // A single player's d20 roll for a roll, including their streak/boost
