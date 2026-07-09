@@ -3078,6 +3078,7 @@ export class WinnersDiceGame {
     private startBoostPurchase(sender: number): void {
         const state = this.state;
         if (!state.players) return;
+        if (this.blockedByShopDeal(sender)) return;
         const player = state.players.find(p => p.memberNumber === sender)!;
         state.awaitingBoostLevel = sender;
 
@@ -3146,6 +3147,7 @@ export class WinnersDiceGame {
     private startBuyback(sender: number): void {
         const state = this.state;
         if (!state.players) return;
+        if (this.blockedByShopDeal(sender)) return;
         const player = state.players.find(p => p.memberNumber === sender)!;
 
         state.awaitingBuyback = sender;
@@ -4006,10 +4008,7 @@ export class WinnersDiceGame {
     private startBondageDeal(buyer: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
-            this.bot.whisper(buyer, "There's already a deal in progress — finish that first.");
-            return;
-        }
+        if (this.blockedByShopDeal(buyer)) return;
         const wearer = state.players.find(p => p.memberNumber !== buyer)!;
 
         if (this.itemCatalog.size === 0) {
@@ -4705,10 +4704,7 @@ export class WinnersDiceGame {
     private startLockDeal(sender: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
-            this.bot.whisper(sender, "There's already a deal in progress — finish that first.");
-            return;
-        }
+        if (this.blockedByShopDeal(sender)) return;
         const wearer = state.players.find(p => p.memberNumber !== sender)!;
 
         const lockable = this.lockableBondageSlotsFor(wearer.memberNumber);
@@ -5132,10 +5128,7 @@ export class WinnersDiceGame {
     private startToyDeal(winner: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
-            this.bot.whisper(winner, "There's already a deal in progress — finish that first.");
-            return;
-        }
+        if (this.blockedByShopDeal(winner)) return;
         if (this.toyCatalog.length === 0) {
             this.bot.whisper(winner, "The toy catalog isn't available right now — try again later.");
             return;
