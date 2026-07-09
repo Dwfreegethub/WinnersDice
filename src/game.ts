@@ -1533,12 +1533,17 @@ export class WinnersDiceGame {
         this.returnToSpendMenu(deal.placer);
     }
 
-    // Either party in an in-progress toy rental can back out — mirrors
-    // handleLockDealCancel. Safe at every stage, including "awaiting_duration",
-    // since the toy is only actually applied once a duration is chosen.
+    // Only the winner (initiator) can back out of an in-progress toy rental —
+    // the loser is a captive participant and can't simply decline, mirroring
+    // the "You can't decline a toy offer" messaging in handleToyLoserResponse.
     private handleToyDealCancel(sender: number): void {
         const deal = this.state.toyDeal;
         if (!deal) return;
+
+        if (sender === deal.loser) {
+            this.bot.whisper(sender, "You can't cancel this deal — reply with 'yes' to accept or 'counter <number>' to negotiate the price.");
+            return;
+        }
 
         const otherParty = sender === deal.winner ? deal.loser : deal.winner;
         const alreadyVisibleToBoth = deal.stage !== "awaiting_toy" && deal.stage !== "awaiting_toy_confirm" && deal.stage !== "awaiting_price";
