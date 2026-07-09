@@ -5,3 +5,8 @@ src/secrets.ts
 pending_update.txt
 feedback_status.json
 lock_release_log.txt
+players.json
+wrapper.output
+bondage_usage.json
+winnersdice.err
+winnersdice.out

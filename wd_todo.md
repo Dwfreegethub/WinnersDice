@@ -1,5 +1,16 @@
 # WinnersDice — Todo / Known Issues
 
+## HIGH PRIORITY
+
+1. Decide max rolls per round — currently unlimited pressing; needs a cap decision
+2. % rule on negotiations — enforce percentage-based limits on counter-offers during negotiation
+3. Decide what to do about clothing — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
+   - Key open question: how does the bot actually remove clothing from a player? Need to research whether BC's socket API supports bot-initiated clothing removal, or if it requires the player to do it themselves (like BD's "!removed" confirmation flow). This affects whether stripping can be automatic or honor-system.
+4. Clean up help more — possibly context-sensitive help based on current game phase/menu state
+5. More obvious ways to back out of a transaction — make cancel/back options clearer at every step
+
+---
+
 ## Known Issues / Limitations
 
 - **Safeword handler: first live test did not work as expected** — needs debugging. Check whether the `SafewordUsed` socket event is actually firing, or whether the Action message pattern matching is off.
