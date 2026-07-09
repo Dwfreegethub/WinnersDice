@@ -908,12 +908,12 @@ export class WinnersDiceGame {
     }
 
     private handleChallenge(sender: number, args: string): void {
+        if (this.checkPendingUpdate()) return;
+
         if (this.state.phase !== "idle") {
             this.bot.sendChat("A WinnersDice match is already in progress. Type !cancel to abort an ongoing negotiation first.");
             return;
         }
-
-        if (this.checkPendingUpdate()) return;
 
         const targetName = args.replace(/^@/, "").trim();
         if (!targetName) {
