@@ -924,7 +924,6 @@ export class WinnersDiceGame {
         if (this.checkPendingUpdate()) return;
 
         if (this.state.phase !== "idle") {
-            this.bot.sendChat("A WinnersDice match is already in progress. Type !cancel to abort an ongoing negotiation first.");
             return;
         }
 
