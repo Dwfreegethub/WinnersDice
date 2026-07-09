@@ -525,9 +525,21 @@ export class WinnersDiceGame {
         const cmd = cmdRaw.toLowerCase();
         const args = rest.join(" ");
 
+        const helpArg = args.trim().toLowerCase();
+
         switch (cmd) {
             case "!help":
-                this.handleHelp(sender);
+                if (helpArg === "setup") {
+                    this.handleHelpSetup(sender);
+                } else if (helpArg === "game") {
+                    this.handleHelpGame(sender);
+                } else if (helpArg === "shop") {
+                    this.handleHelpShop(sender);
+                } else if (helpArg === "admin") {
+                    this.handleHelpAdmin(sender);
+                } else {
+                    this.handleHelp(sender);
+                }
                 break;
             case "!challenge":
                 this.handleChallenge(sender, args);
@@ -785,13 +797,46 @@ export class WinnersDiceGame {
             `=== WinnersDice Commands ===\n` +
             `challenge @PlayerName - Challenge a player to a match (!challenge also works)\n` +
             `help - Show this message (!help also works)\n\n` +
+            `=== Help Topics ===\n` +
+            `help setup - Challenge and match setup (negotiation, settings)\n` +
+            `help game - During the match (bank, press, endgame, mercy, streaks & boosts)\n` +
+            `help shop - The shop and spending (post-bank menu, shop items, bondage removal)\n`;
+
+        if (this.isAdmin(sender)) {
+            text += `help admin - Admin commands\n`;
+        }
+
+        text +=
+            `\n=== Feedback ===\n` +
+            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
+
+        this.sendLongWhisper(sender, text);
+    }
+
+    private handleHelpSetup(sender: number): void {
+        const text =
             `=== Setup (Negotiating Match Rules) ===\n` +
+            `challenge @PlayerName - Challenge a player to a match (!challenge also works)\n` +
             `yes / no - Answer the bot's yes-or-no questions (!yes / !no also work)\n` +
             `When asked for a number, just say it (e.g. "4" or "4 rounds")\n` +
             `accept - Accept the other player's proposal (!accept also works)\n` +
             `counter <value> - Counter-propose a different value (!counter also works; just "counter" will prompt you for the value)\n` +
             `decline - Decline and end the negotiation (!decline also works)\n` +
             `cancel - Abort the negotiation entirely (!cancel also works)\n\n` +
+            `=== What Each Setting Means ===\n` +
+            `minRounds - how many minimum rounds before the winner can end the game (default 3)\n` +
+            `stripping - whether losing a roll can require removing clothing\n` +
+            `bondage - whether bondage and locks can be applied to the loser\n` +
+            `toys - whether toys can be purchased and used on the loser\n` +
+            `services - whether sexual services can be bought as part of the shop\n\n` +
+            `=== Feedback ===\n` +
+            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
+
+        this.sendLongWhisper(sender, text);
+    }
+
+    private handleHelpGame(sender: number): void {
+        const text =
             `=== During the Game ===\n` +
             `Only the winner of a roll gets to choose what's next — the loser waits.\n` +
             `bank - Lock in your pot and ask what's next (spend / continue / endgame) (!bank also works)\n` +
@@ -803,7 +848,13 @@ export class WinnersDiceGame {
             `Rolling a Natural 20 adds +2 to your streak instead of +1 (announced in chat).\n` +
             `Rolling a Natural 1 curses you with -1 to your rolls until you win one (also announced).\n` +
             `Streak resets to 0 when you lose a roll or a round ends (banker picks "continue").\n` +
-            `Boost is purchased from the shop, persists across rounds, and drains by 1 on each loss.\n\n` +
+            `Boost is purchased from the shop, persists across rounds, and drains by 1 on each loss.`;
+
+        this.sendLongWhisper(sender, text);
+    }
+
+    private handleHelpShop(sender: number): void {
+        const text =
             `=== After Banking ===\n` +
             `You'll get a numbered menu — just reply with the number:\n` +
             `1. continue - Start the next round (multiplier goes up, streaks reset, boosts persist)\n` +
@@ -828,18 +879,23 @@ export class WinnersDiceGame {
             `cancel - Back out of a purchase or offer you can't afford (or just changed your mind on) (!cancel also works)\n\n` +
             `=== Bondage Removal ===\n` +
             `removebondage <slot> - (placer only) Remove bondage you applied, free of charge (say "!removebondage <slot>")\n` +
-            `buybondage <slot> - (wearer only) Ask to buy back a removal — the placer names the price (blocked on locked slots — use the post-bank "remove locks" option instead); say "!buybondage <slot>"\n\n` +
-            `=== Feedback ===\n` +
-            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
+            `buybondage <slot> - (wearer only) Ask to buy back a removal — the placer names the price (blocked on locked slots — use the post-bank "remove locks" option instead); say "!buybondage <slot>"`;
 
-        if (this.isAdmin(sender)) {
-            text +=
-                `\n\n=== Admin Commands ===\n` +
-                `reset - End the current match immediately and reset to idle (say "!reset")\n` +
-                `setstreak <n> - Set the streak bonus cap, default ${DEFAULT_MAX_STREAK} (say "!setstreak <n>")\n` +
-                `setstatus <memberNumber> <status> - Set a player's feedback status (reviewing, testing, implemented, partly_implemented) — say "!setstatus <memberNumber> <status>"\n` +
-                `feedback list - View a summary of all tracked feedback (say "!feedback list")`;
+        this.sendLongWhisper(sender, text);
+    }
+
+    private handleHelpAdmin(sender: number): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
         }
+
+        const text =
+            `=== Admin Commands ===\n` +
+            `reset - End the current match immediately and reset to idle (say "!reset")\n` +
+            `setstreak <n> - Set the streak bonus cap, default ${DEFAULT_MAX_STREAK} (say "!setstreak <n>")\n` +
+            `setstatus <memberNumber> <status> - Set a player's feedback status (reviewing, testing, implemented, partly_implemented) — say "!setstatus <memberNumber> <status>"\n` +
+            `feedback list - View a summary of all tracked feedback (say "!feedback list")`;
 
         this.sendLongWhisper(sender, text);
     }
