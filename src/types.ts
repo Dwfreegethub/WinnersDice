@@ -172,6 +172,23 @@ export interface ClothingDeal {
     stage: ClothingDealStage;
 }
 
+// In-progress "actions & services" purchase negotiated via the spend menu:
+// the winner (buyer) describes a request and names a price; the loser
+// (seller) can accept, decline, or counter, same shape as a clothing deal.
+// Once agreed, the price is settled immediately (seller receives half, the
+// rest is the bot fee) and the deal stays non-null through the 5-minute
+// "active" period so game commands stay blocked until the timer fires.
+export interface ServiceDeal {
+    buyer: number;
+    seller: number;
+    description: string | null;
+    price: number | null;
+    counterPrice: number | null;
+    stage: "awaiting_description" | "awaiting_seller_response" | "awaiting_buyer_counter_response" | "active";
+    timerHandle: NodeJS.Timeout | null;
+    warningHandle: NodeJS.Timeout | null;
+}
+
 // A piece of bondage currently applied in a match. `slot` is the picker-facing
 // display name (see bondagePicker.ts PICK_SLOTS) — the BC item group is
 // derived from it via PICK_SLOTS rather than stored redundantly.
@@ -367,6 +384,8 @@ export interface GameState {
     spendMenuOpen: boolean;
     // In-progress clothing purchase, if any.
     clothingDeal: ClothingDeal | null;
+    // In-progress "actions & services" purchase, if any.
+    serviceDeal: ServiceDeal | null;
     // In-progress bondage purchase (apply or paid removal), if any.
     bondageDeal: BondageDeal | null;
     // Bondage currently applied to either player in this match.

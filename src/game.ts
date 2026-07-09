@@ -22,6 +22,7 @@ import {
     PlayerRecord,
     PlayerState,
     RoundResult,
+    ServiceDeal,
     SoldItem,
     SpendOption,
     ToyDeal,
@@ -82,7 +83,7 @@ function settingLabel(key: NegotiationKey): string {
         case "bondageAppliedBy": return "Bondage application";
         case "lockDuration": return "Lock duration (minutes)";
         case "toys": return "Toys";
-        case "services": return "Services";
+        case "services": return "Actions & Services";
     }
 }
 
@@ -125,7 +126,7 @@ function yesNoQuestion(key: NegotiationKey): string {
         case "stripping": return "Enable stripping?";
         case "bondage": return "Enable bondage and locks?";
         case "toys": return "Enable toys?";
-        case "services": return "Enable sexual services?";
+        case "services": return "Enable actions & services?";
         default: return `Enable ${settingLabel(key)}?`;
     }
 }
@@ -136,7 +137,7 @@ function yesNoQuestion(key: NegotiationKey): string {
 // questions if either player says no.
 const CONSENT_ALL_QUESTION =
     "WinnersDice is an adult game involving stripping, bondage, use of locks and restraints, sexual situations, " +
-    "and potentially sexual services or being under the other player's control for a period of time. " +
+    "and potentially actions & services or being under the other player's control for a period of time. " +
     "Do you both agree to all of this? (yes / no)";
 
 function rollD20(): number {
@@ -458,6 +459,7 @@ export class WinnersDiceGame {
             awaitingPostBank: null,
             spendMenuOpen: false,
             clothingDeal: null,
+            serviceDeal: null,
             bondageDeal: null,
             activeBondage: [],
             removableBondage: [],
@@ -619,6 +621,11 @@ export class WinnersDiceGame {
             return;
         }
 
+        // Same for an in-progress service deal (buyer describes & proposes, seller responds).
+        if (this.state.serviceDeal && this.handleServiceDealMessage(sender, msg, lower)) {
+            return;
+        }
+
         // Plain-language equivalents of !bank / !press for whoever just won
         // a roll and is deciding what to do next.
         if (this.state.phase === "playing" && this.state.awaitingDecision === sender) {
@@ -764,7 +771,8 @@ export class WinnersDiceGame {
             `buyback - Buy back an item you've sold, for double its sale price\n` +
             `toys - Pick a toy and offer a price for a turn with it (they can accept or counter, no declining); ` +
             `once agreed, pick a duration and it's placed in your hand until time's up\n` +
-            `services - coming soon\n` +
+            `actions & services - offer to buy an action or service from your opponent for a price ` +
+            `they can accept, decline, or counter\n` +
             `back - Return to the continue/spend/endgame prompt\n` +
             `cancel - Back out of a purchase or offer you can't afford (or just changed your mind on) (!cancel also works)\n\n` +
             `=== Bondage Removal ===\n` +
@@ -890,6 +898,7 @@ export class WinnersDiceGame {
             awaitingPostBank: null,
             spendMenuOpen: false,
             clothingDeal: null,
+            serviceDeal: null,
             bondageDeal: null,
             activeBondage: [],
             removableBondage: [],
@@ -1205,7 +1214,7 @@ export class WinnersDiceGame {
             negotiation.config.bondage = true;
             negotiation.config.toys = true;
             negotiation.config.services = true;
-            this.bot.sendChat("Both players agreed — stripping, bondage, toys, and services are all enabled.");
+            this.bot.sendChat("Both players agreed — stripping, bondage, toys, and actions & services are all enabled.");
         } else {
             this.bot.sendChat("At least one player said no — let's go through each setting individually.");
         }
@@ -1402,6 +1411,7 @@ export class WinnersDiceGame {
             awaitingPostBank: null,
             spendMenuOpen: false,
             clothingDeal: null,
+            serviceDeal: null,
             bondageDeal: null,
             activeBondage: [],
             removableBondage: [],
@@ -1566,6 +1576,7 @@ export class WinnersDiceGame {
         const state = this.state;
         if (state.phase !== "playing" || !state.players || !state.config || state.awaitingDecision !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByServiceDeal(sender)) return;
 
         const winner = state.players.find(p => p.memberNumber === sender)!;
         winner.balance += state.pot;
@@ -1614,6 +1625,7 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || !state.config) return;
 
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByServiceDeal(sender)) return;
 
         if (state.spendMenuOpen) {
             this.handleSpendMenuChoice(sender, lower, raw);
@@ -1650,6 +1662,7 @@ export class WinnersDiceGame {
         const state = this.state;
         if (state.phase !== "playing" || !state.players || state.awaitingDecision !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByServiceDeal(sender)) return;
 
         const winner = state.players.find(p => p.memberNumber === sender)!;
 
@@ -1698,6 +1711,7 @@ export class WinnersDiceGame {
         if (state.phase !== "playing" || !state.players || !state.config) return;
         if (state.awaitingDecision !== sender && state.awaitingPostBank !== sender) return;
         if (this.blockedByWardrobe(sender)) return;
+        if (this.blockedByServiceDeal(sender)) return;
 
         if (state.currentRound < state.config.minRounds) {
             if (state.awaitingPostBank === sender) {
@@ -1751,6 +1765,7 @@ export class WinnersDiceGame {
         this.releaseAllActiveLocks();
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
+        this.clearServiceDeal();
         this.state = this.createIdleState();
 
         this.checkPendingUpdate();
@@ -1777,7 +1792,7 @@ export class WinnersDiceGame {
         if (state.config!.toys && this.toyCatalog.length > 0) {
             options.push({ key: "toys", label: `toys — pick a toy, agree a price with ${opponent.name}, then use it for a set time` });
         }
-        if (state.config!.services) options.push({ key: "services", label: `services — buy a service (coming soon)` });
+        if (state.config!.services) options.push({ key: "services", label: `actions & services — request an action or service from ${opponent.name} for a price` });
         if (player.soldItems.length > 0) options.push({ key: "buyback", label: `buyback — buy back an item you've sold` });
         options.push({ key: "back", label: `back — return to continue/endgame` });
         return options;
@@ -1874,7 +1889,11 @@ export class WinnersDiceGame {
                 this.bot.whisper(sender, `${settingLabel("services")} wasn't enabled for this match.`);
                 return;
             }
-            this.bot.whisper(sender, `Buying services isn't implemented yet — coming soon! Pick another option from the shop.`);
+            if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal) {
+                this.bot.whisper(sender, "There's already a deal in progress — finish that first.");
+                return;
+            }
+            this.startServiceDeal(sender);
             return;
         }
 
@@ -2061,7 +2080,7 @@ export class WinnersDiceGame {
     private startClothingDeal(buyer: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.bondageDeal || state.lockDeal || state.toyDeal) {
+        if (state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
             this.bot.whisper(buyer, "There's already a deal in progress — finish that first.");
             return;
         }
@@ -2307,6 +2326,270 @@ export class WinnersDiceGame {
     }
 
     // ============================================================
+    // ACTIONS & SERVICES
+    // ============================================================
+    //
+    // Mirrors the clothing deal flow: the winner (buyer) describes a request
+    // and names a price, the loser (seller) can accept, decline, or counter
+    // once, and the buyer can only accept/decline that counter (no further
+    // counters). Unlike clothing, settlement doesn't wait on a wardrobe
+    // change — instead the deal stays non-null through a 5-minute "active"
+    // period (with a 3-minute warning) so the game stays paused until the
+    // timer fires.
+    // ============================================================
+
+    private startServiceDeal(buyer: number): void {
+        const state = this.state;
+        if (!state.players) return;
+        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
+            this.bot.whisper(buyer, "There's already a deal in progress — finish that first.");
+            return;
+        }
+        const seller = state.players.find(p => p.memberNumber !== buyer)!;
+
+        state.serviceDeal = {
+            buyer,
+            seller: seller.memberNumber,
+            description: null,
+            price: null,
+            counterPrice: null,
+            stage: "awaiting_description",
+            timerHandle: null,
+            warningHandle: null,
+        };
+
+        this.bot.whisper(buyer, "What action or service would you like to request? Describe it and name your price in points.");
+    }
+
+    // Dispatches a message to the in-progress service deal, if any. Returns
+    // true if the message was consumed by the deal flow.
+    private handleServiceDealMessage(sender: number, raw: string, lower: string): boolean {
+        const deal = this.state.serviceDeal;
+        if (!deal) return false;
+
+        switch (deal.stage) {
+            case "awaiting_description":
+                if (sender !== deal.buyer) return false;
+                return this.handleServiceDescriptionInput(deal, raw);
+
+            case "awaiting_seller_response":
+                if (sender !== deal.seller) return false;
+                return this.handleServiceSellerResponse(deal, lower);
+
+            case "awaiting_buyer_counter_response":
+                if (sender !== deal.buyer) return false;
+                return this.handleServiceBuyerCounterResponse(deal, lower);
+
+            case "active":
+                return false;
+        }
+    }
+
+    // Parses the buyer's description/price input, same free-form extraction
+    // as clothing (extractItemAndPrice). Since ServiceDeal has a single
+    // "awaiting_description" stage (no separate item/price sub-stages), the
+    // still-missing field is tracked by which of deal.description/deal.price
+    // is still null. Always consumes the message.
+    private handleServiceDescriptionInput(deal: ServiceDeal, raw: string): boolean {
+        if (deal.description === null && deal.price === null) {
+            const { item: description, price } = extractItemAndPrice(raw);
+            if (description && price !== null) {
+                deal.description = description;
+                deal.price = price;
+                this.proposeServiceDealToSeller(deal);
+            } else if (description) {
+                deal.description = description;
+                this.bot.whisper(deal.buyer, `Got it — how many points are you offering?`);
+            } else if (price !== null) {
+                deal.price = price;
+                this.bot.whisper(deal.buyer, `Got ${price} points — what action or service would you like to request?`);
+            } else {
+                this.bot.whisper(deal.buyer, "What action or service would you like to request? Describe it and name your price in points.");
+            }
+            return true;
+        }
+
+        if (deal.description === null) {
+            const { item: description } = extractItemAndPrice(raw);
+            if (!description) {
+                this.bot.whisper(deal.buyer, "What action or service would you like to request?");
+                return true;
+            }
+            deal.description = description;
+            this.proposeServiceDealToSeller(deal);
+            return true;
+        }
+
+        // price is null
+        const price = extractNumber(raw);
+        if (price === null) {
+            this.bot.whisper(deal.buyer, "How many points are you offering?");
+            return true;
+        }
+        deal.price = price;
+        this.proposeServiceDealToSeller(deal);
+        return true;
+    }
+
+    private proposeServiceDealToSeller(deal: ServiceDeal): void {
+        const state = this.state;
+        if (state.spendingBalance < deal.price!) {
+            this.bot.whisper(deal.buyer, `You can't afford that — ${deal.price} points is more than your ${state.spendingBalance} balance. Type !cancel to exit the shop, or describe what you'd like to request and your price.`);
+            deal.description = null;
+            deal.price = null;
+            return;
+        }
+
+        deal.stage = "awaiting_seller_response";
+        this.bot.whisper(deal.seller,
+            `${this.playerName(deal.buyer)} wants to buy a service: "${deal.description}" for ${deal.price} pts. ` +
+            `Reply accept, decline, or counter <amount>.`
+        );
+        this.bot.whisper(deal.buyer,
+            `⏳ Offer sent to ${this.playerName(deal.seller)}. Waiting for their response...`
+        );
+    }
+
+    private handleServiceSellerResponse(deal: ServiceDeal, lower: string): boolean {
+        if (lower === "accept" || lower === "yes" || lower === "y") {
+            this.finalizeServiceDeal(deal, deal.price!);
+            return true;
+        }
+
+        if (lower === "decline" || lower === "no" || lower === "n") {
+            this.bot.whisper(deal.buyer, "Service declined.");
+            this.state.serviceDeal = null;
+            this.returnToSpendMenu(deal.buyer);
+            return true;
+        }
+
+        const counterMatch = lower.match(/^counter(?:\s+(.+))?$/);
+        if (counterMatch) {
+            const valueText = (counterMatch[1] ?? "").trim();
+            const n = extractNumber(valueText);
+            if (n === null) {
+                this.bot.whisper(deal.seller, "Please counter with an amount, e.g. 'counter 40'.");
+                return true;
+            }
+            deal.counterPrice = n;
+            deal.stage = "awaiting_buyer_counter_response";
+            this.bot.whisper(deal.buyer, `${this.playerName(deal.seller)} counters: "${deal.description}" for ${n} points. Accept or decline?`);
+            return true;
+        }
+
+        this.bot.whisper(deal.seller, "Please say 'accept', 'decline', or 'counter <amount>'.");
+        return true;
+    }
+
+    // The buyer can only accept or decline the seller's counter — no
+    // further counter-offers from the buyer.
+    private handleServiceBuyerCounterResponse(deal: ServiceDeal, lower: string): boolean {
+        if (lower === "accept" || lower === "yes" || lower === "y") {
+            this.finalizeServiceDeal(deal, deal.counterPrice!);
+            return true;
+        }
+
+        if (lower === "decline" || lower === "no" || lower === "n") {
+            this.bot.whisper(deal.seller, "Service declined.");
+            this.state.serviceDeal = null;
+            this.returnToSpendMenu(deal.buyer);
+            return true;
+        }
+
+        this.bot.whisper(deal.buyer, "Accept or decline the counter-offer?");
+        return true;
+    }
+
+    // Settles an agreed service deal at the final price: checks the buyer
+    // can afford it, deducts the full price from their spending balance,
+    // credits half to the seller's pending balance (the other half is the
+    // bot's fee), announces it, and starts the 5-minute active timer. The
+    // deal stays non-null (stage "active") until the timer fires, keeping
+    // the game paused.
+    private finalizeServiceDeal(deal: ServiceDeal, price: number): void {
+        const state = this.state;
+        if (!state.players) return;
+
+        const buyer = state.players.find(p => p.memberNumber === deal.buyer)!;
+        const seller = state.players.find(p => p.memberNumber === deal.seller)!;
+        const description = deal.description!;
+
+        if (state.spendingBalance < price) {
+            this.bot.whisper(deal.buyer, `You can't afford that — ${price} points is more than your ${state.spendingBalance} balance. The deal is off.`);
+            this.bot.whisper(deal.seller, `${this.playerName(deal.buyer)} can't cover ${price} points — the deal is off.`);
+            state.serviceDeal = null;
+            this.returnToSpendMenu(deal.buyer);
+            return;
+        }
+
+        const half = Math.floor(price / 2);
+        state.spendingBalance -= price;
+        seller.pendingBalance += half;
+
+        this.bot.sendChat(`✅ ${buyer.name} purchased a service from ${seller.name}: "${description}" for ${price} pts. ${seller.name} has 5 minutes.`);
+
+        deal.price = price;
+        deal.stage = "active";
+        this.startServiceTimer(deal);
+    }
+
+    // Schedules the 3-minute warning whisper and the 5-minute expiry for an
+    // active service deal.
+    private startServiceTimer(deal: ServiceDeal): void {
+        deal.warningHandle = setTimeout(() => {
+            this.bot.whisper(deal.buyer, "⏳ 3 minutes remaining on the service.");
+            this.bot.whisper(deal.seller, "⏳ 3 minutes remaining on the service.");
+        }, 2 * 60 * 1000);
+
+        deal.timerHandle = setTimeout(() => this.expireServiceDeal(deal), 5 * 60 * 1000);
+    }
+
+    // Fires when an active service deal's 5-minute timer runs out — announces
+    // it, clears the deal, and resumes whichever menu the buyer was in.
+    // Guards against a stale timer in case the deal was already cleared some
+    // other way (match end, safeword, reset) in the meantime.
+    private expireServiceDeal(deal: ServiceDeal): void {
+        if (this.state.serviceDeal !== deal) return;
+
+        this.bot.sendChat("⏰ Time's up! The service period has ended. Game resumes.");
+        this.state.serviceDeal = null;
+        this.sendPostServiceMenu(deal.buyer);
+    }
+
+    // Whispers the buyer what to do next once an active service deal's timer
+    // clears — re-showing whichever menu they were in before the pause.
+    private sendPostServiceMenu(buyer: number): void {
+        const state = this.state;
+        if (state.phase !== "playing" || state.awaitingPostBank !== buyer) return;
+
+        if (state.spendMenuOpen) {
+            this.openSpendMenu(buyer);
+        } else {
+            this.bot.whisper(buyer, `Game resumes — here's what you can do next:\n` + this.postBankPromptText(buyer));
+        }
+    }
+
+    // Cancels an in-progress or active service deal's timers and clears it —
+    // called alongside clearPendingWardrobeChecks()/releaseActiveToy() when a
+    // match ends, is force-reset, or halted by a safeword.
+    private clearServiceDeal(): void {
+        const deal = this.state.serviceDeal;
+        if (!deal) return;
+        if (deal.timerHandle) clearTimeout(deal.timerHandle);
+        if (deal.warningHandle) clearTimeout(deal.warningHandle);
+        this.state.serviceDeal = null;
+    }
+
+    // Whispers `sender` that the game is paused if a service deal is being
+    // negotiated or its active timer is running. Returns true if the command
+    // should be blocked.
+    private blockedByServiceDeal(sender: number): boolean {
+        if (!this.state.serviceDeal) return false;
+        this.bot.whisper(sender, "⏳ A service is in progress — game is paused.");
+        return true;
+    }
+
+    // ============================================================
     // BONDAGE PURCHASES
     // ============================================================
     //
@@ -2423,7 +2706,7 @@ export class WinnersDiceGame {
     private startBondageDeal(buyer: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal) {
+        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
             this.bot.whisper(buyer, "There's already a deal in progress — finish that first.");
             return;
         }
@@ -3039,7 +3322,7 @@ export class WinnersDiceGame {
     private startLockDeal(sender: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal) {
+        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
             this.bot.whisper(sender, "There's already a deal in progress — finish that first.");
             return;
         }
@@ -3390,7 +3673,7 @@ export class WinnersDiceGame {
     private startToyDeal(winner: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal) {
+        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
             this.bot.whisper(winner, "There's already a deal in progress — finish that first.");
             return;
         }
@@ -3812,6 +4095,7 @@ export class WinnersDiceGame {
         this.releaseAllActiveLocks();
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
+        this.clearServiceDeal();
         this.state = this.createIdleState();
 
         this.bot.sendChat(`⛔ ${playerName} has used their safeword. The game has been stopped.`);
@@ -3907,6 +4191,7 @@ export class WinnersDiceGame {
         this.releaseAllActiveLocks();
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
+        this.clearServiceDeal();
         this.state = this.createIdleState();
         this.bot.sendChat("Game has been reset by admin.");
     }
