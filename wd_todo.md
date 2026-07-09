@@ -2,12 +2,10 @@
 
 ## HIGH PRIORITY
 
-1. Decide max rolls per round — currently unlimited pressing; needs a cap decision
-2. % rule on negotiations — enforce percentage-based limits on counter-offers during negotiation
-3. Decide what to do about clothing — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
+1. Decide what to do about clothing — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
    - Key open question: how does the bot actually remove clothing from a player? Need to research whether BC's socket API supports bot-initiated clothing removal, or if it requires the player to do it themselves (like BD's "!removed" confirmation flow). This affects whether stripping can be automatic or honor-system.
-4. Clean up help more — possibly context-sensitive help based on current game phase/menu state
-5. More obvious ways to back out of a transaction — make cancel/back options clearer at every step
+2. Clean up help more — possibly context-sensitive help based on current game phase/menu state
+3. **Price tracking** — track what prices items actually sold for during shop negotiations, so players and admins can see historical pricing data. Design TBD (could be per-session log, persistent file, or whisper on request via !prices).
 
 ---
 
@@ -95,6 +93,14 @@ See `Completed` below — the 5-question proposal, up-to-5-step negotiation, blo
 ---
 
 ## Completed
+
+### Completed Today (2026-07-09)
+- Early shop announcements: all spend menu options (bondage, clothing, locks, toys, buyback, boost, services) now announce to the room when entered
+- Standardized cancel/back: `0` backs out of any numbered menu, `0` cancels price entry, `cancel`/`!cancel` works in free-form text fields; service deal cancel bug fixed
+- Toys picker redesigned to match bondage: popular list of 9 items + random fill, fuzzy match with confirm, `list` shows full catalog, `0` backs out
+- Shop counter-offer rules: first counter capped at 2× if original offer > 500; subsequent counters must close gap by ≥10% when gap > 50 pts; bot shows minimum and auto-applies it if player goes below
+- Max rolls per round: capped at 20 (`MAX_ROLLS_PER_ROUND` constant, easy to change)
+- Merged endgame branch → master and dev; runtime files gitignored (players.json, wrapper.output, etc.)
 
 - Shared pot model (one pot, winner takes all on bank)
 - Streak + Boost two-component system (streak resets on loss, boost -1 per loss)
