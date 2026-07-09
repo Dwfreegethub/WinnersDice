@@ -174,17 +174,34 @@ export interface ClothingDeal {
 
 // In-progress "actions & services" purchase negotiated via the spend menu:
 // the winner (buyer) describes a request and names a price; the loser
-// (seller) can accept, decline, or counter, same shape as a clothing deal.
-// Once agreed, the price is settled immediately (seller receives half, the
-// rest is the bot fee) and the deal stays non-null through the 5-minute
-// "active" period so game commands stay blocked until the timer fires.
+// (seller) and buyer then negotiate through the structured 5-step price
+// negotiation (see applyInitiatorOffer/applyResponderCounter in game.ts) —
+// same shape as a bondage/lock deal. Once agreed, the price is settled
+// immediately (seller receives half, the rest is the bot fee) and the deal
+// stays non-null through the 5-minute "active" period so game commands stay
+// blocked until the timer fires.
 export interface ServiceDeal {
     buyer: number;
     seller: number;
     description: string | null;
+    // The buyer's (initiator's) most recent offer.
     price: number | null;
+    // The seller's (responder's) most recent counter.
     counterPrice: number | null;
-    stage: "awaiting_description" | "awaiting_seller_response" | "awaiting_buyer_counter_response" | "active";
+    stage:
+        | "awaiting_description"
+        | "awaiting_seller_response"
+        | "awaiting_seller_counter_value"
+        | "awaiting_buyer_counter_response"
+        | "awaiting_buyer_counter_value"
+        | "active";
+    // 0 before the buyer's first offer; 1-5 tracking the structured
+    // negotiation steps described in game.ts (applyInitiatorOffer/applyResponderCounter).
+    negotiationStep: number;
+    // The buyer's opening offer — their counters can never go below this.
+    initiatorFloor: number | null;
+    // The seller's first counter — their later counters can never go above this.
+    responderCeiling: number | null;
     timerHandle: NodeJS.Timeout | null;
     warningHandle: NodeJS.Timeout | null;
 }

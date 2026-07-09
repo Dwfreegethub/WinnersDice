@@ -2354,6 +2354,9 @@ export class WinnersDiceGame {
             price: null,
             counterPrice: null,
             stage: "awaiting_description",
+            negotiationStep: 0,
+            initiatorFloor: null,
+            responderCeiling: null,
             timerHandle: null,
             warningHandle: null,
         };
@@ -2376,9 +2379,17 @@ export class WinnersDiceGame {
                 if (sender !== deal.seller) return false;
                 return this.handleServiceSellerResponse(deal, lower);
 
+            case "awaiting_seller_counter_value":
+                if (sender !== deal.seller) return false;
+                return this.handleServiceSellerCounterValue(deal, raw);
+
             case "awaiting_buyer_counter_response":
                 if (sender !== deal.buyer) return false;
                 return this.handleServiceBuyerCounterResponse(deal, lower);
+
+            case "awaiting_buyer_counter_value":
+                if (sender !== deal.buyer) return false;
+                return this.handleServiceBuyerCounterValue(deal, raw);
 
             case "active":
                 return false;
@@ -2440,6 +2451,9 @@ export class WinnersDiceGame {
             return;
         }
 
+        // Opening offer — always succeeds at negotiationStep 0, sets initiatorFloor.
+        applyInitiatorOffer(deal, deal.price!);
+
         deal.stage = "awaiting_seller_response";
         this.bot.whisper(deal.seller,
             `${this.playerName(deal.buyer)} wants to buy a service: "${deal.description}" for ${deal.price} pts. ` +
@@ -2466,23 +2480,43 @@ export class WinnersDiceGame {
         const counterMatch = lower.match(/^counter(?:\s+(.+))?$/);
         if (counterMatch) {
             const valueText = (counterMatch[1] ?? "").trim();
-            const n = extractNumber(valueText);
-            if (n === null) {
-                this.bot.whisper(deal.seller, "Please counter with an amount, e.g. 'counter 40'.");
+            if (!valueText) {
+                deal.stage = "awaiting_seller_counter_value";
+                this.bot.whisper(deal.seller, "How many points would you like to counter with?");
                 return true;
             }
-            deal.counterPrice = n;
-            deal.stage = "awaiting_buyer_counter_response";
-            this.bot.whisper(deal.buyer, `${this.playerName(deal.seller)} counters: "${deal.description}" for ${n} points. Accept or decline?`);
-            return true;
+            return this.handleServiceSellerCounterValue(deal, valueText);
         }
 
         this.bot.whisper(deal.seller, "Please say 'accept', 'decline', or 'counter <amount>'.");
         return true;
     }
 
-    // The buyer can only accept or decline the seller's counter — no
-    // further counter-offers from the buyer.
+    private handleServiceSellerCounterValue(deal: ServiceDeal, raw: string): boolean {
+        const n = extractNumber(raw);
+        if (n === null) {
+            this.bot.whisper(deal.seller, "How many points would you like to counter with?");
+            return true;
+        }
+
+        const result = applyResponderCounter(deal, n);
+        if (!result.ok) {
+            this.bot.whisper(deal.seller, result.error!);
+            return true;
+        }
+
+        if (result.matched) {
+            this.finalizeServiceDeal(deal, result.price!);
+            return true;
+        }
+
+        deal.stage = "awaiting_buyer_counter_response";
+        this.bot.whisper(deal.buyer, `${this.playerName(deal.seller)} counters: "${deal.description}" for ${deal.counterPrice} points. Accept, decline, or counter?`);
+        return true;
+    }
+
+    // The buyer can accept, decline, or counter the seller's counter,
+    // continuing the structured negotiation (see applyInitiatorOffer).
     private handleServiceBuyerCounterResponse(deal: ServiceDeal, lower: string): boolean {
         if (lower === "accept" || lower === "yes" || lower === "y") {
             this.finalizeServiceDeal(deal, deal.counterPrice!);
@@ -2496,7 +2530,41 @@ export class WinnersDiceGame {
             return true;
         }
 
-        this.bot.whisper(deal.buyer, "Accept or decline the counter-offer?");
+        const counterMatch = lower.match(/^counter(?:\s+(.+))?$/);
+        if (counterMatch) {
+            const valueText = (counterMatch[1] ?? "").trim();
+            if (!valueText) {
+                deal.stage = "awaiting_buyer_counter_value";
+                this.bot.whisper(deal.buyer, "How many points would you like to counter with?");
+                return true;
+            }
+            return this.handleServiceBuyerCounterValue(deal, valueText);
+        }
+
+        this.bot.whisper(deal.buyer, "Please say 'accept', 'decline', or 'counter <amount>'.");
+        return true;
+    }
+
+    private handleServiceBuyerCounterValue(deal: ServiceDeal, raw: string): boolean {
+        const n = extractNumber(raw);
+        if (n === null) {
+            this.bot.whisper(deal.buyer, "How many points would you like to counter with?");
+            return true;
+        }
+
+        const result = applyInitiatorOffer(deal, n);
+        if (!result.ok) {
+            this.bot.whisper(deal.buyer, result.error!);
+            return true;
+        }
+
+        if (result.final || result.matched) {
+            this.finalizeServiceDeal(deal, result.matched ? result.price! : deal.price!);
+            return true;
+        }
+
+        deal.stage = "awaiting_seller_response";
+        this.bot.whisper(deal.seller, `${this.playerName(deal.buyer)} counters: "${deal.description}" for ${deal.price} points. Accept, decline, or counter?`);
         return true;
     }
 
