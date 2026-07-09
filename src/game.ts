@@ -178,6 +178,19 @@ const ALLOW_FREE_REAPPLY = true;
 // item costs double its sale price; see handleBuybackResponse).
 const LOCK_REMOVAL_MULTIPLIER = 2;
 
+// When stripping the winner's bondage at end of game, items are removed one
+// at a time with this delay between each so the client isn't hit with
+// several simultaneous item updates.
+const END_GAME_STRIP_STAGGER_MS = 1000;
+
+// After each removal, how long to wait before checking the winner's synced
+// appearance to confirm the item actually came off.
+const END_GAME_STRIP_VERIFY_DELAY_MS = 1000;
+
+// Total attempts (initial + retries) before giving up on a stuck item and
+// telling the winner to remove it manually.
+const END_GAME_STRIP_MAX_ATTEMPTS = 3;
+
 // ============================================================
 // END GAME
 // ============================================================
@@ -1898,7 +1911,7 @@ export class WinnersDiceGame {
 
         this.clearPendingWardrobeChecks();
         this.releaseAllActiveLocks();
-        this.releaseAllActiveBondage();
+        this.releaseWinnerBondage(winner.memberNumber);
         this.releaseActiveToy();
         this.state = this.createIdleState();
 
@@ -4016,16 +4029,59 @@ export class WinnersDiceGame {
     }
 
     // Physically releases every active bondage item via the BC socket and
-    // clears the tracking arrays — called when a match ends (finishMatch),
-    // is force-reset (!reset), or halted by a safeword, so nobody is left
-    // restrained with no in-bot way to remove it once the match's
-    // activeBondage tracking is wiped.
+    // clears the tracking arrays — used for a force-reset (!reset) or a
+    // safeword halt, where both players need to be freed immediately. A
+    // normal match end goes through releaseWinnerBondage() instead, since
+    // the loser's bondage is meant to stay on (the end-game timer lock
+    // handles stripping them later).
     private releaseAllActiveBondage(): void {
         for (const entry of this.state.activeBondage) {
             this.bot.removeItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot));
         }
         this.state.activeBondage = [];
         this.state.removableBondage = [];
+    }
+
+    // Strips only the winner's active bondage at the end of a match — the
+    // loser's stays on, since the end-game timer lock is responsible for
+    // freeing them. Removal is staggered one item at a time
+    // (END_GAME_STRIP_STAGGER_MS apart) rather than fired all at once, and
+    // each removal is verified against the winner's synced appearance,
+    // retrying up to END_GAME_STRIP_MAX_ATTEMPTS times before giving up and
+    // asking the winner to remove the item manually.
+    private releaseWinnerBondage(winnerMemberNumber: number): void {
+        const toRemove = this.state.activeBondage.filter(b => b.wearerMemberNumber === winnerMemberNumber);
+
+        toRemove.forEach((entry, i) => {
+            setTimeout(() => {
+                this.stripWinnerItem(winnerMemberNumber, entry.slot, this.groupForSlotDisplay(entry.slot), 1);
+            }, i * END_GAME_STRIP_STAGGER_MS);
+        });
+
+        this.state.activeBondage = this.state.activeBondage.filter(b => b.wearerMemberNumber !== winnerMemberNumber);
+        this.state.removableBondage = this.state.removableBondage.filter(b => b.wearerMemberNumber !== winnerMemberNumber);
+    }
+
+    // Removes one item from the winner and, after a short delay, checks
+    // their re-synced appearance to confirm it actually came off. If it's
+    // still there, retries (re-sending the removal) up to
+    // END_GAME_STRIP_MAX_ATTEMPTS total attempts before whispering the
+    // winner to remove it by hand.
+    private stripWinnerItem(memberNumber: number, slotDisplay: string, group: string, attempt: number): void {
+        this.bot.removeItem(memberNumber, group);
+
+        setTimeout(() => {
+            const char = this.roomCharacters.get(memberNumber);
+            const stillPresent = char?.Appearance?.some((item: any) => item.Group === group) ?? false;
+            if (!stillPresent) return;
+
+            if (attempt >= END_GAME_STRIP_MAX_ATTEMPTS) {
+                this.bot.whisper(memberNumber, `I tried to remove your bondage but couldn't free your ${slotDisplay} — you may need to remove it manually.`);
+                return;
+            }
+
+            this.stripWinnerItem(memberNumber, slotDisplay, group, attempt + 1);
+        }, END_GAME_STRIP_VERIFY_DELAY_MS);
     }
 
     // ============================================================
