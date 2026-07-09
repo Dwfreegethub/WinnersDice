@@ -3626,7 +3626,7 @@ export class WinnersDiceGame {
             return;
         }
 
-        this.bot.applyItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), entry.itemName, "Default", {});
+        this.bot.applyItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), entry.itemName, "Default", { Difficulty: 20 });
         state.activeBondage.push({ ...entry });
         state.removableBondage.splice(idx, 1);
 
@@ -3990,7 +3990,7 @@ export class WinnersDiceGame {
             state.spendingBalance -= price;
             wearer.pendingBalance += half;
 
-            this.bot.applyItem(deal.wearer, group, itemName, "Default", {});
+            this.bot.applyItem(deal.wearer, group, itemName, "Default", { Difficulty: 20 });
             state.activeBondage.push({
                 slot: deal.slot!,
                 itemName,
