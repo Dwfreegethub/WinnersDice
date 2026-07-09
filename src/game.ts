@@ -819,8 +819,8 @@ export class WinnersDiceGame {
 
     private handleReadme(memberNumber: number): void {
         const text =
-            `=== WinnersDice Readme ===\n` +
-            `WinnersDice is a two-player dice duel with stakes. Challenge someone, negotiate what's on the line — rounds, stripping, bondage, toys, maybe a little service — then roll. The winner of each roll builds a pot and decides when to bank it. Spend those coins making your opponent's evening... interesting.\n\n` +
+            `=== WinnersDice ===\n` +
+            `WinnersDice is a high-stakes, two-player dice duel with adult consequences. Challenge someone, negotiate what's on the line — rounds, stripping, bondage, toys, maybe a little service — then roll. The winner of each roll builds a pot, takes control, and decides what happens next. Roll on, bank it, or spend those coins making your opponent's evening... interesting.\n\n` +
             `Roll well and your streak grows. Roll a natural 20 and you're on fire. Roll a 1 and you'll feel it. Press your luck or play it safe — but once the rounds are done, someone's walking away in more restraints than they arrived in.\n\n` +
             `Shop smart. Roll lucky. And maybe... negotiate a little mercy.\n\n` +
             `Say !help for commands.`;
