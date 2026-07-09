@@ -1470,6 +1470,11 @@ export class WinnersDiceGame {
             return;
         }
 
+        if (state.clothingDeal && (sender === state.clothingDeal.buyer || sender === state.clothingDeal.opponent)) {
+            this.handleClothingDealCancel(sender);
+            return;
+        }
+
         if (state.bondageDeal && (sender === state.bondageDeal.placer || sender === state.bondageDeal.wearer)) {
             this.handleBondageDealCancel(sender);
             return;
@@ -1491,6 +1496,24 @@ export class WinnersDiceGame {
         }
 
         this.handleShopCancel(sender);
+    }
+
+    // Either party in an in-progress clothing deal can back out — mirrors
+    // handleLockDealCancel/handleBondageDealCancel.
+    private handleClothingDealCancel(sender: number): void {
+        const deal = this.state.clothingDeal;
+        if (!deal) return;
+
+        const otherParty = sender === deal.buyer ? deal.opponent : deal.buyer;
+        const alreadyVisibleToBoth = deal.stage !== "awaiting_item_price" && deal.stage !== "awaiting_item" && deal.stage !== "awaiting_price";
+
+        this.bot.whisper(sender, "Clothing deal cancelled.");
+        if (alreadyVisibleToBoth) {
+            this.bot.whisper(otherParty, `${this.playerName(sender)} cancelled the clothing deal.`);
+        }
+
+        this.state.clothingDeal = null;
+        this.returnToSpendMenu(deal.buyer);
     }
 
     // Either party in an in-progress bondage deal can back out — always
@@ -1574,17 +1597,6 @@ export class WinnersDiceGame {
         if (state.awaitingBuyback === sender) {
             state.awaitingBuyback = null;
             this.bot.whisper(sender, "Buyback cancelled.");
-            this.returnToSpendMenu(sender);
-            return;
-        }
-
-        if (state.clothingDeal && sender === state.clothingDeal.buyer) {
-            const deal = state.clothingDeal;
-            if (deal.stage !== "awaiting_item_price" && deal.stage !== "awaiting_item" && deal.stage !== "awaiting_price") {
-                this.bot.whisper(deal.opponent, `${this.playerName(deal.buyer)} cancelled the clothing deal.`);
-            }
-            this.bot.whisper(sender, "Clothing deal cancelled.");
-            state.clothingDeal = null;
             this.returnToSpendMenu(sender);
             return;
         }
@@ -3018,10 +3030,6 @@ export class WinnersDiceGame {
                 this.bot.whisper(sender, "Bondage wasn't enabled for this match.");
                 return;
             }
-            if (state.clothingDeal) {
-                this.bot.whisper(sender, "There's already a clothing deal in progress — finish that first.");
-                return;
-            }
             this.startBondageDeal(sender);
             return;
         }
@@ -3029,10 +3037,6 @@ export class WinnersDiceGame {
         if (key === "locks") {
             if (!state.config.bondage) {
                 this.bot.whisper(sender, "Bondage wasn't enabled for this match.");
-                return;
-            }
-            if (state.clothingDeal || state.bondageDeal) {
-                this.bot.whisper(sender, "There's already a deal in progress — finish that first.");
                 return;
             }
             this.startLockDeal(sender);
@@ -3044,10 +3048,6 @@ export class WinnersDiceGame {
                 this.bot.whisper(sender, `${settingLabel("services")} wasn't enabled for this match.`);
                 return;
             }
-            if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal) {
-                this.bot.whisper(sender, "There's already a deal in progress — finish that first.");
-                return;
-            }
             this.startServiceDeal(sender);
             return;
         }
@@ -3055,10 +3055,6 @@ export class WinnersDiceGame {
         if (key === "toys") {
             if (!state.config.toys) {
                 this.bot.whisper(sender, `${settingLabel("toys")} wasn't enabled for this match.`);
-                return;
-            }
-            if (state.clothingDeal || state.bondageDeal || state.lockDeal) {
-                this.bot.whisper(sender, "There's already a deal in progress — finish that first.");
                 return;
             }
             this.startToyDeal(sender);
@@ -3247,10 +3243,7 @@ export class WinnersDiceGame {
     private startClothingDeal(buyer: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
-            this.bot.whisper(buyer, "There's already a deal in progress — finish that first.");
-            return;
-        }
+        if (this.blockedByShopDeal(buyer)) return;
         const opponent = state.players.find(p => p.memberNumber !== buyer)!;
 
         state.clothingDeal = {
@@ -3298,7 +3291,7 @@ export class WinnersDiceGame {
     private handleClothingItemPriceInput(deal: ClothingDeal, raw: string): boolean {
         const trimmedLower = raw.trim().toLowerCase();
         if (trimmedLower === "cancel" || trimmedLower === "!cancel") {
-            this.handleShopCancel(deal.buyer);
+            this.handleClothingDealCancel(deal.buyer);
             return true;
         }
 
@@ -3336,7 +3329,7 @@ export class WinnersDiceGame {
         // awaiting_price
         const price = extractNumber(raw);
         if (price === 0) {
-            this.handleShopCancel(deal.buyer);
+            this.handleClothingDealCancel(deal.buyer);
             return true;
         }
         if (price === null) {
@@ -3535,10 +3528,7 @@ export class WinnersDiceGame {
     private startServiceDeal(buyer: number): void {
         const state = this.state;
         if (!state.players) return;
-        if (state.clothingDeal || state.bondageDeal || state.lockDeal || state.toyDeal || state.serviceDeal) {
-            this.bot.whisper(buyer, "There's already a deal in progress — finish that first.");
-            return;
-        }
+        if (this.blockedByShopDeal(buyer)) return;
         const seller = state.players.find(p => p.memberNumber !== buyer)!;
 
         state.serviceDeal = {
