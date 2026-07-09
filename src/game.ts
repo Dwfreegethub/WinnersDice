@@ -3192,6 +3192,7 @@ export class WinnersDiceGame {
         }
 
         deal.stage = "awaiting_opponent_response";
+        this.bot.sendChat(`👗 ${this.playerName(deal.buyer)} is looking to buy some clothing from ${this.playerName(deal.opponent)}...`);
         this.bot.whisper(deal.opponent,
             `${this.playerName(deal.buyer)} wants to buy your ${deal.item} for ${deal.price} points. ` +
             `Accept, decline, or counter with a different price? (say 'accept', 'decline', or 'counter <number>')`
