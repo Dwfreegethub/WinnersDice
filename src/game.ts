@@ -4841,7 +4841,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_opponent_counter_value";
-                this.bot.whisper(deal.wearer, "What removal price would you like to counter with?" + counterOfferHint(deal));
+                this.bot.whisper(deal.wearer, `What price would you like to counter with to lock ${deal.slots.join(", ")}? (removal will cost 2× that)` + counterOfferHint(deal));
                 return true;
             }
             return this.handleLockWearerCounterValue(deal, valueText);
@@ -4854,7 +4854,7 @@ export class WinnersDiceGame {
     private handleLockWearerCounterValue(deal: LockDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.wearer, "What removal price would you like to counter with?" + counterOfferHint(deal));
+            this.bot.whisper(deal.wearer, `What price would you like to counter with to lock ${deal.slots.join(", ")}? (removal will cost 2× that)` + counterOfferHint(deal));
             return true;
         }
 
@@ -4895,7 +4895,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_buyer_counter_value";
-                this.bot.whisper(deal.placer, "What removal price would you like to counter with?" + counterOfferHint(deal));
+                this.bot.whisper(deal.placer, `What price would you like to counter with to lock ${deal.slots.join(", ")}? (removal will cost 2× that)` + counterOfferHint(deal));
                 return true;
             }
             return this.handleLockPlacerCounterValue(deal, valueText);
@@ -4908,7 +4908,7 @@ export class WinnersDiceGame {
     private handleLockPlacerCounterValue(deal: LockDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.placer, "What removal price would you like to counter with?" + counterOfferHint(deal));
+            this.bot.whisper(deal.placer, `What price would you like to counter with to lock ${deal.slots.join(", ")}? (removal will cost 2× that)` + counterOfferHint(deal));
             return true;
         }
 
