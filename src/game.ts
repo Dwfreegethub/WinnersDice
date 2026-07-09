@@ -1391,6 +1391,11 @@ export class WinnersDiceGame {
             return;
         }
 
+        if (state.serviceDeal && (sender === state.serviceDeal.buyer || sender === state.serviceDeal.seller)) {
+            this.handleServiceDealCancel(sender);
+            return;
+        }
+
         this.handleShopCancel(sender);
     }
 
@@ -1774,6 +1779,11 @@ export class WinnersDiceGame {
 
         if (state.spendMenuOpen) {
             this.handleSpendMenuChoice(sender, lower, raw);
+            return;
+        }
+
+        if (lower === "0") {
+            this.bot.whisper(sender, "You're at the main menu — there's nothing to go back to. Choose an option or wait for the other player.");
             return;
         }
 
@@ -2835,7 +2845,6 @@ export class WinnersDiceGame {
         }
         if (state.config!.services) options.push({ key: "services", label: `actions & services — request an action or service from ${opponent.name} for a price` });
         if (player.soldItems.length > 0) options.push({ key: "buyback", label: `buyback — buy back an item you've sold` });
-        options.push({ key: "back", label: `back — return to continue/endgame` });
         return options;
     }
 
@@ -2849,7 +2858,8 @@ export class WinnersDiceGame {
         state.spendMenuOpen = true;
         this.bot.whisper(sender,
             `The shop (${state.spendingBalance} points balance) — what would you like to do?\n` +
-            options.map((o, i) => `${i + 1}. ${o.label}`).join("\n")
+            options.map((o, i) => `${i + 1}. ${o.label}`).join("\n") +
+            `\n0. Back — return to continue/endgame`
         );
     }
 
@@ -2869,19 +2879,19 @@ export class WinnersDiceGame {
             return;
         }
 
+        if (lower === "0") {
+            state.spendMenuOpen = false;
+            this.bot.whisper(sender, this.postBankPromptText(sender));
+            return;
+        }
+
         const options = this.spendMenuOptions(sender);
         const idx = /^\d+$/.test(lower) ? parseInt(lower, 10) : null;
         const key = (idx !== null && idx >= 1 && idx <= options.length) ? options[idx - 1].key : null;
 
         if (key === null) {
             this.bot.whisper(sender,
-                `I didn't catch that — reply with a number (${options.map((o, i) => `${i + 1}. ${o.label}`).join(", ")})`);
-            return;
-        }
-
-        if (key === "back") {
-            state.spendMenuOpen = false;
-            this.bot.whisper(sender, this.postBankPromptText(sender));
+                `I didn't catch that — reply with a number (${options.map((o, i) => `${i + 1}. ${o.label}`).join(", ")}, 0. Back)`);
             return;
         }
 
@@ -2981,7 +2991,7 @@ export class WinnersDiceGame {
             `+4 Boost — 500 points\n` +
             `+5 Boost — 1,000 points\n` +
             `(your current boost: +${player.boost}, max total: +${MAX_BOOST})\n` +
-            `How many levels? (say 1-5)`
+            `How many levels? (say 1-5, or 0 to go back)`
         );
     }
 
@@ -2991,6 +3001,10 @@ export class WinnersDiceGame {
         const player = state.players.find(p => p.memberNumber === sender)!;
 
         const n = extractNumber(raw);
+        if (n === 0) {
+            this.handleShopCancel(sender);
+            return;
+        }
         if (n === null || n < 1 || n > 5) {
             this.bot.whisper(sender, "Please say a number from 1 to 5.");
             return;
@@ -3048,6 +3062,7 @@ export class WinnersDiceGame {
         this.bot.whisper(sender,
             `Which item would you like to buy back?\n` +
             lines.join("\n") +
+            `\n0. Back` +
             `\n(say the item name or number)`
         );
     }
@@ -3072,6 +3087,10 @@ export class WinnersDiceGame {
                 return;
             }
         } else {
+            if (raw.trim() === "0") {
+                this.handleShopCancel(sender);
+                return;
+            }
             const num = extractNumber(raw);
             if (num !== null && num >= 1 && num <= player.soldItems.length) {
                 chosen = player.soldItems[num - 1];
@@ -3173,6 +3192,12 @@ export class WinnersDiceGame {
     // Parses the buyer's item/price input for stages awaiting_item_price,
     // awaiting_item, and awaiting_price. Always consumes the message.
     private handleClothingItemPriceInput(deal: ClothingDeal, raw: string): boolean {
+        const trimmedLower = raw.trim().toLowerCase();
+        if (trimmedLower === "cancel" || trimmedLower === "!cancel") {
+            this.handleShopCancel(deal.buyer);
+            return true;
+        }
+
         if (deal.stage === "awaiting_item_price") {
             const { item, price } = extractItemAndPrice(raw);
             if (item && price !== null) {
@@ -3206,6 +3231,10 @@ export class WinnersDiceGame {
 
         // awaiting_price
         const price = extractNumber(raw);
+        if (price === 0) {
+            this.handleShopCancel(deal.buyer);
+            return true;
+        }
         if (price === null) {
             this.bot.whisper(deal.buyer, "How many points are you offering?");
             return true;
@@ -3416,7 +3445,7 @@ export class WinnersDiceGame {
         };
 
         this.bot.sendChat(`🎭 ${this.playerName(buyer)} is browsing the services menu...`);
-        this.bot.whisper(buyer, "What action or service would you like to request? Describe it and name your price in points.");
+        this.bot.whisper(buyer, "What action or service would you like to request? Describe it and name your price in points. (0 to go back)");
     }
 
     // Dispatches a message to the in-progress service deal, if any. Returns
@@ -3457,6 +3486,12 @@ export class WinnersDiceGame {
     // still-missing field is tracked by which of deal.description/deal.price
     // is still null. Always consumes the message.
     private handleServiceDescriptionInput(deal: ServiceDeal, raw: string): boolean {
+        const trimmedLower = raw.trim().toLowerCase();
+        if (trimmedLower === "cancel" || trimmedLower === "!cancel" || trimmedLower === "0") {
+            this.handleServiceDealCancel(deal.buyer);
+            return true;
+        }
+
         if (deal.description === null && deal.price === null) {
             const { item: description, price } = extractItemAndPrice(raw);
             if (description && price !== null) {
@@ -3692,6 +3727,28 @@ export class WinnersDiceGame {
         }
     }
 
+    // Either party in an in-progress (or active) service deal can back out —
+    // mirrors handleToyDealCancel. Not visible to the other party until the
+    // buyer's opening offer has been sent (stage past "awaiting_description").
+    private handleServiceDealCancel(sender: number): void {
+        const deal = this.state.serviceDeal;
+        if (!deal) return;
+
+        const otherParty = sender === deal.buyer ? deal.seller : deal.buyer;
+        const alreadyVisibleToBoth = deal.stage !== "awaiting_description";
+
+        if (deal.timerHandle) clearTimeout(deal.timerHandle);
+        if (deal.warningHandle) clearTimeout(deal.warningHandle);
+
+        this.bot.whisper(sender, "Service deal cancelled.");
+        if (alreadyVisibleToBoth) {
+            this.bot.whisper(otherParty, `${this.playerName(sender)} cancelled the service deal.`);
+        }
+
+        this.state.serviceDeal = null;
+        this.returnToSpendMenu(deal.buyer);
+    }
+
     // Cancels an in-progress or active service deal's timers and clears it —
     // called alongside clearPendingWardrobeChecks()/releaseActiveToy() when a
     // match ends, is force-reset, or halted by a safeword.
@@ -3798,6 +3855,7 @@ export class WinnersDiceGame {
             const marker = hasRandom && i === options.length - 1 ? ` ← random pick (not in top ${PICK_LIST_TOP_N})` : "";
             lines.push(`${i + 1}. ${name}${marker}`);
         });
+        lines.push("0. Back");
         lines.push("Or type any item name from this slot.");
         return lines.join("\n");
     }
@@ -3863,7 +3921,7 @@ export class WinnersDiceGame {
         };
 
         this.bot.sendChat(`⛓️ ${this.playerName(buyer)} is looking to apply some bondage to ${wearer.name}...`);
-        this.bot.whisper(buyer, `Which slot?\n` + available.map((s, i) => `${i + 1}. ${s.display}`).join("\n"));
+        this.bot.whisper(buyer, `Which slot?\n` + available.map((s, i) => `${i + 1}. ${s.display}`).join("\n") + `\n0. Back`);
     }
 
     // Entry point for !buybondage <slot>: the wearer initiates, but the
@@ -4056,12 +4114,17 @@ export class WinnersDiceGame {
         const available = this.availableBondageSlotsFor(deal.wearer);
 
         const trimmed = raw.trim();
+        if (trimmed === "0") {
+            this.handleBondageDealCancel(deal.placer);
+            return true;
+        }
+
         const idx = /^\d+$/.test(trimmed) ? parseInt(trimmed, 10) : null;
         const match = (idx !== null && idx >= 1 && idx <= available.length) ? available[idx - 1] : null;
         if (!match) {
             this.bot.whisper(deal.placer,
                 `That's not a valid slot number for ${wearerName}. Choose a number:\n` +
-                available.map((s, i) => `${i + 1}. ${s.display}`).join("\n"));
+                available.map((s, i) => `${i + 1}. ${s.display}`).join("\n") + `\n0. Back`);
             return true;
         }
 
@@ -4083,12 +4146,17 @@ export class WinnersDiceGame {
         let chosen: string | null = null;
 
         const trimmed = raw.trim();
+        if (trimmed === "0") {
+            this.handleBondageDealCancel(deal.placer);
+            return true;
+        }
+
         if (/^\d+$/.test(trimmed)) {
             const idx = parseInt(trimmed, 10);
             if (idx >= 1 && idx <= deal.itemOptions.length) {
                 chosen = deal.itemOptions[idx - 1];
             } else {
-                this.bot.whisper(deal.placer, `Pick a number 1-${deal.itemOptions.length} or type an item name.`);
+                this.bot.whisper(deal.placer, `Pick a number 1-${deal.itemOptions.length} or type an item name. (0. Back)`);
                 return true;
             }
         } else {
@@ -4153,6 +4221,10 @@ export class WinnersDiceGame {
 
     private handleBondagePriceChoice(deal: BondageDeal, raw: string): boolean {
         const n = extractNumber(raw);
+        if (n === 0) {
+            this.handleBondageDealCancel(deal.placer);
+            return true;
+        }
         if (n === null || n < 0) {
             this.bot.whisper(deal.placer, deal.kind === "apply"
                 ? "How many points are you offering?"
@@ -4516,6 +4588,7 @@ export class WinnersDiceGame {
             `Which of ${wearer.name}'s items should get an Exclusive lock?\n` +
             lockable.map((b, i) => `${i + 1}. ${b.slot} — ${b.itemName}`).join("\n") +
             `\n${lockable.length + 1}. All of the above\n` +
+            `0. Back\n` +
             `Reply with a number.`
         );
     }
@@ -4554,6 +4627,11 @@ export class WinnersDiceGame {
     }
 
     private handleLockSlotChoice(deal: LockDeal, lower: string): boolean {
+        if (lower.trim() === "0") {
+            this.handleLockDealCancel(deal.placer);
+            return true;
+        }
+
         const lockable = this.lockableBondageSlotsFor(deal.wearer);
         if (lockable.length === 0) {
             this.state.lockDeal = null;
@@ -4568,7 +4646,7 @@ export class WinnersDiceGame {
         } else if ((idx !== null && idx === lockable.length + 1) || lower === "all") {
             deal.slots = lockable.map(b => b.slot);
         } else {
-            this.bot.whisper(deal.placer, `Reply with a number 1-${lockable.length + 1} (or "all").`);
+            this.bot.whisper(deal.placer, `Reply with a number 1-${lockable.length + 1} (or "all"), or 0 to go back.`);
             return true;
         }
 
@@ -4580,6 +4658,10 @@ export class WinnersDiceGame {
 
     private handleLockPriceChoice(deal: LockDeal, raw: string): boolean {
         const n = extractNumber(raw);
+        if (n === 0) {
+            this.handleLockDealCancel(deal.placer);
+            return true;
+        }
         if (n === null || n < 0) {
             this.bot.whisper(deal.placer, "How many points should removal cost?");
             return true;
@@ -4876,6 +4958,7 @@ export class WinnersDiceGame {
         this.sendLongWhisper(winner,
             `Pick a toy:\n` +
             this.toyCatalog.map((t, i) => `${i + 1}. ${t.label}`).join("\n") +
+            `\n0. Back` +
             `\nOr type any item name.`
         );
     }
@@ -4921,12 +5004,17 @@ export class WinnersDiceGame {
         let chosen: ToyCatalogEntry | null = null;
 
         const trimmed = raw.trim();
+        if (trimmed === "0") {
+            this.handleToyDealCancel(deal.winner);
+            return true;
+        }
+
         if (/^\d+$/.test(trimmed)) {
             const idx = parseInt(trimmed, 10);
             if (idx >= 1 && idx <= this.toyCatalog.length) {
                 chosen = this.toyCatalog[idx - 1];
             } else {
-                this.bot.whisper(deal.winner, `Pick a number 1-${this.toyCatalog.length} or type an item name.`);
+                this.bot.whisper(deal.winner, `Pick a number 1-${this.toyCatalog.length} or type an item name. (0. Back)`);
                 return true;
             }
         } else {
@@ -4951,6 +5039,10 @@ export class WinnersDiceGame {
 
     private handleToyPriceChoice(deal: ToyDeal, raw: string): boolean {
         const n = extractNumber(raw);
+        if (n === 0) {
+            this.handleToyDealCancel(deal.winner);
+            return true;
+        }
         if (n === null || n < 0) {
             this.bot.whisper(deal.winner, "How many points are you offering?");
             return true;
