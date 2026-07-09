@@ -2937,7 +2937,7 @@ export class WinnersDiceGame {
         if (state.config!.stripping) options.push({ key: "clothing", label: `clothing — buy an item of clothing from your opponent` });
         if (state.config!.bondage) options.push({ key: "bondage", label: `bondage — buy bondage for your opponent` });
         if (state.config!.bondage && this.lockableBondageSlotsFor(opponent.memberNumber).length > 0) {
-            options.push({ key: "locks", label: `locks — buy a lock on ${opponent.name}'s bondage with a removal price (they can accept, decline, or counter)` });
+            options.push({ key: "locks", label: `locks — pay to lock ${opponent.name}'s bondage; they can remove it later for 2× your price` });
         }
         if (state.config!.toys && this.toyCatalog.length > 0) {
             options.push({ key: "toys", label: `toys — pick a toy, agree a price with ${opponent.name}, then use it for a set time` });
@@ -4057,10 +4057,10 @@ export class WinnersDiceGame {
             return;
         }
 
-        if (this.state.activeLocks.some(l => l.wearerMemberNumber === sender && l.slot === match.slot)) {
-            this.bot.whisper(sender, `That slot is locked with an Exclusive lock — pay its removal price from your post-bank menu ("remove locks") instead.`);
-            return;
-        }
+        const slotLock = this.state.activeLocks.find(l => l.wearerMemberNumber === sender && l.slot === match.slot);
+        const lockFeeNote = slotLock
+            ? ` Note: this slot has a lock — a removal fee of ${this.lockRemovalCost(slotLock)} pts will be added to the final buyout price.`
+            : "";
 
         state.bondageDeal = {
             kind: "removal",
@@ -4078,9 +4078,10 @@ export class WinnersDiceGame {
             responderCeiling: null,
         };
 
+        const lockNote = slotLock ? ` (slot has a lock — wearer will also pay the ${this.lockRemovalCost(slotLock)} pt lock removal fee)` : "";
         this.bot.whisper(match.placerMemberNumber,
-            `${this.playerName(sender)} wants to buy back the ${match.itemName} on their ${match.slot}. How many points do you want to charge for removal?`);
-        this.bot.whisper(sender, `⏳ Offer sent to ${this.playerName(match.placerMemberNumber)}. Waiting for their response...`);
+            `${this.playerName(sender)} wants to buy back the ${match.itemName} on their ${match.slot}. How many points do you want to charge for removal?${lockNote}`);
+        this.bot.whisper(sender, `⏳ Offer sent to ${this.playerName(match.placerMemberNumber)}. Waiting for their response...${lockFeeNote}`);
     }
 
     // !removebondage <slot> — free, instant, placer-only.
@@ -4510,12 +4511,19 @@ export class WinnersDiceGame {
                 this.returnToSpendMenu(deal.placer);
                 return;
             }
-        } else if (wearer.balance < price) {
-            this.bot.whisper(deal.wearer, `You can't afford that — ${price} points is more than your ${wearer.balance} balance. The deal is off.`);
-            this.bot.whisper(deal.placer, `${wearer.name} can't cover ${price} points — the deal is off.`);
-            state.bondageDeal = null;
-            this.returnToSpendMenu(deal.placer);
-            return;
+        } else {
+            const lock = state.activeLocks.find(l => l.wearerMemberNumber === deal.wearer && l.slot === deal.slot);
+            const lockFee = lock ? this.lockRemovalCost(lock) : 0;
+            const totalPrice = price + lockFee;
+
+            if (wearer.balance < totalPrice) {
+                const breakdown = lockFee > 0 ? ` (bondage: ${price} + lock: ${lockFee})` : "";
+                this.bot.whisper(deal.wearer, `You can't afford that — total cost is ${totalPrice} points${breakdown} and you have ${wearer.balance}. The deal is off.`);
+                this.bot.whisper(deal.placer, `${wearer.name} can't cover ${totalPrice} points — the deal is off.`);
+                state.bondageDeal = null;
+                this.returnToSpendMenu(deal.placer);
+                return;
+            }
         }
 
         const half = Math.floor(price / 2);
@@ -4541,12 +4549,23 @@ export class WinnersDiceGame {
 
             this.bot.sendChat(`⛓️ Deal! ${placer.name} paid ${price} points to apply ${itemName} to ${wearer.name}'s ${deal.slot}. ${wearer.name} receives ${half} points (pending — available next Bank). Bot fee: ${half} points.`);
         } else {
-            wearer.balance -= price;
+            // Check for a lock on this slot — fold its removal fee into the total
+            const lock = state.activeLocks.find(l => l.wearerMemberNumber === deal.wearer && l.slot === deal.slot);
+            const lockFee = lock ? this.lockRemovalCost(lock) : 0;
+            const totalPrice = price + lockFee;
+
+            wearer.balance -= totalPrice;
             placer.pendingBalance += half;
+
+            if (lock) {
+                const lockHalf = Math.floor(lockFee / 2);
+                const lockPlacer = state.players.find(p => p.memberNumber === lock.placerMemberNumber);
+                if (lockPlacer) lockPlacer.pendingBalance += lockHalf;
+                state.activeLocks = state.activeLocks.filter(l => l !== lock);
+            }
 
             this.bot.removeItem(deal.wearer, group);
             state.activeBondage = state.activeBondage.filter(b => !(b.wearerMemberNumber === deal.wearer && b.slot === deal.slot));
-            state.activeLocks = state.activeLocks.filter(l => !(l.wearerMemberNumber === deal.wearer && l.slot === deal.slot));
             if (ALLOW_FREE_REAPPLY) {
                 state.removableBondage.push({
                     slot: deal.slot!,
@@ -4557,7 +4576,12 @@ export class WinnersDiceGame {
                 });
             }
 
-            this.bot.sendChat(`🔓 Deal! ${wearer.name} paid ${price} points to have ${itemName} removed from their ${deal.slot}. ${placer.name} receives ${half} points (pending — available next Bank). Bot fee: ${half} points.`);
+            let msg = `🔓 Deal! ${wearer.name} paid ${totalPrice} points to have ${itemName} removed from their ${deal.slot}. ${placer.name} receives ${half} points (pending — available next Bank). Bot fee: ${half} points.`;
+            if (lock) {
+                const lockHalf = Math.floor(lockFee / 2);
+                msg += ` Lock removed — ${this.playerName(lock.placerMemberNumber)} receives ${lockHalf} points (pending).`;
+            }
+            this.bot.sendChat(msg);
         }
 
         state.bondageDeal = null;
@@ -4693,7 +4717,7 @@ export class WinnersDiceGame {
             initiatorFloor: null,
             responderCeiling: null,
         };
-        this.bot.sendChat(`🔒 ${this.playerName(sender)} is thinking about adding some extra security to ${this.playerName(wearer.memberNumber)}'s situation...`);
+        this.bot.sendChat(`🔒 ${this.playerName(sender)} is eyeing a lock for ${this.playerName(wearer.memberNumber)}'s situation...`);
         this.bot.whisper(sender,
             `Which of ${wearer.name}'s items should get an Exclusive lock?\n` +
             lockable.map((b, i) => `${i + 1}. ${b.slot} — ${b.itemName}`).join("\n") +
@@ -4762,7 +4786,7 @@ export class WinnersDiceGame {
 
         deal.stage = "awaiting_price";
         this.bot.whisper(deal.placer,
-            `Propose a removal price — ${this.playerName(deal.wearer)} can accept, decline, or counter. How many points?`);
+            `How much do you want to pay to lock ${this.playerName(deal.wearer)}'s ${deal.slots.join(", ")}? ${this.playerName(deal.wearer)} can accept, decline, or counter. (0 to back out)\nNote: the wearer can remove the lock later for 2× this price from their post-bank menu.`);
         return true;
     }
 
@@ -4794,9 +4818,9 @@ export class WinnersDiceGame {
         const lockedList = deal.slots.join(", ");
 
         this.bot.whisper(deal.wearer,
-            `${placerName} wants to apply an Exclusive lock to your ${lockedList} — removal would cost ${deal.price} points, payable anytime from your post-bank menu. Accept? (yes/no, or 'counter <number>')`);
+            `${placerName} wants to pay ${deal.price} points to lock your ${lockedList}. You'll receive ${Math.floor(deal.price! / 2)} points (pending). You can remove the lock anytime from your post-bank menu for ${deal.price! * 2} points. Accept? (yes/no, or 'counter <number>')`);
         this.bot.whisper(deal.placer,
-            `⏳ Your lock offer (${lockedList} for ${deal.price} points removal) has been sent to ${wearerName}. Waiting for their response...`);
+            `⏳ Your lock offer (pay ${deal.price} pts to lock ${lockedList}) has been sent to ${wearerName}. Waiting for their response...`);
     }
 
     private handleLockWearerResponse(deal: LockDeal, lower: string): boolean {
@@ -4847,7 +4871,7 @@ export class WinnersDiceGame {
         }
 
         deal.stage = "awaiting_buyer_counter_response";
-        this.bot.whisper(deal.placer, `${this.playerName(deal.wearer)} counters: ${deal.counterPrice} points removal. Accept, decline, or counter?`);
+        this.bot.whisper(deal.placer, `${this.playerName(deal.wearer)} counters: ${deal.counterPrice} points to lock. Accept, decline, or counter?`);
         return true;
     }
 
@@ -4902,22 +4926,38 @@ export class WinnersDiceGame {
 
         deal.stage = "awaiting_opponent_response";
         this.bot.whisper(deal.wearer,
-            `${this.playerName(deal.placer)} counters: ${deal.price} points removal. Accept, decline, or counter?`);
+            `${this.playerName(deal.placer)} counters: ${deal.price} points to lock. Accept, decline, or counter?`);
         return true;
     }
 
-    // Settles an agreed lock deal: applies the Exclusive lock(s) immediately
-    // and records the agreed price on each ActiveLock so the later removal
-    // cost can be computed (see lockRemovalCost). No points change hands
-    // here — only removal costs the wearer.
+    // Settles an agreed lock deal: the placer pays the negotiated price now
+    // (same money flow as any other shop purchase — half to the wearer as
+    // pending, half as bot fee), then applies the Exclusive lock(s) and
+    // records the agreed price on each ActiveLock so the later removal cost
+    // can be computed (see lockRemovalCost).
     private finalizeLockDeal(deal: LockDeal, price: number): void {
         const state = this.state;
-        state.lockDeal = null;
         if (!state.players) return;
+
+        if (state.spendingBalance < price) {
+            this.bot.whisper(deal.placer, `You can't afford that — ${price} points is more than your ${state.spendingBalance} balance. The deal is off.`);
+            this.bot.whisper(deal.wearer, `${this.playerName(deal.placer)} can't cover ${price} points — the deal is off.`);
+            state.lockDeal = null;
+            this.returnToSpendMenu(deal.placer);
+            return;
+        }
+
+        state.lockDeal = null;
 
         const placerName = this.playerName(deal.placer);
         const wearerName = this.playerName(deal.wearer);
+        const wearer = state.players.find(p => p.memberNumber === deal.wearer)!;
         const lockProperty = this.buildLockProperty();
+        const half = Math.floor(price / 2);
+        const removalCost = price * LOCK_REMOVAL_MULTIPLIER;
+
+        state.spendingBalance -= price;
+        wearer.pendingBalance += half;
 
         for (const slotDisplay of deal.slots) {
             const entry = state.activeBondage.find(b => b.wearerMemberNumber === deal.wearer && b.slot === slotDisplay);
@@ -4933,8 +4973,7 @@ export class WinnersDiceGame {
         }
 
         const lockedList = deal.slots.join(", ");
-        const removalCost = price * LOCK_REMOVAL_MULTIPLIER;
-        this.bot.sendChat(`🔒 ${placerName} locked ${wearerName}'s ${lockedList} with an Exclusive lock — removal costs ${removalCost} points.`);
+        this.bot.sendChat(`🔒 ${placerName} paid ${price} points to lock ${wearerName}'s ${lockedList}. ${wearerName} receives ${half} points (pending — available next Bank). Removal costs ${removalCost} points.`);
         this.bot.whisper(deal.wearer, `Pay ${removalCost} points from your post-bank menu ("remove locks") to have it removed anytime.`);
 
         this.returnToSpendMenu(deal.placer);
