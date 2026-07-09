@@ -541,8 +541,8 @@ export class WinnersDiceGame {
                     this.handleHelp(sender);
                 }
                 break;
-            case "!about":
-                this.handleAbout(sender);
+            case "!readme":
+                this.handleReadme(sender);
                 break;
             case "!challenge":
                 this.handleChallenge(sender, args);
@@ -801,6 +801,7 @@ export class WinnersDiceGame {
             `challenge @PlayerName - Challenge a player to a match (!challenge also works)\n` +
             `help - Show this message (!help also works)\n\n` +
             `=== Help Topics ===\n` +
+            `!readme - Read about this game\n` +
             `help setup - Challenge and match setup (negotiation, settings)\n` +
             `help game - During the match (bank, press, endgame, mercy, streaks & boosts)\n` +
             `help shop - The shop and spending (post-bank menu, shop items, bondage removal)\n`;
@@ -811,15 +812,14 @@ export class WinnersDiceGame {
 
         text +=
             `\n=== Feedback ===\n` +
-            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")\n\n` +
-            `!about - About this bot`;
+            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
 
         this.sendLongWhisper(sender, text);
     }
 
-    private handleAbout(memberNumber: number): void {
+    private handleReadme(memberNumber: number): void {
         const text =
-            `=== About WinnersDice ===\n` +
+            `=== WinnersDice Readme ===\n` +
             `WinnersDice is a two-player dice duel with stakes. Challenge someone, negotiate what's on the line — rounds, stripping, bondage, toys, maybe a little service — then roll. The winner of each roll builds a pot and decides when to bank it. Spend those coins making your opponent's evening... interesting.\n\n` +
             `Roll well and your streak grows. Roll a natural 20 and you're on fire. Roll a 1 and you'll feel it. Press your luck or play it safe — but once the rounds are done, someone's walking away in more restraints than they arrived in.\n\n` +
             `Shop smart. Roll lucky. And maybe... negotiate a little mercy.\n\n` +
