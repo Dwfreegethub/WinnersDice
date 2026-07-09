@@ -541,6 +541,9 @@ export class WinnersDiceGame {
                     this.handleHelp(sender);
                 }
                 break;
+            case "!about":
+                this.handleAbout(sender);
+                break;
             case "!challenge":
                 this.handleChallenge(sender, args);
                 break;
@@ -808,9 +811,21 @@ export class WinnersDiceGame {
 
         text +=
             `\n=== Feedback ===\n` +
-            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")`;
+            `feedback <text> - Send feedback to the developers, whisper only (say "!feedback <text>")\n\n` +
+            `!about - About this bot`;
 
         this.sendLongWhisper(sender, text);
+    }
+
+    private handleAbout(memberNumber: number): void {
+        const text =
+            `=== About WinnersDice ===\n` +
+            `WinnersDice is a two-player dice duel with stakes. Challenge someone, negotiate what's on the line — rounds, stripping, bondage, toys, maybe a little service — then roll. The winner of each roll builds a pot and decides when to bank it. Spend those coins making your opponent's evening... interesting.\n\n` +
+            `Roll well and your streak grows. Roll a natural 20 and you're on fire. Roll a 1 and you'll feel it. Press your luck or play it safe — but once the rounds are done, someone's walking away in more restraints than they arrived in.\n\n` +
+            `Shop smart. Roll lucky. And maybe... negotiate a little mercy.\n\n` +
+            `Say !help for commands.`;
+
+        this.sendLongWhisper(memberNumber, text);
     }
 
     private handleHelpSetup(sender: number): void {
