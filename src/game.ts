@@ -2751,10 +2751,11 @@ export class WinnersDiceGame {
 
     // Settles the agreed end game: deducts both sides' committed points
     // (STUB — should go to a per-pair bank, not just vanish; see wd_todo.md),
-    // applies an Exclusive lock to any requested extra slots that already
-    // have bondage on them, and announces the terms per location/privacy.
-    // The timer/password lock itself doesn't go on yet — that waits for the
-    // lock-time vote (see startEndGameLockVote) to settle the final duration.
+    // strips the winner's own accumulated bondage (see releaseWinnerBondage),
+    // and announces the terms per location/privacy. The loser's locks
+    // (leash + any requested extra slots) don't go on yet — that waits for
+    // the lock-time vote (see startEndGameLockVote) to settle the final
+    // duration, then all of them are applied together in applyEndGameTimerLock.
     private executeEndGame(proposal: EndGameProposal, finalMinutes: number): void {
         const state = this.state;
         if (!state.players) return;
@@ -2774,21 +2775,12 @@ export class WinnersDiceGame {
 
         log(`[STUB] Per-pair bank: ${winner.name} banks ${winnerCost} pts, ${loser.name} banks ${loserCost} pts. TODO: persist to a per-pair points bank instead of discarding.`);
 
-        const lockProperty = this.buildLockProperty();
-        const appliedLockSlots: string[] = [];
-        for (const group of proposal.requestedLockSlots) {
-            const slotDisplay = PICK_SLOTS.find(s => s.group === group)?.display;
-            const entry = slotDisplay
-                ? state.activeBondage.find(b => b.wearerMemberNumber === loser.memberNumber && b.slot === slotDisplay)
-                : undefined;
-            if (!entry) continue; // nothing worn there — nothing to lock
-            this.bot.applyItem(loser.memberNumber, group, entry.itemName, "Default", lockProperty);
-            appliedLockSlots.push(group);
-        }
-        if (appliedLockSlots.length < proposal.requestedLockSlots.length) {
-            const skipped = proposal.requestedLockSlots.filter(s => !appliedLockSlots.includes(s));
-            this.bot.whisper(winner.memberNumber, `Note: couldn't lock ${skipped.join(", ")} — nothing is worn there.`);
-        }
+        // Terms are agreed — the winner shouldn't still be wearing whatever
+        // bondage they picked up earlier in the match. Requested lock slots
+        // on the loser aren't applied yet; that happens in
+        // applyEndGameTimerLock() once the lock-time vote settles the final
+        // duration, so every lock (leash + extras) shares the same password.
+        this.releaseWinnerBondage(winner.memberNumber);
 
         if (proposal.location === "move") {
             this.bot.sendChat(`⚔️ End game terms agreed! ${winner.name} and ${loser.name} — consider moving to a private room for this session.`);
@@ -2801,7 +2793,7 @@ export class WinnersDiceGame {
         state.endGameProposal = null;
         this.endGameAwaitingLockSlotsInput = false;
 
-        this.startEndGameLockVote(winner.memberNumber, loser.memberNumber, winnerCost, loserCost, appliedLockSlots);
+        this.startEndGameLockVote(winner.memberNumber, loser.memberNumber, winnerCost, loserCost, proposal.requestedLockSlots);
     }
 
     // Suggested lock-time vote baseline — scales with room size. With the
@@ -2813,16 +2805,16 @@ export class WinnersDiceGame {
         return Math.max(10, playerCount * 5);
     }
 
-    // After the end game's extra lock slots are applied, give every loser a
-    // 30-second window to nudge the suggested timer/password lock duration
-    // before it actually goes on. No reply within the window counts as
+    // Give every loser a 30-second window to nudge the suggested
+    // timer/password lock duration before it (and any requested extra lock
+    // slots) actually goes on. No reply within the window counts as
     // "accept" (see finalizeEndGameLockVote).
     private startEndGameLockVote(
         winnerMemberNumber: number,
         loserMemberNumber: number,
         winnerPointsSpent: number,
         loserPointsSpent: number,
-        appliedLockSlots: string[],
+        requestedLockSlots: string[],
     ): void {
         const suggested = this.endGameSuggestedLockMinutes();
         const timeout = setTimeout(() => this.finalizeEndGameLockVote(), 30 * 1000);
@@ -2834,7 +2826,7 @@ export class WinnersDiceGame {
             votes: new Map(),
             winnerPointsSpent,
             loserPointsSpent,
-            appliedLockSlots,
+            requestedLockSlots,
             timeout,
         };
 
@@ -2890,16 +2882,36 @@ export class WinnersDiceGame {
         this.applyEndGameTimerLock(vote, finalMinutes);
     }
 
-    // Applies the timer/password lock to the loser's leash slot at the
-    // vote's final duration, hands the winner the password, and schedules
-    // expireEndGame() for when it's up.
+    // Applies the timer/password lock to the loser's leash slot AND every
+    // requested extra lock slot (that has something worn on it) at the
+    // vote's final duration — all sharing the same password — hands the
+    // winner that password, and schedules expireEndGame() for when it's up.
     private applyEndGameTimerLock(vote: EndGameLockVote, finalMinutes: number): void {
         const state = this.state;
         const loserMemberNumber = vote.loserMemberNumbers[0];
 
         const password = String(Math.floor(1000 + Math.random() * 9000));
-        this.bot.applyItem(loserMemberNumber, END_GAME_LEASH_GROUP, END_GAME_LEASH_ITEM, "Default", this.buildTimerPasswordLockProperty(password, finalMinutes));
-        this.bot.whisper(vote.winnerMemberNumber, `🔑 Lock password for ${this.playerName(loserMemberNumber)}'s leash: ${password} — this is only shown once.`);
+        const lockProperty = this.buildTimerPasswordLockProperty(password, finalMinutes);
+
+        this.bot.applyItem(loserMemberNumber, END_GAME_LEASH_GROUP, END_GAME_LEASH_ITEM, "Default", lockProperty);
+
+        const appliedLockSlots: string[] = [];
+        for (const group of vote.requestedLockSlots) {
+            const slotDisplay = PICK_SLOTS.find(s => s.group === group)?.display;
+            const entry = slotDisplay
+                ? state.activeBondage.find(b => b.wearerMemberNumber === loserMemberNumber && b.slot === slotDisplay)
+                : undefined;
+            if (!entry) continue; // nothing worn there — nothing to lock
+            this.bot.applyItem(loserMemberNumber, group, entry.itemName, "Default", lockProperty);
+            appliedLockSlots.push(group);
+        }
+        if (appliedLockSlots.length < vote.requestedLockSlots.length) {
+            const skipped = vote.requestedLockSlots.filter(s => !appliedLockSlots.includes(s));
+            this.bot.whisper(vote.winnerMemberNumber, `Note: couldn't lock ${skipped.join(", ")} — nothing is worn there.`);
+        }
+
+        this.bot.whisper(vote.winnerMemberNumber,
+            `🔑 Lock password for ${this.playerName(loserMemberNumber)}'s leash${appliedLockSlots.length > 0 ? " and locks" : ""}: ${password} — this is only shown once.`);
 
         const timer = setTimeout(() => this.expireEndGame(), finalMinutes * 60 * 1000);
         state.activeEndGame = {
@@ -2909,7 +2921,7 @@ export class WinnersDiceGame {
             winnerPointsSpent: vote.winnerPointsSpent,
             loserPointsSpent: vote.loserPointsSpent,
             timer,
-            appliedLockSlots: vote.appliedLockSlots,
+            appliedLockSlots,
         };
     }
 
@@ -5712,7 +5724,7 @@ export class WinnersDiceGame {
     // Cancels any in-progress end game proposal/negotiation and, if a timer
     // lock is actively running, cancels its timer and strips the leash lock.
     // Any additional requested lock slots are left for releaseAllActiveBondage()
-    // to strip along with the item they're locked to (see executeEndGame —
+    // to strip along with the item they're locked to (see applyEndGameTimerLock —
     // those locks are only ever applied over an already-tracked activeBondage
     // entry, so the normal teardown covers them).
     private clearEndGameState(): void {

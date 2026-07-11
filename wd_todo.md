@@ -121,6 +121,7 @@ See `Completed` below — the 5-question proposal, up-to-5-step negotiation, blo
 - Test safeword in BD (StripDiceBot) — verify BD's Action message pattern catches the safeword event and triggers full bondage removal + game stop.
 - Re-test safeword in WD after debugging.
 - Test permission pre-flight: join a game with AllowItem disabled in BC settings and verify the bot blocks the challenge with the correct whisper message.
+- Check the end game live — verify the 5-question winner proposal, up-to-5-step negotiation, block/execution outcomes, lock-time vote, and timer/password lock all play out correctly in an actual match.
 
 ---
 

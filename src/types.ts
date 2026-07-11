@@ -428,13 +428,15 @@ export interface ActiveEndGame {
     appliedLockSlots: string[];
 }
 
-// After the end game's extra lock slots are applied but before the timer/
-// password lock goes on the loser's leash, each loser gets a 30-second
-// window to nudge the suggested lock duration up or down in 5-minute
-// increments (see game.ts's startEndGameLockVote/finalizeEndGameLockVote).
-// Carries everything executeEndGame already settled (points spent, applied
-// lock slots) through to the vote's finalization, since EndGameProposal is
-// cleared once the vote starts.
+// Before the timer/password lock goes on the loser's leash (and any extra
+// requested lock slots), each loser gets a 30-second window to nudge the
+// suggested lock duration up or down in 5-minute increments (see game.ts's
+// startEndGameLockVote/finalizeEndGameLockVote). Carries everything
+// executeEndGame already settled (points spent, requested lock slots)
+// through to the vote's finalization, since EndGameProposal is cleared once
+// the vote starts. The requested lock slots aren't actually locked until
+// applyEndGameTimerLock() runs after the vote — they get the same
+// timer/password lock (and duration) as the leash, applied together.
 export interface EndGameLockVote {
     winnerMemberNumber: number;
     loserMemberNumbers: number[];
@@ -444,7 +446,7 @@ export interface EndGameLockVote {
     votes: Map<number, 1 | 2 | 3>;
     winnerPointsSpent: number;
     loserPointsSpent: number;
-    appliedLockSlots: string[];
+    requestedLockSlots: string[];
     timeout: NodeJS.Timeout;
 }
 
