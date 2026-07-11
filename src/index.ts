@@ -128,6 +128,7 @@ async function main() {
         const memberNumber = data.SourceMemberNumber;
         log(`Member #${memberNumber} left the room.`);
         roomMembers.delete(memberNumber);
+        game.onMemberLeave(memberNumber);
     });
 
     bot.onSyncSingle((data: any) => {

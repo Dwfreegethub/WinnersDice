@@ -23,6 +23,7 @@ import {
     MercyRequest,
     NegotiationKey,
     NegotiationState,
+    PairBalanceEntry,
     PlayerRecord,
     PlayerState,
     RoundResult,
@@ -168,6 +169,11 @@ const WARDROBE_CHECK_TIMEOUT_MS = 2 * 60 * 1000;
 
 // How long the challenged player has to answer yes/no before a challenge expires.
 const CHALLENGE_ACCEPTANCE_TIMEOUT_MS = 30 * 1000;
+
+// How long the remaining player has to wait (or safeword out early) after
+// their opponent disconnects mid-match before the game auto-ends — see
+// onMemberLeave/expireDisconnectTimer.
+const DISCONNECT_TIMEOUT_MS = 3 * 60 * 1000;
 
 // If true, a placer who removes bondage they placed (!removebondage) can
 // re-apply that same item to the same slot for free (!reapplybondage),
@@ -528,6 +534,10 @@ export class WinnersDiceGame {
     private playerRecords: Record<string, PlayerRecord> = {};
     private readonly playerRecordsPath = path.join(__dirname, "..", "players.json");
 
+    // Per-pair leftover point carryover — see PairBalanceEntry.
+    private pairBalances: Record<string, PairBalanceEntry> = {};
+    private readonly pairBalancesPath = path.join(__dirname, "..", "pair_balances.json");
+
     private readonly pendingUpdatePath = path.join(__dirname, "..", "pending_update.txt");
 
     // Cap on streak for the *next* match, admin-settable via !setstreak.
@@ -577,6 +587,7 @@ export class WinnersDiceGame {
         this.loadBondageUsage();
         this.loadFeedbackStatus();
         this.loadPlayerRecords();
+        this.loadPairBalances();
     }
 
     private createIdleState(): GameState {
@@ -609,6 +620,7 @@ export class WinnersDiceGame {
             waitingForWardrobe: null,
             mercyRequest: null,
             mercyCooldowns: new Map(),
+            disconnectTimer: null,
         };
     }
 
@@ -622,8 +634,34 @@ export class WinnersDiceGame {
     }
 
     public handleChatMessage(sender: number, content: string, isWhisper: boolean): void {
-        const msg = content.trim();
+        let msg = content.trim();
         if (!msg) return;
+
+        // Strip one layer of enclosing parens so BC's out-of-character
+        // convention — e.g. "(help)" or "(H)" — is parsed the same as the
+        // bare word. This only affects what the bot reads internally; the
+        // player's own message still displays with the parens intact to
+        // everyone else in the room, so their OOC bracket stays visible.
+        const parenMatch = msg.match(/^\(([\s\S]*)\)$/);
+        if (parenMatch) {
+            msg = parenMatch[1].trim();
+        }
+        if (!msg) return;
+
+        // "quit" / "(quit)" / "!quit" is only meaningful while a disconnect
+        // countdown is running (see onMemberLeave) — it's the remaining
+        // player's way to end the game early instead of waiting out the
+        // countdown or using the real BC safeword. Not a globally-
+        // recognized command otherwise, so this check is scoped to
+        // state.disconnectTimer being active and only listens to whoever
+        // isn't the disconnected player.
+        if (this.state.disconnectTimer && sender !== this.state.disconnectTimer.memberNumber) {
+            const normalizedQuit = msg.replace(/^!/, "").trim();
+            if (/^\(?quit\)?$/i.test(normalizedQuit)) {
+                this.endGameDueToDisconnect(this.state.disconnectTimer.memberNumber);
+                return;
+            }
+        }
 
         if (!msg.startsWith("!")) {
             this.handleConversational(sender, msg);
@@ -647,7 +685,7 @@ export class WinnersDiceGame {
                 } else if (helpArg === "admin") {
                     this.handleHelpAdmin(sender);
                 } else {
-                    this.handleHelp(sender);
+                    this.handleContextHelp(sender);
                 }
                 break;
             case "!readme":
@@ -671,6 +709,8 @@ export class WinnersDiceGame {
             case "!yes":
                 if (this.isAwaitingChallengeAcceptance()) {
                     this.handleChallengeAcceptAnswer(sender, true);
+                } else if (this.isAwaitingCarryoverChoice()) {
+                    this.handleCarryoverChoiceAnswer(sender, true);
                 } else if (this.isAwaitingConsentAll()) {
                     this.handleConsentAllAnswer(sender, true);
                 } else {
@@ -680,6 +720,8 @@ export class WinnersDiceGame {
             case "!no":
                 if (this.isAwaitingChallengeAcceptance()) {
                     this.handleChallengeAcceptAnswer(sender, false);
+                } else if (this.isAwaitingCarryoverChoice()) {
+                    this.handleCarryoverChoiceAnswer(sender, false);
                 } else if (this.isAwaitingConsentAll()) {
                     this.handleConsentAllAnswer(sender, false);
                 } else {
@@ -733,6 +775,15 @@ export class WinnersDiceGame {
     private handleConversational(sender: number, msg: string): void {
         const negotiation = this.state.negotiation;
         const lower = msg.toLowerCase();
+
+        // Bare "help"/"H" (including the now-unwrapped "(help)"/"(H)" OOC
+        // forms — see handleChatMessage's paren-stripping) is recognized
+        // everywhere, ahead of every other conversational check, so it's
+        // never swallowed as invalid input by whatever's currently active.
+        if (lower === "help" || lower === "h") {
+            this.handleContextHelp(sender);
+            return;
+        }
 
         // A !challenge matched more than one room member by name — the
         // challenger's next reply picks which one, before any negotiation exists.
@@ -876,6 +927,10 @@ export class WinnersDiceGame {
                     this.handleAccept(sender);
                     return;
                 }
+                if (negotiation.carryoverStage === "awaiting") {
+                    this.handleCarryoverChoiceAnswer(sender, true);
+                    return;
+                }
                 if (negotiation.consentAllStage === "awaiting") {
                     this.handleConsentAllAnswer(sender, true);
                     return;
@@ -890,6 +945,10 @@ export class WinnersDiceGame {
 
         if (lower === "no" || lower === "n") {
             if (negotiation && this.state.phase === "negotiating" && !negotiation.pending) {
+                if (negotiation.carryoverStage === "awaiting") {
+                    this.handleCarryoverChoiceAnswer(sender, false);
+                    return;
+                }
                 if (negotiation.consentAllStage === "awaiting") {
                     this.handleConsentAllAnswer(sender, false);
                     return;
@@ -1011,6 +1070,147 @@ export class WinnersDiceGame {
         this.sendLongWhisper(sender, text);
     }
 
+    // ============================================================
+    // CONTEXTUAL HELP
+    // ============================================================
+    //
+    // Dispatches bare "help"/"H" (see handleConversational — also covers
+    // the OOC "(help)"/"(H)" forms, unwrapped by handleChatMessage's
+    // paren-stripping) and bare "!help" with no topic argument (see
+    // handleChatMessage's switch) to a short, phase-appropriate hint
+    // instead of the generic top-level command index. Falls back to that
+    // generic index (handleHelp) for idle/pre-game/negotiation phases,
+    // where "!help setup" already covers things. The explicit "!help
+    // setup/game/shop/admin" topic commands are untouched by any of this —
+    // they always show their full page regardless of phase.
+    // ============================================================
+
+    private isStandardCounterStage(stage: string): boolean {
+        return stage === "awaiting_opponent_response" || stage === "awaiting_opponent_counter_value"
+            || stage === "awaiting_buyer_counter_response" || stage === "awaiting_buyer_counter_value";
+    }
+
+    private isServiceCounterStage(stage: string): boolean {
+        return stage === "awaiting_seller_response" || stage === "awaiting_seller_counter_value"
+            || stage === "awaiting_buyer_counter_response" || stage === "awaiting_buyer_counter_value";
+    }
+
+    private dealCounterHintText(canCancel: boolean): string {
+        return canCancel
+            ? `💬 accept to close the deal, counter <number> to push back, or cancel to walk away.`
+            : `💬 accept to close the deal, or counter <number> to push back — no backing out of this one once it's rolling!`;
+    }
+
+    private endGameQuestionHintText(proposal: EndGameProposal): string {
+        switch (proposal.proposalStage) {
+            case "q1_time": return `⏱️ Type a number — how many minutes you're claiming. Costs that many points.`;
+            case "q2_location": return `🚪 1 to stay in this room, 2 to move somewhere else.`;
+            case "q3_privacy": return `👀 1 for public, 2 for private.`;
+            case "q4_locks":
+                return this.endGameAwaitingLockSlotsInput
+                    ? `🔒 List the slots separated by commas, or say all.`
+                    : `🔒 yes if you want to lock down any of their slots, no if not.`;
+            case "q5_description": return `✍️ Just type freely — describe what you've got planned, then send it when you're happy.`;
+            default: return "";
+        }
+    }
+
+    // Re-generates the current question's prompt so the help hint can be
+    // followed by a repeat of what's actually being asked, mirroring the
+    // shop menu's "hint, then re-show the menu" pattern (see
+    // handleContextHelp). Kept as its own function rather than refactored
+    // to share strings with the Q1-Q5 handlers (startEndGameProposal/
+    // advanceToEndGameQ4/etc.), since those fire on state transitions with
+    // extra one-time context (e.g. Q1's "noted" confirmation) that a bare
+    // re-ask shouldn't repeat.
+    private endGameQuestionPromptText(proposal: EndGameProposal): string {
+        switch (proposal.proposalStage) {
+            case "q1_time":
+                return `Q1 of 5 — How many minutes do you want to claim? Each point = 1 minute and will be spent from your balance ` +
+                    `(you have ${this.state.spendingBalance} pts available). Type a number.`;
+            case "q2_location":
+                return `Q2 of 5 — Where do you want to take this?\n1. Stay in this room\n2. Move to a different room (recommended for longer sessions)`;
+            case "q3_privacy":
+                return `Q3 of 5 — How do you want to set the room?\n1. Public — open for others to watch or join\n2. Private — just the two of you`;
+            case "q4_locks":
+                return this.endGameAwaitingLockSlotsInput
+                    ? `Which slots? Valid: ${END_GAME_LOCK_SLOTS.join(", ")}\nReply with a comma-separated list, or "all" for all of them.`
+                    : `Q4 of 5 — Do you want to place locks on ${this.playerName(proposal.loserMemberNumber)}? (yes / no)`;
+            case "q5_description":
+                return `Q5 of 5 — Describe what you have in mind for ${this.playerName(proposal.loserMemberNumber)}. They will see this. (Type freely — when done, send it)`;
+            default:
+                return "";
+        }
+    }
+
+    private handleContextHelp(sender: number): void {
+        const state = this.state;
+
+        if (state.bondageDeal && this.isStandardCounterStage(state.bondageDeal.stage) &&
+            (sender === state.bondageDeal.placer || sender === state.bondageDeal.wearer)) {
+            this.bot.whisper(sender, this.dealCounterHintText(true));
+            return;
+        }
+        if (state.lockDeal && this.isStandardCounterStage(state.lockDeal.stage) &&
+            (sender === state.lockDeal.placer || sender === state.lockDeal.wearer)) {
+            this.bot.whisper(sender, this.dealCounterHintText(true));
+            return;
+        }
+        if (state.serviceDeal && this.isServiceCounterStage(state.serviceDeal.stage) &&
+            (sender === state.serviceDeal.buyer || sender === state.serviceDeal.seller)) {
+            this.bot.whisper(sender, this.dealCounterHintText(true));
+            return;
+        }
+        if (state.toyDeal && this.isStandardCounterStage(state.toyDeal.stage) &&
+            (sender === state.toyDeal.winner || sender === state.toyDeal.loser)) {
+            this.bot.whisper(sender, this.dealCounterHintText(sender === state.toyDeal.winner));
+            return;
+        }
+
+        if (state.endGameProposal) {
+            const proposal = state.endGameProposal;
+            if (this.isEndGameProposalQuestionStage(proposal.proposalStage) && sender === proposal.winnerMemberNumber) {
+                this.bot.whisper(sender, this.endGameQuestionHintText(proposal));
+                this.bot.whisper(sender, this.endGameQuestionPromptText(proposal));
+                return;
+            }
+            if (proposal.proposalStage === "negotiating" &&
+                (sender === proposal.winnerMemberNumber || sender === proposal.loserMemberNumber)) {
+                this.bot.whisper(sender,
+                    `⚔️ yes to accept, or counter <minutes> to negotiate — no flat decline on this one. ` +
+                    `(Round 5 is the final say — no more countering after that.)`
+                );
+                return;
+            }
+        }
+
+        if (state.endGameLockVote && state.endGameLockVote.loserMemberNumbers.includes(sender)) {
+            this.bot.whisper(sender,
+                `⏱️ 1 = shorter (−5 min), 2 = keep it as-is, 3 = longer (+5 min). You've got 30 seconds!`
+            );
+            return;
+        }
+
+        if (state.phase === "playing" && state.awaitingPostBank === sender) {
+            this.handleHelpShop(sender);
+            if (state.spendMenuOpen) {
+                this.openSpendMenu(sender);
+            } else {
+                this.bot.whisper(sender, this.postBankPromptText(sender));
+            }
+            return;
+        }
+
+        if (state.phase === "playing" && state.awaitingDecision === sender && state.config) {
+            this.bot.whisper(sender,
+                `🎲 It's your call — !bank to lock in your pot, !press to keep rolling. Once you've hit round ${state.config.minRounds}, !endgame and !mercy open up too.`
+            );
+            return;
+        }
+
+        this.handleHelp(sender);
+    }
+
     private findPlayersByName(name: string, excludeMemberNumber: number): Player[] {
         const lower = name.toLowerCase();
         const matches: Player[] = [];
@@ -1102,6 +1302,9 @@ export class WinnersDiceGame {
             awaitingCounterFrom: null,
             consentAllStage: "not_asked",
             consentAllAnswers: {},
+            carryoverStage: "not_asked",
+            carryoverAnswers: {},
+            useCarryover: false,
         };
 
         this.state = {
@@ -1133,6 +1336,7 @@ export class WinnersDiceGame {
             waitingForWardrobe: null,
             mercyRequest: null,
             mercyCooldowns: new Map(),
+            disconnectTimer: null,
         };
 
         this.bot.sendChat(`${challenger.name} has challenged ${opponent.name} to WinnersDice!`);
@@ -1199,9 +1403,87 @@ export class WinnersDiceGame {
         }
 
         negotiation.acceptanceStage = "accepted";
+        this.bot.sendChat(`${opponent.name} accepted!`);
+        this.promptCarryoverOrBeginSettings(negotiation);
+    }
+
+    // After the challenge is accepted, checks whether this pair has a saved
+    // carryover balance from a previous match (see pairKey/pairBalances) and,
+    // if so, asks both players whether to use it before settings negotiation
+    // starts (see handleCarryoverChoiceAnswer). Skips straight to settings
+    // negotiation if there's nothing to ask about.
+    private promptCarryoverOrBeginSettings(negotiation: NegotiationState): void {
+        const { challenger, opponent } = negotiation;
+        const key = this.pairKey(challenger.memberNumber, opponent.memberNumber);
+        const entry = this.pairBalances[key];
+        const challengerCarry = entry?.balances[String(challenger.memberNumber)] ?? 0;
+        const opponentCarry = entry?.balances[String(opponent.memberNumber)] ?? 0;
+
+        if (!entry || (challengerCarry <= 0 && opponentCarry <= 0)) {
+            negotiation.carryoverStage = "done";
+            negotiation.useCarryover = false;
+            this.beginSettingsNegotiation();
+            return;
+        }
+
+        negotiation.carryoverStage = "awaiting";
+        negotiation.carryoverAnswers = {};
         this.bot.sendChat(
-            `${opponent.name} accepted! Let's negotiate the match settings. ` +
-            `Either player can type !cancel at any time to abort.`
+            `${challenger.name} and ${opponent.name}: you have points carried over from your last match together — ` +
+            `${challenger.name}: ${challengerCarry} pts, ${opponent.name}: ${opponentCarry} pts. ` +
+            `Use them? Both must reply "yes" to carry them over — either replying "no" starts both of you fresh and clears the saved points for good.`
+        );
+    }
+
+    private isAwaitingCarryoverChoice(): boolean {
+        return this.state.phase === "negotiating" && this.state.negotiation?.carryoverStage === "awaiting";
+    }
+
+    // Dispatches one player's yes/no answer to the carryover opt-in prompt.
+    // Both challenger and opponent must answer "yes" for the saved balance
+    // to be applied at match start; either answering "no" clears the saved
+    // entry outright (see savePairCarryover for how it's re-created).
+    private handleCarryoverChoiceAnswer(sender: number, value: boolean): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.carryoverStage !== "awaiting") {
+            return;
+        }
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) {
+            return;
+        }
+
+        negotiation.carryoverAnswers[sender] = value;
+
+        const challengerAnswer = negotiation.carryoverAnswers[negotiation.challenger.memberNumber];
+        const opponentAnswer = negotiation.carryoverAnswers[negotiation.opponent.memberNumber];
+
+        if (challengerAnswer === undefined || opponentAnswer === undefined) {
+            const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+            const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+            this.bot.sendChat(`${responder.name} says ${value ? "yes" : "no"}. Waiting on ${other.name}...`);
+            return;
+        }
+
+        const agreed = challengerAnswer && opponentAnswer;
+        negotiation.carryoverStage = "done";
+        negotiation.carryoverAnswers = {};
+        negotiation.useCarryover = agreed;
+
+        if (agreed) {
+            this.bot.sendChat("Both players agreed — carried-over points will be applied when the match starts.");
+        } else {
+            const key = this.pairKey(negotiation.challenger.memberNumber, negotiation.opponent.memberNumber);
+            delete this.pairBalances[key];
+            this.savePairBalances();
+            this.bot.sendChat("Starting fresh — the saved carryover for this pair has been cleared.");
+        }
+
+        this.beginSettingsNegotiation();
+    }
+
+    private beginSettingsNegotiation(): void {
+        this.bot.sendChat(
+            `Let's negotiate the match settings. Either player can type !cancel at any time to abort.`
         );
         this.promptNextSetting();
     }
@@ -1649,9 +1931,19 @@ export class WinnersDiceGame {
             maxStreak: this.defaultMaxStreak,
         };
 
+        // Apply this pair's carried-over balance, if both players opted in
+        // at accept time (see promptCarryoverOrBeginSettings/
+        // handleCarryoverChoiceAnswer). If they opted out, the saved entry
+        // was already deleted at that point, so there's nothing to read here.
+        const carryoverEntry = negotiation.useCarryover
+            ? this.pairBalances[this.pairKey(negotiation.challenger.memberNumber, negotiation.opponent.memberNumber)]
+            : undefined;
+        const challengerStart = carryoverEntry?.balances[String(negotiation.challenger.memberNumber)] ?? 0;
+        const opponentStart = carryoverEntry?.balances[String(negotiation.opponent.memberNumber)] ?? 0;
+
         const players: [PlayerState, PlayerState] = [
-            { memberNumber: negotiation.challenger.memberNumber, name: negotiation.challenger.name, balance: 0, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
-            { memberNumber: negotiation.opponent.memberNumber, name: negotiation.opponent.name, balance: 0, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
+            { memberNumber: negotiation.challenger.memberNumber, name: negotiation.challenger.name, balance: challengerStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
+            { memberNumber: negotiation.opponent.memberNumber, name: negotiation.opponent.name, balance: opponentStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
         ];
 
         this.state = {
@@ -1683,6 +1975,7 @@ export class WinnersDiceGame {
             waitingForWardrobe: null,
             mercyRequest: null,
             mercyCooldowns: new Map(),
+            disconnectTimer: null,
         };
 
         const summary = [
@@ -1696,6 +1989,11 @@ export class WinnersDiceGame {
         this.bot.sendChat(
             `All settings agreed! ${summary}. The WinnersDice match between ${players[0].name} and ${players[1].name} is starting!`
         );
+        if (challengerStart > 0 || opponentStart > 0) {
+            this.bot.sendChat(
+                `Carried-over points applied — ${players[0].name} starts with ${challengerStart} pts, ${players[1].name} starts with ${opponentStart} pts.`
+            );
+        }
 
         this.startMatch();
     }
@@ -1875,6 +2173,8 @@ export class WinnersDiceGame {
             lines.push(`4. remove locks — pay ${total} points to have your locked ${locks.map(l => l.slot).join(", ")} unlocked`);
         }
 
+        lines.push(`H. help — what does all this mean?`);
+
         return lines.join("\n");
     }
 
@@ -2046,6 +2346,7 @@ export class WinnersDiceGame {
         );
 
         this.recordGameCompletion(finalWinnerMemberNumber, [p1, p2]);
+        this.savePairCarryover(p1, p2);
 
         this.clearPendingWardrobeChecks();
         this.releaseAllActiveLocks();
@@ -2268,6 +2569,7 @@ export class WinnersDiceGame {
 
         this.state.mercyRequest = null;
         this.recordGameCompletion(winner.memberNumber, state.players);
+        this.savePairCarryover(conceder, winner);
 
         this.clearPendingWardrobeChecks();
         this.clearEndGameState();
@@ -2699,8 +3001,9 @@ export class WinnersDiceGame {
     }
 
     // The loser countered to zero (or below) — the "nuclear option". Both
-    // sides lose their currently-committed points with no refund, and the
-    // match continues as if endgame had never been called.
+    // sides' currently-committed points are burned by design (same as a
+    // successful executeEndGame settlement — see its comment) with no
+    // refund, and the match continues as if endgame had never been called.
     private blockEndGame(proposal: EndGameProposal, blockValue: number): void {
         const state = this.state;
         const winner = state.players!.find(p => p.memberNumber === proposal.winnerMemberNumber)!;
@@ -2749,12 +3052,15 @@ export class WinnersDiceGame {
         };
     }
 
-    // Settles the agreed end game: deducts both sides' committed points
-    // (STUB — should go to a per-pair bank, not just vanish; see wd_todo.md),
-    // applies an Exclusive lock to any requested extra slots that already
-    // have bondage on them, and announces the terms per location/privacy.
-    // The timer/password lock itself doesn't go on yet — that waits for the
-    // lock-time vote (see startEndGameLockVote) to settle the final duration.
+    // Settles the agreed end game: deducts both sides' committed points and
+    // burns them — by design, points spent settling an end-game deal are
+    // gone for good, credited to neither player (unlike the match's leftover
+    // balance at teardown, which carries over per pair — see
+    // savePairCarryover). Also applies an Exclusive lock to any requested
+    // extra slots that already have bondage on them, and announces the terms
+    // per location/privacy. The timer/password lock itself doesn't go on
+    // yet — that waits for the lock-time vote (see startEndGameLockVote) to
+    // settle the final duration.
     private executeEndGame(proposal: EndGameProposal, finalMinutes: number): void {
         const state = this.state;
         if (!state.players) return;
@@ -2772,7 +3078,7 @@ export class WinnersDiceGame {
         proposal.winnerPointsCommitted = winnerCost;
         proposal.loserPointsCommitted = loserCost;
 
-        log(`[STUB] Per-pair bank: ${winner.name} banks ${winnerCost} pts, ${loser.name} banks ${loserCost} pts. TODO: persist to a per-pair points bank instead of discarding.`);
+        log(`End game settled: ${winner.name} spent ${winnerCost} pts, ${loser.name} spent ${loserCost} pts — burned by design, credited to neither player.`);
 
         const lockProperty = this.buildLockProperty();
         const appliedLockSlots: string[] = [];
@@ -2790,12 +3096,13 @@ export class WinnersDiceGame {
             this.bot.whisper(winner.memberNumber, `Note: couldn't lock ${skipped.join(", ")} — nothing is worn there.`);
         }
 
+        const pointsSpentNote = `(${winner.name} spent ${proposal.winnerPointsCommitted} pts, ${loser.name} spent ${proposal.loserPointsCommitted} pts settling the deal)`;
         if (proposal.location === "move") {
-            this.bot.sendChat(`⚔️ End game terms agreed! ${winner.name} and ${loser.name} — consider moving to a private room for this session.`);
+            this.bot.sendChat(`⚔️ End game terms agreed! ${winner.name} and ${loser.name} — consider moving to a private room for this session. ${pointsSpentNote}`);
         } else if (proposal.privacy === "public") {
-            this.bot.sendChat(`⚔️ End game underway! ${winner.name} has claimed ${finalMinutes} minutes with ${loser.name}. The room is open for observers.`);
+            this.bot.sendChat(`⚔️ End game underway! ${winner.name} has claimed ${finalMinutes} minutes with ${loser.name}. The room is open for observers. ${pointsSpentNote}`);
         } else {
-            this.bot.sendChat(`⚔️ End game underway between ${winner.name} and ${loser.name}.`);
+            this.bot.sendChat(`⚔️ End game underway between ${winner.name} and ${loser.name}. ${pointsSpentNote}`);
         }
 
         state.endGameProposal = null;
@@ -2932,7 +3239,10 @@ export class WinnersDiceGame {
             }
         }
 
-        this.bot.sendChat(`⏱️ ${this.playerName(active.winnerMemberNumber)}'s claimed time with ${this.playerName(active.loserMemberNumber)} has ended.`);
+        this.bot.sendChat(
+            `⏱️ ${this.playerName(active.winnerMemberNumber)}'s claimed time with ${this.playerName(active.loserMemberNumber)} has ended. ` +
+            `(${this.playerName(active.winnerMemberNumber)} spent ${active.winnerPointsSpent} pts, ${this.playerName(active.loserMemberNumber)} spent ${active.loserPointsSpent} pts settling this.)`
+        );
 
         this.state.activeEndGame = null;
         this.finishMatch(active.winnerMemberNumber);
@@ -2975,7 +3285,8 @@ export class WinnersDiceGame {
         this.bot.whisper(sender,
             `The shop (${state.spendingBalance} points balance) — what would you like to do?\n` +
             options.map((o, i) => `${i + 1}. ${o.label}`).join("\n") +
-            `\n0. Back — return to continue/endgame`
+            `\n0. Back — return to continue/endgame` +
+            `\nH. help — what does all this mean?`
         );
     }
 
@@ -5585,6 +5896,18 @@ export class WinnersDiceGame {
     // are cancelled, both players are whispered, and the room is notified.
     public handleSafewordUsed(memberNumber: number): void {
         const state = this.state;
+
+        // Mid-countdown for an opponent who disconnected, and it's the
+        // *other* player (the one still here) safewording — that's the
+        // "end it now" option from the countdown whisper (see
+        // onMemberLeave). Same teardown as expireDisconnectTimer, with the
+        // disconnect getting the blame in the message rather than the
+        // standard "used their safeword" framing.
+        if (state.disconnectTimer && state.phase === "playing" && memberNumber !== state.disconnectTimer.memberNumber) {
+            this.endGameDueToDisconnect(state.disconnectTimer.memberNumber);
+            return;
+        }
+
         const isInGame =
             (state.phase === "negotiating" &&
                 (state.negotiation?.challenger.memberNumber === memberNumber ||
@@ -5600,6 +5923,7 @@ export class WinnersDiceGame {
         const otherMemberNumber = this.getOtherPlayerMemberNumber(memberNumber);
 
         if (state.negotiation) this.clearChallengeAcceptanceTimer(state.negotiation);
+        this.clearDisconnectTimer();
         this.clearPendingWardrobeChecks();
         // TODO: Save/resume end game state across sessions — design TBD.
         this.clearEndGameState();
@@ -5630,6 +5954,100 @@ export class WinnersDiceGame {
             return other?.memberNumber ?? null;
         }
         return null;
+    }
+
+    // ============================================================
+    // DISCONNECT HANDLING
+    // ============================================================
+    //
+    // Fires when a room member leaves entirely (disconnect, closed client,
+    // kicked) — detected via BC's ChatRoomSyncMemberLeave event and
+    // dispatched here from index.ts alongside its own roomMembers cleanup.
+    // ============================================================
+
+    // Pre-game (negotiating): aborts immediately, same as !reset — there's
+    // no in-progress scene to protect, so no grace period. Mid-match
+    // (playing): starts a grace-period countdown (see
+    // DISCONNECT_TIMEOUT_MS/expireDisconnectTimer) instead of ending things
+    // outright, since disconnects are often just a dropped connection
+    // rather than someone actually leaving; onMemberJoin cancels it if they
+    // reconnect in time.
+    public onMemberLeave(memberNumber: number): void {
+        const state = this.state;
+
+        if (state.phase === "negotiating" && state.negotiation &&
+            (state.negotiation.challenger.memberNumber === memberNumber || state.negotiation.opponent.memberNumber === memberNumber)) {
+            const playerName = this.roomMembers.get(memberNumber)?.name ?? `Player #${memberNumber}`;
+            log(`DISCONNECT: ${playerName} (#${memberNumber}) left the room during negotiation. Cancelling.`);
+
+            this.clearChallengeAcceptanceTimer(state.negotiation);
+            this.state = this.createIdleState();
+            this.bot.sendChat(`The WinnersDice challenge was cancelled — ${playerName} left the room.`);
+            return;
+        }
+
+        if (state.phase === "playing" && state.players?.some(p => p.memberNumber === memberNumber)) {
+            if (state.disconnectTimer) return; // already counting down
+
+            const playerName = this.roomMembers.get(memberNumber)?.name ?? `Player #${memberNumber}`;
+            const otherMemberNumber = this.getOtherPlayerMemberNumber(memberNumber);
+            log(`DISCONNECT: ${playerName} (#${memberNumber}) left the room mid-match. Starting a ${DISCONNECT_TIMEOUT_MS / 60000}-minute countdown.`);
+
+            const timer = setTimeout(() => this.expireDisconnectTimer(memberNumber), DISCONNECT_TIMEOUT_MS);
+            state.disconnectTimer = { memberNumber, timer };
+
+            if (otherMemberNumber !== null) {
+                this.bot.whisper(otherMemberNumber,
+                    `👋 ${playerName} has left the room. You have 3 minutes before the game is automatically ended — probably just a hiccup, ` +
+                    `so feel free to wait it out. You can also say "quit" at any time to end it now instead.`
+                );
+            }
+        }
+    }
+
+    // Fires DISCONNECT_TIMEOUT_MS after a mid-match disconnect if the
+    // player hasn't rejoined (see onMemberJoin) and the remaining player
+    // hasn't safeworded out early (see handleSafewordUsed). Guards against
+    // a stale timer in case state.disconnectTimer was already cleared some
+    // other way right around the deadline.
+    private expireDisconnectTimer(memberNumber: number): void {
+        if (this.state.disconnectTimer?.memberNumber !== memberNumber) return;
+        this.endGameDueToDisconnect(memberNumber);
+    }
+
+    private clearDisconnectTimer(): void {
+        if (this.state.disconnectTimer) {
+            clearTimeout(this.state.disconnectTimer.timer);
+            this.state.disconnectTimer = null;
+        }
+    }
+
+    // Shared teardown for a mid-match disconnect that wasn't resolved by a
+    // reconnect in time — either the countdown elapsed
+    // (expireDisconnectTimer) or the remaining player chose to safeword out
+    // early (see handleSafewordUsed). Same cleanup as a normal safeword,
+    // but the announcement blames the disconnect. Does NOT call
+    // finishMatch/recordGameCompletion/savePairCarryover — an aborted match
+    // doesn't bank final balances, same as a normal safeword or !reset.
+    private endGameDueToDisconnect(disconnectedMemberNumber: number): void {
+        const playerName = this.roomMembers.get(disconnectedMemberNumber)?.name ?? `Player #${disconnectedMemberNumber}`;
+        const otherMemberNumber = this.getOtherPlayerMemberNumber(disconnectedMemberNumber);
+
+        log(`DISCONNECT: Ending match — ${playerName} (#${disconnectedMemberNumber}) did not return in time.`);
+
+        this.clearDisconnectTimer();
+        this.clearPendingWardrobeChecks();
+        this.clearEndGameState();
+        this.releaseAllActiveLocks();
+        this.releaseAllActiveBondage();
+        this.releaseActiveToy();
+        this.clearServiceDeal();
+        this.state = this.createIdleState();
+
+        this.bot.sendChat(`⛔ Game ended due to ${playerName} losing connection.`);
+        if (otherMemberNumber !== null) {
+            this.bot.whisper(otherMemberNumber, `Game ended due to ${playerName} losing connection. Hope they're okay — feel free to !challenge them again whenever.`);
+        }
     }
 
     // ============================================================
@@ -5936,8 +6354,15 @@ export class WinnersDiceGame {
         }
         if (chunk) chunks.push(chunk);
 
+        // Every split chunk is prefixed with "- " so it can never start
+        // with "!" — BCX (and similar BC extensions) intercept incoming
+        // messages that begin with "!" as commands, so a chunk boundary
+        // landing right before a "!command" line would otherwise get
+        // swallowed client-side instead of displayed. Single-whisper
+        // messages (the common case, above) never hit this branch and are
+        // unaffected.
         chunks.forEach((c, i) => {
-            setTimeout(() => this.bot.whisper(memberNumber, c), i * 300);
+            setTimeout(() => this.bot.whisper(memberNumber, `- ${c}`), i * 300);
         });
     }
 
@@ -5948,6 +6373,14 @@ export class WinnersDiceGame {
     public onMemberJoin(memberNumber: number, name: string, char?: BCCharacter): void {
         if (memberNumber === this.bot.getMemberNumber()) return;
         if (char) this.roomCharacters.set(memberNumber, char);
+
+        // Reconnect during their own disconnect countdown (see
+        // onMemberLeave) — cancel it and resume as normal.
+        if (this.state.disconnectTimer?.memberNumber === memberNumber) {
+            this.clearDisconnectTimer();
+            this.bot.sendChat(`🎲 ${name} is back! The game continues.`);
+        }
+
         this.recordPlayerSeen(memberNumber, name);
         this.sendWelcomeWhisper(memberNumber, name);
         this.notifyFeedbackStatus(memberNumber, name);
@@ -5962,11 +6395,22 @@ export class WinnersDiceGame {
         }
     }
 
+    // Room greeting whispered to a joining player (never to the room, and
+    // never to the bot itself — see the guard in onMemberJoin below). The
+    // closing line depends on whether a match is currently running: idle
+    // points them at !challenge, anything else (negotiating/playing) tells
+    // them to feel free to watch instead.
     private sendWelcomeWhisper(memberNumber: number, name: string): void {
-        this.bot.whisper(memberNumber,
-            `Welcome, ${name}! WinnersDice has been getting regular updates thanks to player feedback. ` +
-            `Play a round and let us know what you think — type !challenge @opponent to start or !help to see the rules. 🎲`
-        );
+        const intro =
+            `🎲 Welcome to WinnersDice — a high-stakes dice duel where players strip, get restrained, and press their luck to see who comes out on top.\n\n` +
+            `Say !readme for the full rundown.\n\n` +
+            `This game is menu-driven with integrated help throughout — just type H or (H) at any menu or now for a hint.\n\n`;
+
+        const closing = this.state.phase === "idle"
+            ? `Ready to play? Type !challenge @[playername] to get started!`
+            : `There's a game in progress right now — feel free to watch!`;
+
+        this.sendLongWhisper(memberNumber, intro + closing);
     }
 
     private loadPlayerRecords(): void {
@@ -5989,6 +6433,47 @@ export class WinnersDiceGame {
         } catch (err) {
             logError(`[WD] Failed to write players.json: ${err}`);
         }
+    }
+
+    // Canonical, order-independent key for a two-player pair's carryover
+    // balance (see pairBalances) — sorted so it doesn't matter who
+    // challenges whom next time.
+    private pairKey(a: number, b: number): string {
+        return [a, b].sort((x, y) => x - y).join("-");
+    }
+
+    private loadPairBalances(): void {
+        try {
+            const raw = fs.readFileSync(this.pairBalancesPath, "utf8");
+            this.pairBalances = JSON.parse(raw);
+        } catch {
+            this.pairBalances = {};
+        }
+    }
+
+    private savePairBalances(): void {
+        try {
+            fs.writeFileSync(this.pairBalancesPath, JSON.stringify(this.pairBalances, null, 2), "utf8");
+        } catch (err) {
+            logError(`[WD] Failed to write pair_balances.json: ${err}`);
+        }
+    }
+
+    // Records each player's final balance as this pair's carryover for next
+    // time they play each other. Called from finishMatch and resolveMercy
+    // only — a safeword or admin !reset teardown intentionally does NOT
+    // call this, so an aborted match never persists a balance.
+    private savePairCarryover(p1: PlayerState, p2: PlayerState): void {
+        const key = this.pairKey(p1.memberNumber, p2.memberNumber);
+        this.pairBalances[key] = {
+            memberNumbers: [p1.memberNumber, p2.memberNumber],
+            balances: {
+                [String(p1.memberNumber)]: p1.balance,
+                [String(p2.memberNumber)]: p2.balance,
+            },
+            lastUpdated: centralTimestamp(),
+        };
+        this.savePairBalances();
     }
 
     // Reads feedback.log and returns the set of member numbers that have
