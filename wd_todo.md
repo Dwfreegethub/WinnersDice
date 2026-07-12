@@ -2,117 +2,55 @@
 
 ## HIGH PRIORITY
 
-### Bugs that affect active play (fix before next live session)
-
-1. **Spend-menu double-deal guards are inconsistent** — `clothing` has no guard at all; each spend option checks a different subset of active deals; `toys` misses `serviceDeal`. A buyer waiting on a counter-offer can accidentally open a second deal. Fix: all spend-menu paths should check for ANY active deal before proceeding.
-
-2. **`!endgame`/`!bank`/`!press` don't block while a deal is in progress** — Service deals and mercy are explicitly blocked, but mid-clothing/bondage/lock/toy deals are not. Triggering `!endgame` mid-negotiation orphans the deal object in state while the match moves to end-game. Fix: add a `blockedByActiveDeal()` guard mirroring `blockedByServiceDeal()`.
-
-3. **Clothing deal seller can't cancel** — If the seller (opponent) types `!cancel` or `0` mid-negotiation, nothing happens — no response, bot looks frozen. Every other deal type lets both sides cancel symmetrically. `handleCancel` has no `clothingDeal` branch; it falls through to `handleShopCancel` which only works for the buyer. Fix: add `handleClothingDealCancel` and wire it in.
-
-4. **End-game execute/block leaks points** — `executeEndGame` and `blockEndGame` both deduct points from both players and credit them nowhere — they just vanish. Mercy explicitly conserves every point via `resolveMercy`. Fix: decide where those points go and implement once the end-game per-pair bank stub is done.
-
-5. **Lock deal counter-offer prompts still say "removal price"** — The opening offer now correctly says "pay X to lock, removal costs 2×," but all four counter-offer re-prompts still say "what removal price would you like to counter with?" — a player countering 300 will think removal costs 300 when it'll cost 600. Quick fix: update the four prompt strings.
-
-6. **Toy deal "loser can't decline" is bypassed by `!cancel`** — The design intentionally blocks a plain decline from the loser, but `handleCancel` lets the loser call `handleToyDealCancel` unconditionally — same effect, no charge. Fix: either block the loser from cancelling mid-negotiation, or drop the pretense and remove the "can't decline" message.
-
-7. **Lock deal has no pre-offer affordability check** — Toy and service verify the proposer can afford their number before sending it to the other side. Locks only catch the shortfall at `finalizeLockDeal`, after a full back-and-forth. Quick fix: add the same check in `handleLockPriceChoice`.
-
-8. **`onMemberLeave` has no game hook** — If a player disconnects mid-negotiation or mid-match, the game doesn't know. Nothing pauses or times out; the other player is left hanging indefinitely. `index.ts` only updates the room roster map — it never calls into `game.ts`.
-
-### Existing high-priority items
-
-9. Decide what to do about clothing — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
-   - Key question on automatic strip: `removeItem(memberNumber, "Cloth")` uses the same socket event as bondage removal and should work for clothing slots. The unknown is whether BC's server will honor it from a bot that isn't whitelisted. Needs a live test — add a debug command (`!teststrip`) that calls `removeItem` on the Cloth slot to confirm.
-10. Clean up help more — possibly context-sensitive help based on current game phase/menu state
-11. **Price tracking** — track what prices items actually sold for during shop negotiations, so players and admins can see historical pricing data. Design TBD (could be per-session log, persistent file, or whisper on request via !prices).
+1. Decide what to do about clothing — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
+   - Key question on automatic strip: `removeItem(memberNumber, "Cloth")` uses the same socket event as bondage removal and should work for clothing slots. The unknown is whether BC's server will honor it from a bot that isn't whitelisted. Needs a live test — add a debug command (`!teststrip`) that calls `removeItem` on the Cloth slot to confirm. (Not yet added.)
+2. **Price tracking** — track what prices items actually sold for during shop negotiations, so players and admins can see historical pricing data. Design TBD (could be per-session log, persistent file, or whisper on request via !prices). Not implemented — no `!prices` command or price log in `game.ts`.
 
 ---
 
 ## MEDIUM PRIORITY
 
-1. **Clothing deal uses weak single-counter negotiation** — Bondage/lock/toy/service all use the shared 5-step engine with Rule A (first-counter cap) and Rule B (10%-gap-close floor). Clothing hand-rolls a single exchange: seller gets one counter, buyer can only accept/decline. `ClothingDeal` structurally lacks `negotiationStep`/`initiatorFloor`/`responderCeiling`. Consider upgrading to the shared negotiation engine.
+1. **Clothing deal uses weak single-counter negotiation** — Bondage/lock/toy/service all use the shared 5-step engine with Rule A (first-counter cap) and Rule B (10%-gap-close floor). Clothing hand-rolls a single exchange: seller gets one counter, buyer can only accept/decline. `ClothingDeal` in `types.ts` structurally lacks `negotiationStep`/`initiatorFloor`/`responderCeiling`. Consider upgrading to the shared negotiation engine.
 
-2. **Dead code: `BondagePicker` class is never instantiated** — `bondagePicker.ts` is 1279 lines; ~950 implement a full "picker chooses restraints piece by piece" system (mode selection, slot consent, veto, popularity tracking, outfit logging) that is never used at runtime. `game.ts` only imports 4 small helpers/constants. Either wire it in or delete it.
+2. **Dead code: `BondagePicker` class is never instantiated** — `bondagePicker.ts` is 1279 lines; ~950 implement a full "picker chooses restraints piece by piece" system (mode selection, slot consent, veto, popularity tracking, outfit logging) that is never used at runtime. `game.ts` only imports 4 small helpers/constants (confirmed — no `new BondagePicker(...)` anywhere). Either wire it in or delete it.
 
-3. **`!setstatus` can't set feedback to "declined"** — `validStatuses` omits `"declined"` even though `FeedbackItemStatus` includes it and it's a valid resolved state. Admin has to hand-edit the JSON file.
+3. **`!setstatus` can't set feedback to "declined"** — `validStatuses` (`game.ts`) still omits `"declined"` even though `FeedbackItemStatus` includes it and it's a valid resolved state. Admin has to hand-edit the JSON file.
 
-4. **`pendingChallengeDisambiguation` not cleared on reset/safeword** — It's a class field, not part of `GameState`, so it survives `!reset` and safeword. After a reset, a challenger's next message could be swallowed as a stale disambiguation answer.
+4. **`pendingChallengeDisambiguation` not cleared on reset/safeword** — It's a class field, not part of `GameState`, so it survives `!reset` and safeword (confirmed — neither `handleReset` nor `handleSafewordUsed` touches it). After a reset, a challenger's next message could be swallowed as a stale disambiguation answer.
+
+5. **Mid-game disconnects still just abort — no state-saving/resume** — `onMemberLeave` exists (see Completed): pre-game it cancels the negotiation immediately, mid-match it gives the remaining player a 3-minute grace period (or "quit") before ending things. But "ending things" is still a hard abort — same teardown as safeword/`!reset`, no `finishMatch`/carryover. Consider whether a disconnect-triggered end should instead persist state for the two players to resume later (similar in spirit to the per-pair points carryover added for normal match completion, but disconnects are a harder case: mid-round state, pending deals, applied bondage, etc.). Design TBD.
 
 ---
 
 ## Known Issues / Limitations
 
-- **Safeword handler: first live test did not work as expected** — needs debugging. Check whether the `SafewordUsed` socket event is actually firing, or whether the Action message pattern matching is off.
+- **Safeword handler: first live test did not work as expected** — needs debugging. Check whether the `SafewordUsed` socket event is actually firing, or whether the Action message pattern matching is off. (No changes found in `index.ts`/`game.ts` since this was flagged — still needs a live re-test.)
 
 - **Buyback: no wardrobe detection on re-equip**
-  BC's ChatRoomSyncSingle fires on wardrobe changes but cannot distinguish clothing being *added* vs *removed*. When a player buys back their item, there's no way to detect them putting it back on. Buyback flow skips wardrobe monitoring — player just re-equips on their own after payment. If we ever find a BC API event that signals item equipped, revisit this.
+  BC's ChatRoomSyncSingle fires on wardrobe changes but cannot distinguish clothing being *added* vs *removed*. When a player buys back their item, there's no way to detect them putting it back on. Buyback flow skips wardrobe monitoring — player just re-equips on their own after payment (confirmed unchanged in `startBuyback`/`handleBuybackResponse`). If we ever find a BC API event that signals item equipped, revisit this.
 
 ---
 
 ## Queued Features / Changes
 
-- **Challenge acceptance prompt**
-  When a player is challenged, the first thing the bot asks them is whether they accept the challenge (yes/no) before proceeding to any negotiation or game setup.
+- **Banking + clothing menus whisper-only** — All bank menus (continue/spend/endgame), spend menus, and clothing negotiation messages should be sent via whisper, not public chat. Still not the case: `startClothingDeal`/`proposeClothingDealToOpponent` and most `start*Deal` entry points intentionally `sendChat` an opening announcement (see "Early shop announcements" in Completed, 2026-07-09). That was a deliberate design choice made *after* this item was written, so it may be obsolete — worth a quick DW call on whether to drop this item or scope it down to just the bank/continue/endgame prompts (which already look whisper-only).
 
-- **Banking + clothing menus whisper-only**
-  All bank menus (continue/spend/endgame), spend menus, and clothing negotiation messages should be sent via whisper, not public chat. Currently some of these go to chat.
+- **Negotiation Deadlock — Forced Sale** — not implemented (no `!setnegotiate`/`!setmultiplier` commands, no forced-sale logic in any deal type).
+  - After 2 rounds of back-and-forth counter offers with no agreement, bot intervenes with a forced sale
+  - Forced sale price = highest number offered during the negotiation × configurable multiplier (default 2×)
+  - Buyer gets the item at that price; deal closes automatically (no further negotiation)
+  - Admin commands: `!setnegotiate off`/`on`, `!setmultiplier 2`/`2.5`/`3`, both per-session
+  - Design concerns to resolve before implementing (winner/loser abuse via lowball/absurd counters) — DW to revisit
 
-- **Clothing offer confirmation to buyer**
-  After a clothing offer is sent to the opponent for approval, the buyer gets no feedback. Add a whisper to the buyer immediately: "⏳ Your offer for [item] at [price] pts has been sent to [Opponent]. Waiting for their response..."
+### End Game — Winner-Initiated (from bank/shop) — IMPLEMENTED, remaining open items
+See Completed for the full flow. Points committed during execute/block are intentionally burned (credited to neither player) — see "Per-pair points carryover" in Completed for the separate mechanic that persists each player's leftover *match* balance between matches. Still open:
 
-- **Post-wardrobe-change options prompt**
-  After the game unpauses (wardrobe change detected), neither player gets told what happens next. After announcing "[Opponent] handed over [item]! Game resumes.", immediately whisper the current player their available options (e.g. the spend menu again if they're still in a spend session, or the continue/endgame prompt if they were post-bank).
-
-### Negotiation Deadlock — Forced Sale
-- After 2 rounds of back-and-forth counter offers with no agreement, bot intervenes with a forced sale
-- Forced sale price = highest number offered during the negotiation × configurable multiplier (default 2×)
-- Buyer gets the item at that price; deal closes automatically (no further negotiation)
-- Admin commands:
-  - Toggle to disable forced-sale and revert to current behavior (negotiation just ends with no sale): `!setnegotiate off` / `!setnegotiate on`
-  - Set the multiplier: `!setmultiplier 2` / `!setmultiplier 2.5` / `!setmultiplier 3` (options: 2×, 2.5×, 3×)
-- Both settings configurable per game session by admin
-- Design concerns to resolve before implementing:
-  - **Winner abuse**: buyer could lowball intentionally (e.g. offer 1 pt) just to trigger the forced sale at 2× = 2 pts, effectively stealing the item
-    - Possible guard: forced sale price must meet a minimum floor (e.g. original asking price, or a bot-set minimum based on item tier)
-  - **Loser abuse**: seller could counter with an absurdly high number they know the buyer can't afford, hoping to make the forced sale price unreachable
-    - Possible guard: forced sale price is capped at buyer's current spendingBalance, or counter offers above a reasonable ceiling are rejected by the bot
-  - These edge cases need design thought before coding — DW to revisit
-
-- **Context-sensitive `!help`**
-  `!help` should respond based on current game phase rather than always showing the full help text.
-  - Pre-game / idle: full help, possibly broken into submenus (like StripDiceBot's help is structured)
-  - Mid-round (phase = `"playing"`, `awaitingDecision` is set): show roll/gameplay help only
-  - Banking phase (`awaitingPostBank` is set): show banking options help only
-  - Negotiation phase: show negotiation commands help only
-  Reference BD's help subcommand structure in `D:\Games\BC-Bot\StripDiceBot\src\` for the submenu pattern.
-
-### Toys — shop option for the active banker (future feature)
-- The player currently in the bank (spending phase) can buy toys to use on their opponent
-- Items include: vibrator, feather, BDSM implements
-- Each toy has a point cost and a duration (time the toy can be applied/used)
-- Similar to the bondage shop option, but for toys/implements rather than restraints
-- Design questions still open:
-  - Exact item list and BC asset names
-  - Cost and duration values per item
-  - Whether duration is in rounds or real time
-  - Whether the toy gets removed automatically by the bot (like exclusive locks) or has a manual removal flow
+- **`!points` command** — not implemented; players currently only see balances via the whispers sent at the start of the end game proposal and inside the delivered proposal, not on demand. Should show both: current banked balance, and the current pot (what they'd gain by `!bank` right now) — a quick on-demand check during any live round, not just at end-game.
+- **End game anti-stalling**: consider requiring each counter to close at least 25% of the gap between the two sides' positions. Confirmed not implemented in `applyEndGameLoserCounter`/`applyEndGameWinnerCounter` (only the shared shop-deal negotiation has the 10%-gap-close rule — end-game's bespoke negotiation doesn't). Only implement if stalling becomes a real problem in playtesting.
+- **End game save/resume**: when safeword or reset is called during active end game, consider saving the agreed terms so the session can be resumed later. Design TBD — the `// TODO: Save/resume end game state across sessions` comment is still present in both `handleSafewordUsed` and `handleReset`.
+- **End game timer/password lock slot**: `bc_items.json` has no literal "ItemLeash" BC group — `executeEndGame()`/`expireEndGame()` still use `ItemNeckRestraints` + `CollarLeash` as a stand-in (`END_GAME_LEASH_GROUP`/`END_GAME_LEASH_ITEM`). Revisit once there's a clearer idea of what BC asset should represent the timer lock.
 
 _(add items here as they come up during playtesting)_
-
-### End Game — Winner-Initiated (from bank/shop) — IMPLEMENTED
-See `Completed` below — the 5-question proposal, up-to-5-step negotiation, block/execution flow, lock-time vote, timer/password lock, and safeword/reset teardown are all in `game.ts`. Remaining open items from the original design, now tracked as their own TODOs:
-
-- **Per-pair points bank** — currently a stub (see "End game per-pair bank" below); points committed on execution/block are just deducted and logged, not persisted anywhere.
-- **`!points` command** — not implemented; players currently only see balances via the whispers sent at the start of the end game proposal and inside the delivered proposal, not on demand.
-
-- **End game anti-stalling**: consider requiring each counter to close at least 25% of the gap between the two sides' positions. Only implement if stalling becomes a real problem in playtesting.
-
-- **End game save/resume**: when safeword or reset is called during active end game, consider saving the agreed terms so the session can be resumed later. Design TBD.
-
-- **End game per-pair bank**: `executeEndGame()` currently just deducts both sides' committed points and logs a `[STUB]` line — implement the persistent per-pair points bank described above instead of discarding them.
-
-- **End game timer/password lock slot**: `bc_items.json` has no literal "ItemLeash" BC group — `executeEndGame()`/`expireEndGame()` currently use `ItemNeckRestraints` + `CollarLeash` as a stand-in. Revisit once there's a clearer idea of what BC asset should represent the timer lock.
 
 ---
 
@@ -125,6 +63,35 @@ See `Completed` below — the 5-question proposal, up-to-5-step negotiation, blo
 ---
 
 ## Completed
+
+### Completed Today (2026-07-10)
+- **Per-pair points carryover**: `pair_balances.json` (gitignored, same pattern as `players.json`) tracks each player's leftover balance independently per opponent, keyed by the sorted member-number pair. Written at `finishMatch`/`resolveMercy` only — safeword and admin `!reset` do NOT write it. At challenge-accept time (`promptCarryoverOrBeginSettings`), if a saved entry exists for the pair, both players are asked whether to use it; both must agree or both start at zero and the saved entry is deleted outright. A's balance against B never affects A's balance against C.
+- **End-game points-vanish bug fixed (by clarification, not mechanics change)**: `executeEndGame`/`blockEndGame` already deducted committed points correctly — the bug was that they vanished with no record. Per DW's call, this is intentional: end-game negotiation points are burned, not banked to either player. Replaced the `[STUB]`/`TODO` log line with an explicit "burned by design" log, and `EndGameProposal.winnerPointsCommitted`/`loserPointsCommitted` (previously set but never read) now surface in the deal-closing chat announcement and teardown announcement.
+- **Disconnect handling (`onMemberLeave`)**: `index.ts` calls `game.onMemberLeave(memberNumber)` alongside its roster cleanup. Pre-game: aborts immediately, same teardown as `!reset`. Mid-match: starts a 3-minute countdown (`GameState.disconnectTimer`), whispers the remaining player they can wait it out or say "quit"/`!safeword` to end early. Reconnect in time cancels the timer (`onMemberJoin`) and resumes normally; otherwise it tears down like a safeword with a disconnect-flavored message. No `finishMatch`/`recordGameCompletion`/`savePairCarryover` on any disconnect path.
+- **"quit" as a scoped early-exit command**: while a disconnect countdown is active, the remaining player can type `quit`, `(quit)`, or `!quit` to trigger `endGameDueToDisconnect` immediately — checked in `handleChatMessage` before any other routing, and only recognized while `state.disconnectTimer` is set. Not a globally-recognized command otherwise. The countdown whisper was updated to advertise "quit" instead of `!safeword`.
+- **`sendLongWhisper` BCX-safe split prefix**: every split chunk (only the multi-message path — single whispers are untouched) is now prefixed with `"- "` so a chunk can never start with `!`, regardless of where the line-boundary split lands. Protects all 11 call sites that share this helper (help text, bondage/toy pick lists, end-game proposal delivery, feedback status whispers), not just the near-miss `!help shop` case that was flagged.
+- **Global `()` OOC normalization**: `handleChatMessage` now strips one layer of enclosing parens from every incoming message before any dispatch, so BC's OOC convention — `(help)`, `(H)`, etc. — is parsed the same as the bare word internally. This only affects what the bot reads; the player's own message still displays with the parens intact to the room. The pre-existing `(quit)` handling for the disconnect countdown still works (now redundant with the global strip, but left alone since it's harmless).
+- **Phase-aware `!help`/"help"/"H"**: bare `!help` (no topic arg) and conversational `help`/`H` (and their now-normalized `(help)`/`(H)` forms) route through a new `handleContextHelp` dispatcher instead of always showing the generic top-level menu:
+  - Idle / pre-game negotiation: unchanged — still the old generic `handleHelp` menu (`!help setup` etc. still work exactly as before, untouched).
+  - Mid-round (`awaitingDecision`): short hint — bank/press/endgame/mercy and when endgame/mercy unlock.
+  - Shop/bank menus (`awaitingPostBank`, spend menu open or not): shows the existing `!help shop` page, then re-displays whichever menu was open. Both menu whispers (`postBankPromptText`, `openSpendMenu`) now list `H. help` as a visible option.
+  - Deal negotiations (bondage/lock/toy/service) during the accept/counter back-and-forth: role-aware hint — standard accept/counter/cancel for bondage/lock/service and the toy winner, a no-cancel variant for the toy loser. Clothing deals are intentionally out of scope (not part of the original ask).
+  - End-game Q1–Q5: per-question hint, then re-asks the current question (mirrors the shop-menu pattern).
+  - End-game proposal/counter-offer (`negotiating` stage): single hint, no repeat (per the approved design — only shop/bank and Q1–Q5 repeat the prompt).
+  - `!help admin` unchanged — always available via whisper, admin-gated as before.
+
+### Verified already implemented (found via full code review, 2026-07-10 — no todo update at the time they landed)
+- **Challenge acceptance prompt** — `beginNegotiation` whispers the opponent "Do you accept? (yes/no)" and nothing else proceeds until they answer (`handleChallengeAcceptAnswer`).
+- **Clothing offer confirmation to buyer** — `proposeClothingDealToOpponent` whispers the buyer "⏳ Offer sent to [Opponent]. Waiting for their response..." immediately after the offer goes out.
+- **Post-wardrobe-change options prompt** — `sendPostWardrobeMenu`, called once a wardrobe change clears the pending check, whispers "Game resumes — here's what you can do next:" plus the relevant menu.
+- **Toys — shop option for the active banker** — fully built: `ToyDeal` negotiation via the spend menu, toy catalog loaded from `ItemHandheld_toys_list.txt`, duration selection, and automatic removal via `ActiveToy`'s timer. This queued item was a stale duplicate of the toy system already logged under Completed (2026-07-09) below.
+
+### Completed 2026-07-09 — confirmed via code review (bugs #1–3 and #5–7 from the original numbering, committed to dev)
+- **Spend-menu double-deal guards fixed** — `hasActiveDeal()`/`blockedByShopDeal()` now checked uniformly: all six spend-menu entry points (`startClothingDeal`, `startBondageDeal`, `startLockDeal`, `startServiceDeal`, `startToyDeal`, `startBuyback`) plus `startBoostPurchase`, and `!bank`/`!press`/`!endgame`, all guard against ANY active deal before proceeding.
+- **Clothing deal seller can now cancel** — `handleClothingDealCancel` is wired into `handleCancel` for both `deal.buyer` and `deal.opponent` symmetrically with the other deal types.
+- **Lock deal counter-offer prompts fixed** — all four re-prompts now read "What price would you like to counter with to lock [slots]? (removal will cost 2× that)" instead of the old "removal price" wording.
+- **Toy deal "loser can't decline" bypass fixed** — `handleToyDealCancel` now explicitly blocks the loser ("You can't cancel this deal — reply with 'yes' to accept or 'counter <number>' to negotiate the price.").
+- **Lock deal pre-offer affordability check added** — `handleLockPriceChoice` now checks `state.spendingBalance < n` before sending the offer to the opponent, instead of only catching it at finalization.
 
 ### Completed Today (2026-07-09)
 - Early shop announcements: all spend menu options (bondage, clothing, locks, toys, buyback, boost, services) now announce to the room when entered
@@ -148,17 +115,15 @@ See `Completed` below — the 5-question proposal, up-to-5-step negotiation, blo
 - Wrap unprotected `fs` calls in try/catch and log failures: `saveFeedbackStatus()`, `savePlayerRecords()`, `handleFeedback()`'s `fs.appendFileSync`, `checkPendingUpdate()`'s `fs.unlinkSync`
 - Fix `logger.ts` double timezone-shift bug (ported BD's `centralTimeString()` pattern)
 - Fix feedback rejoin regression with `REVIEWING_FEEDBACK_STATUSES` + `reviewingAckDate` de-dup pattern (ported from BD)
-- End game: 5-question winner proposal, up-to-5-step time negotiation with the loser, block/execution outcomes, a 30-second lock-time vote (loser(s) nudge the suggested duration ±5 min per vote before it's applied), timer/password lock on the loser's leash slot plus optional extra lock slots, and safeword/reset teardown (per-pair bank still a stub — see Queued Features)
+- End game: 5-question winner proposal, up-to-5-step time negotiation with the loser, block/execution outcomes, timer/password lock (standard duration, no loser vote) on the loser's leash slot plus optional extra lock slots — all sharing the same password, and safeword/reset teardown
 
 ---
 
 ## Minor / Polish
 
-1. **`!help shop` bondage description is misleading** — currently says "you pay half goes to them" which reads like the payer only pays half. They pay the full price; the opponent receives half back.
+1. **`!help shop` bondage description is misleading** — still says "you pay half goes to them" (`handleHelpShop`), which reads like the payer only pays half. They pay the full price; the opponent receives half back.
 
-2. **`EndGameProposal.winnerPointsCommitted`/`loserPointsCommitted` are set but never read** — presumably meant to feed a `!points` command or the per-pair bank stub. Either use them or remove them.
-
-3. **Service deal doesn't disclose the 50/50 split to the seller** — Lock and toy both tell the responder "you'll receive X points (half)" upfront and at settlement. Service's proposal and finalization never mention the split — seller discovers it by checking their pending balance.
+2. **Service deal doesn't disclose the 50/50 split to the seller** — Lock, toy, and bondage all tell the responder "you'll receive X points (half)" upfront and at settlement. Service's proposal (`proposeServiceDealToSeller`) and finalization (`finalizeServiceDeal`) still never mention the split — seller discovers it by checking their pending balance.
 
 ---
 

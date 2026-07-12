@@ -106,6 +106,16 @@ export interface NegotiationState {
     // individual questions proceed as the fallback).
     consentAllStage: "not_asked" | "awaiting" | "done";
     consentAllAnswers: Partial<Record<number, boolean>>;
+    // Mirrors consentAllStage/consentAllAnswers, but for the "use your saved
+    // carryover balance from a previous match against this opponent?" prompt
+    // (see game.ts's promptCarryoverOrBeginSettings/handleCarryoverChoiceAnswer).
+    // "not_asked" also covers the case where no carryover exists at all, in
+    // which case this stage is skipped straight to "done".
+    carryoverStage: "not_asked" | "awaiting" | "done";
+    carryoverAnswers: Partial<Record<number, boolean>>;
+    // True only once carryoverStage is "done" AND both players agreed to use
+    // the saved balance — read when building PlayerState at match start.
+    useCarryover: boolean;
 }
 
 // An item this player has sold to their opponent, available to buy back
@@ -428,26 +438,6 @@ export interface ActiveEndGame {
     appliedLockSlots: string[];
 }
 
-// After the end game's extra lock slots are applied but before the timer/
-// password lock goes on the loser's leash, each loser gets a 30-second
-// window to nudge the suggested lock duration up or down in 5-minute
-// increments (see game.ts's startEndGameLockVote/finalizeEndGameLockVote).
-// Carries everything executeEndGame already settled (points spent, applied
-// lock slots) through to the vote's finalization, since EndGameProposal is
-// cleared once the vote starts.
-export interface EndGameLockVote {
-    winnerMemberNumber: number;
-    loserMemberNumbers: number[];
-    suggestedMinutes: number;
-    // memberNumber -> 1 (less) | 2 (accept) | 3 (more). Missing entry at
-    // finalization time = no reply = counts as accept.
-    votes: Map<number, 1 | 2 | 3>;
-    winnerPointsSpent: number;
-    loserPointsSpent: number;
-    appliedLockSlots: string[];
-    timeout: NodeJS.Timeout;
-}
-
 // The requester's !mercy concession request, walking through the winner's
 // accept/reject and the subsequent duration negotiation (see game.ts's
 // handleMercyCommand/handleMercyMessage/resolveMercy).
@@ -504,9 +494,6 @@ export interface GameState {
     endGameProposal: EndGameProposal | null;
     // Agreed, currently-running end game (timer lock + extra locks), if any.
     activeEndGame: ActiveEndGame | null;
-    // In-progress lock-time vote, between bondage being applied and the
-    // timer/password lock going on, if any.
-    endGameLockVote: EndGameLockVote | null;
     // The awaitingPostBank player's balance during the current bank/spend
     // session. Initialized to their balance when the session starts; every
     // purchase deducts from this immediately, and it's committed back to
@@ -525,6 +512,13 @@ export interface GameState {
     // Member number -> round number a rejected requester must wait until
     // before they can request mercy again (see handleMercyCommand).
     mercyCooldowns: Map<number, number>;
+    // Set while a player is mid-match and has left the room, counting down
+    // to an automatic disconnect-triggered end (see game.ts's onMemberLeave/
+    // expireDisconnectTimer). `memberNumber` is whoever left, so a rejoin
+    // (onMemberJoin) can confirm it's the same player before cancelling.
+    // Cleared on rejoin, on the remaining player safewording early, or once
+    // the timer itself fires.
+    disconnectTimer: { memberNumber: number; timer: NodeJS.Timeout } | null;
 }
 
 // A single player's d20 roll for a roll, including their streak/boost
@@ -561,6 +555,23 @@ export interface PlayerRecord {
     gamesPlayed: number;
     gamesWon: number;
     feedbackGiven: boolean;
+}
+
+// Per-pair leftover point balance, carried over into the next match between
+// these same two players if both opt in at challenge-accept time (see
+// game.ts's promptCarryoverOrBeginSettings). Written at match end from
+// finishMatch/resolveMercy only — never from a safeword or admin !reset
+// teardown. Keyed in pair_balances.json by pairKey(a, b): the two member
+// numbers sorted ascending and joined with "-", so it doesn't matter who
+// challenges whom next time.
+export interface PairBalanceEntry {
+    memberNumbers: [number, number];
+    // Member number (as string, since JSON object keys are strings) -> that
+    // player's leftover balance from their last match against this specific
+    // opponent. Independent per player — this pair has no effect on either
+    // player's balance against a third player.
+    balances: Record<string, number>;
+    lastUpdated: string;
 }
 
 export type FeedbackItemStatus = "pending" | "reviewing" | "testing" | "implemented" | "declined" | "partly_implemented";
