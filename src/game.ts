@@ -780,6 +780,12 @@ export class WinnersDiceGame {
             case "!testlock":
                 this.handleTestLock(sender, args);
                 break;
+            case "!done":
+                this.handleDone(sender);
+                break;
+            case "!time":
+                this.handleTime(sender);
+                break;
         }
     }
 
@@ -1152,6 +1158,26 @@ export class WinnersDiceGame {
 
     private handleContextHelp(sender: number): void {
         const state = this.state;
+
+        // Active service deal — help only applies to the two players involved.
+        if (state.serviceDeal && state.serviceDeal.stage === "active" &&
+            (sender === state.serviceDeal.buyer || sender === state.serviceDeal.seller)) {
+            this.bot.whisper(sender,
+                `Service in progress 🎭 Available commands: \`!done\` (winner only — declare complete), ` +
+                `\`!time\` (check time remaining), safeword (emergency stop).`
+            );
+            return;
+        }
+
+        // Active end game — help only applies to the two players involved.
+        if (state.activeEndGame &&
+            (sender === state.activeEndGame.winnerMemberNumber || sender === state.activeEndGame.loserMemberNumber)) {
+            this.bot.whisper(sender,
+                `End game in progress 🔒 Available commands: \`!done\` (winner, in-room only — end early), ` +
+                `\`!time\` (check time remaining), safeword (emergency stop).`
+            );
+            return;
+        }
 
         if (state.bondageDeal && this.isStandardCounterStage(state.bondageDeal.stage) &&
             (sender === state.bondageDeal.placer || sender === state.bondageDeal.wearer)) {
@@ -2648,6 +2674,7 @@ export class WinnersDiceGame {
             proposedMinutes: 0,
             location: null,
             privacy: null,
+            inRoom: false,
             requestedLockSlots: [],
             description: "",
             negotiationStep: 0,
@@ -2730,6 +2757,7 @@ export class WinnersDiceGame {
         const trimmed = lower.trim();
         if (trimmed === "1" || trimmed === "stay") {
             proposal.location = "stay";
+            proposal.inRoom = true;
             proposal.proposalStage = "q3_privacy";
             this.bot.whisper(proposal.winnerMemberNumber,
                 `Q3 of 5 — How do you want to set the room?\n1. Public — open for others to watch or join\n2. Private — just the two of you`);
@@ -2737,6 +2765,7 @@ export class WinnersDiceGame {
         }
         if (trimmed === "2" || trimmed === "move") {
             proposal.location = "move";
+            proposal.inRoom = false;
             this.advanceToEndGameQ4(proposal);
             return true;
         }
@@ -2853,12 +2882,23 @@ export class WinnersDiceGame {
             `• Locks: ${locksText}\n` +
             `• Their plans: ${proposal.description}\n` +
             `──────────────────────\n` +
-            `Your balance: ${loser.balance} pts | ${winner.name}'s balance: ${winner.balance} pts\n\n` +
-            `To ACCEPT: say "yes" — ${winner.name} will pay ${proposal.proposedMinutes} pts, you pay nothing.\n` +
+            `Balances — You: ${loser.balance} pts | ${winner.name}: ${winner.balance} pts\n\n` +
+            `HOW THIS WORKS:\n` +
+            `• ${winner.name}'s opening ask costs them 1 pt per minute — their ask of ${proposal.proposedMinutes} min costs them ${proposal.proposedMinutes} pts.\n` +
+            `• If you counter to [X] min: ${winner.name} pays [X] pts, YOU pay ${proposal.proposedMinutes} - X pts from your own balance.\n` +
+            `  (Countering low = you take on more cost to cut the time. Countering near the ask = cheap for you, but more minutes.)\n` +
+            `• Countering to 0 or below is a BLOCK: the deal collapses, both sides' committed points are burned, and the match resumes.\n` +
+            `• Up to 5 rounds of negotiation. Rounds 4 and 5 are binding — no backing out.\n` +
+            `• 10% gap-close rule: each counter must close the gap by at least 10% — you can't trickle down by 1 each time.\n\n` +
+            `To ACCEPT: say "yes" — ${winner.name} pays ${proposal.proposedMinutes} pts, you pay nothing.\n` +
             `To NEGOTIATE: reply "counter [minutes]" with a lower number.\n` +
-            `  ↳ If you counter with [X] minutes, ${winner.name} pays [X] pts and YOU PAY ${proposal.proposedMinutes} - X pts from your balance to buy off the difference.\n` +
-            `  ↳ You cannot decline — only accept or negotiate.\n\n` +
-            `(Up to 5 rounds. ${winner.name} gets the final say on round 5.)`
+            `  ↳ You cannot decline outright — only accept or negotiate (or counter to 0 to block).`
+        );
+
+        // Parallel whisper to the winner: remind them of their floor and balance.
+        this.bot.whisper(winner.memberNumber,
+            `⚔️ Proposal delivered to ${loser.name}. Waiting for their response.\n` +
+            `Your floor: ${proposal.winnerFloor} min (you cannot counter below this). Your balance: ${state.spendingBalance} pts.`
         );
 
         if (proposal.location === "stay" && proposal.privacy === "public") {
@@ -2935,6 +2975,26 @@ export class WinnersDiceGame {
             return true;
         }
 
+        // 10% gap-close rule (applies on the second counter, step 3 only).
+        // The loser must move DOWN by at least 10% of the current gap, so they
+        // can't trickle by 1 each time. Unlike the shop rule, there is no minimum
+        // gap threshold — this applies regardless of gap size.
+        if (!isFirstCounter && proposal.loserLastCounter !== null) {
+            const gap = proposal.winnerLastOffer - proposal.loserLastCounter;
+            if (gap > 0) {
+                const movement = Math.round(gap * 0.10);
+                const minimum = proposal.loserLastCounter - movement;
+                if (n > minimum) {
+                    const winnerName = this.playerName(proposal.winnerMemberNumber);
+                    this.bot.whisper(loser.memberNumber,
+                        `Minimum counter: ${minimum} min — you must close the gap by at least 10%. ` +
+                        `(Gap between ${winnerName}'s offer of ${proposal.winnerLastOffer} and your counter of ${proposal.loserLastCounter} is ${gap} min; ` +
+                        `you must move at least ${movement} min.)`);
+                    return true;
+                }
+            }
+        }
+
         const cost = proposal.winnerFloor - n;
         if (loser.balance < cost) {
             this.bot.whisper(loser.memberNumber,
@@ -2982,6 +3042,25 @@ export class WinnersDiceGame {
         if (isFinal && n < proposal.winnerLastOffer) {
             this.bot.whisper(proposal.winnerMemberNumber, `Your final offer must be at least your previous offer of ${proposal.winnerLastOffer} min.`);
             return true;
+        }
+
+        // 10% gap-close rule: winner must increase their offer by at least 10% of
+        // the current gap, preventing trickle counters. No minimum gap threshold —
+        // applies regardless of gap size (unlike the shop's 50-pt floor).
+        if (proposal.loserLastCounter !== null) {
+            const gap = proposal.winnerLastOffer - proposal.loserLastCounter;
+            if (gap > 0) {
+                const movement = Math.round(gap * 0.10);
+                const minimum = proposal.winnerLastOffer + movement;
+                if (n < minimum) {
+                    const loserName = this.playerName(proposal.loserMemberNumber);
+                    this.bot.whisper(proposal.winnerMemberNumber,
+                        `Minimum counter: ${minimum} min — you must close the gap by at least 10%. ` +
+                        `(Gap between your offer of ${proposal.winnerLastOffer} and ${loserName}'s counter of ${proposal.loserLastCounter} is ${gap} min; ` +
+                        `you must increase by at least ${movement} min.)`);
+                    return true;
+                }
+            }
         }
 
         if (proposal.loserLastCounter !== null && n >= proposal.loserLastCounter) {
@@ -3118,7 +3197,7 @@ export class WinnersDiceGame {
         state.endGameProposal = null;
         this.endGameAwaitingLockSlotsInput = false;
 
-        this.applyEndGameLocks(winner.memberNumber, loser.memberNumber, winnerCost, loserCost, proposal.requestedLockSlots, finalMinutes);
+        this.applyEndGameLocks(winner.memberNumber, loser.memberNumber, winnerCost, loserCost, proposal.requestedLockSlots, finalMinutes, proposal.inRoom);
     }
 
     // Applies the timer/password lock to the loser's leash slot AND every
@@ -3133,6 +3212,7 @@ export class WinnersDiceGame {
         loserPointsSpent: number,
         requestedLockSlots: string[],
         lockMinutes: number,
+        inRoom: boolean,
     ): void {
         const state = this.state;
 
@@ -3168,7 +3248,19 @@ export class WinnersDiceGame {
             loserPointsSpent,
             timer,
             appliedLockSlots,
+            inRoom,
+            activeStartTime: Date.now(),
         };
+
+        // If the session is happening in this room, let the winner know the bot
+        // is standing by for lock removal at time's up — and that they can end
+        // early at any time with !done.
+        if (inRoom) {
+            this.bot.whisper(winnerMemberNumber,
+                `⏳ Standing by — I'll remove ${this.playerName(loserMemberNumber)}'s locks when the ${lockMinutes}-minute timer runs out.\n` +
+                `If you're done early, type !done to end the session now.`
+            );
+        }
     }
 
     // Admin-only debug tool: applies the exact same timer/password lock as
@@ -3211,6 +3303,92 @@ export class WinnersDiceGame {
             `🔧 Test lock applied to ${targetDisplayName}: password "${password}", ${testMinutes} min. ` +
             `Check wrapper.output for the ChatRoomSyncItem confirming it actually saved.`
         );
+    }
+
+    // Allows the winner to end an active service deal or an in-room end game
+    // early. For services, the winner is the buyer; for end games, the winner
+    // is the match winner. If the loser types !done during a service, they get
+    // a whisper explaining who can end it.
+    private handleDone(sender: number): void {
+        // Active service deal takes priority.
+        const deal = this.state.serviceDeal;
+        if (deal && deal.stage === "active") {
+            this.handleServiceDone(sender);
+            return;
+        }
+
+        const active = this.state.activeEndGame;
+        if (!active) {
+            this.bot.whisper(sender, `No active session right now.`);
+            return;
+        }
+        if (sender !== active.winnerMemberNumber) {
+            this.bot.whisper(sender, `Only ${this.playerName(active.winnerMemberNumber)} can end the session early.`);
+            return;
+        }
+        if (!active.inRoom) {
+            this.bot.whisper(sender, `!done is only available for in-room sessions.`);
+            return;
+        }
+        clearTimeout(active.timer);
+        this.bot.sendChat(`⚔️ ${this.playerName(active.winnerMemberNumber)} has declared the session complete early.`);
+        this.expireEndGame();
+    }
+
+    // Shared logic for the winner (!done) declaring an active service complete.
+    // Called from handleDone and from the "done" conversational path in
+    // handleServiceDealMessage's "active" case.
+    private handleServiceDone(sender: number): void {
+        const deal = this.state.serviceDeal;
+        if (!deal || deal.stage !== "active") return;
+        if (sender !== deal.buyer) {
+            this.bot.whisper(sender, `Only ${this.playerName(deal.buyer)} can end the service early.`);
+            return;
+        }
+        if (deal.timerHandle) clearTimeout(deal.timerHandle);
+        if (deal.warningHandle) clearTimeout(deal.warningHandle);
+        this.bot.sendChat(`✅ ${this.playerName(deal.buyer)} has declared the service complete.`);
+        this.state.serviceDeal = null;
+        this.sendPostServiceMenu(deal.buyer);
+    }
+
+    // Handles !time (and conversational "time") for both the active service
+    // deal and the active end game. Whispers the requesting player how many
+    // minutes and seconds remain. Only fires if the sender is one of the two
+    // players involved.
+    private handleTime(sender: number): void {
+        const deal = this.state.serviceDeal;
+        if (deal && deal.stage === "active") {
+            if (sender === deal.buyer || sender === deal.seller) {
+                this.whisperServiceTimeRemaining(sender);
+            }
+            return;
+        }
+
+        const endGame = this.state.activeEndGame;
+        if (endGame) {
+            if (sender === endGame.winnerMemberNumber || sender === endGame.loserMemberNumber) {
+                const elapsed = Date.now() - endGame.activeStartTime;
+                const remaining = Math.max(0, endGame.agreedMinutes * 60 * 1000 - elapsed);
+                const mins = Math.floor(remaining / 60000);
+                const secs = Math.floor((remaining % 60000) / 1000);
+                this.bot.whisper(sender, `⏳ ${mins}m ${secs}s remaining on the end game lock.`);
+            }
+            return;
+        }
+
+        this.bot.whisper(sender, "No active timer right now.");
+    }
+
+    // Whispers the service time remaining to the given player.
+    private whisperServiceTimeRemaining(sender: number): void {
+        const deal = this.state.serviceDeal;
+        if (!deal || deal.stage !== "active" || deal.serviceStartTime === null) return;
+        const elapsed = Date.now() - deal.serviceStartTime;
+        const remaining = Math.max(0, deal.serviceDurationMs - elapsed);
+        const mins = Math.floor(remaining / 60000);
+        const secs = Math.floor((remaining % 60000) / 1000);
+        this.bot.whisper(sender, `⏳ ${mins}m ${secs}s remaining on the service.`);
     }
 
     // Fires when the agreed end game time is up: strips the timer/password
@@ -3559,6 +3737,9 @@ export class WinnersDiceGame {
             price: null,
             counterPrice: null,
             stage: "awaiting_item_price",
+            negotiationStep: 0,
+            initiatorFloor: null,
+            responderCeiling: null,
         };
 
         this.bot.sendChat(`👗 ${this.playerName(buyer)} is eyeing ${this.playerName(opponent.memberNumber)}'s wardrobe...`);
@@ -3589,6 +3770,10 @@ export class WinnersDiceGame {
             case "awaiting_buyer_counter_response":
                 if (sender !== deal.buyer) return false;
                 return this.handleClothingBuyerCounterResponse(deal, lower);
+
+            case "awaiting_buyer_counter_value":
+                if (sender !== deal.buyer) return false;
+                return this.handleClothingBuyerCounterValue(deal, raw);
         }
     }
 
@@ -3657,6 +3842,9 @@ export class WinnersDiceGame {
             return;
         }
 
+        // Opening offer — always succeeds at negotiationStep 0, sets initiatorFloor.
+        applyInitiatorOffer(deal, deal.price!);
+
         deal.stage = "awaiting_opponent_response";
         this.bot.sendChat(`👗 ${this.playerName(deal.buyer)} is looking to buy some clothing from ${this.playerName(deal.opponent)}...`);
         this.bot.whisper(deal.opponent,
@@ -3686,7 +3874,7 @@ export class WinnersDiceGame {
             const valueText = (counterMatch[1] ?? "").trim();
             if (!valueText) {
                 deal.stage = "awaiting_opponent_counter_value";
-                this.bot.whisper(deal.opponent, "What price would you like to counter with?");
+                this.bot.whisper(deal.opponent, "What price would you like to counter with?" + counterOfferHint(deal));
                 return true;
             }
             return this.handleClothingOpponentCounterValue(deal, valueText);
@@ -3699,25 +3887,29 @@ export class WinnersDiceGame {
     private handleClothingOpponentCounterValue(deal: ClothingDeal, raw: string): boolean {
         const n = extractNumber(raw);
         if (n === null) {
-            this.bot.whisper(deal.opponent, "What price would you like to counter with?");
+            this.bot.whisper(deal.opponent, "What price would you like to counter with?" + counterOfferHint(deal));
             return true;
         }
 
-        // This is the opponent's only counter-offer in a clothing deal (the
-        // buyer can only accept/decline it afterward) — so it's always the
-        // "first counter-offer" Rule A caps, using deal.price (still the
-        // buyer's untouched original offer at this point) as the baseline.
-        const { amount: capped, notice } = applyFirstCounterCap(deal.price!, n);
-        if (notice) this.bot.whisper(deal.opponent, notice);
+        const result = applyResponderCounter(deal, n);
+        if (!result.ok) {
+            this.bot.whisper(deal.opponent, result.error!);
+            return true;
+        }
+        if (result.notice) this.bot.whisper(deal.opponent, result.notice);
 
-        deal.counterPrice = capped;
+        if (result.matched) {
+            this.finalizeClothingDeal(deal, result.price!);
+            return true;
+        }
+
         deal.stage = "awaiting_buyer_counter_response";
-        this.bot.whisper(deal.buyer, `${this.playerName(deal.opponent)} counters: ${deal.item} for ${capped} points. Accept or decline?`);
+        this.bot.whisper(deal.buyer, `${this.playerName(deal.opponent)} counters: ${deal.item} for ${deal.counterPrice} points. Accept, decline, or counter?`);
         return true;
     }
 
-    // The buyer can only accept or decline the opponent's counter — no
-    // further counter-offers from the buyer.
+    // The buyer can accept, decline, or counter the opponent's counter,
+    // continuing the structured negotiation (see applyInitiatorOffer).
     private handleClothingBuyerCounterResponse(deal: ClothingDeal, lower: string): boolean {
         if (lower === "accept" || lower === "yes" || lower === "y") {
             this.finalizeClothingDeal(deal, deal.counterPrice!);
@@ -3731,7 +3923,42 @@ export class WinnersDiceGame {
             return true;
         }
 
-        this.bot.whisper(deal.buyer, "Accept or decline the counter-offer?");
+        const counterMatch = lower.match(/^counter(?:\s+(.+))?$/);
+        if (counterMatch) {
+            const valueText = (counterMatch[1] ?? "").trim();
+            if (!valueText) {
+                deal.stage = "awaiting_buyer_counter_value";
+                this.bot.whisper(deal.buyer, "How many points would you like to counter with?" + counterOfferHint(deal));
+                return true;
+            }
+            return this.handleClothingBuyerCounterValue(deal, valueText);
+        }
+
+        this.bot.whisper(deal.buyer, "Please say 'accept', 'decline', or 'counter <amount>'.");
+        return true;
+    }
+
+    private handleClothingBuyerCounterValue(deal: ClothingDeal, raw: string): boolean {
+        const n = extractNumber(raw);
+        if (n === null) {
+            this.bot.whisper(deal.buyer, "How many points would you like to counter with?" + counterOfferHint(deal));
+            return true;
+        }
+
+        const result = applyInitiatorOffer(deal, n);
+        if (!result.ok) {
+            this.bot.whisper(deal.buyer, result.error!);
+            return true;
+        }
+        if (result.notice) this.bot.whisper(deal.buyer, result.notice);
+
+        if (result.final || result.matched) {
+            this.finalizeClothingDeal(deal, result.matched ? result.price! : deal.price!);
+            return true;
+        }
+
+        deal.stage = "awaiting_opponent_response";
+        this.bot.whisper(deal.opponent, `${this.playerName(deal.buyer)} counters: ${deal.item} for ${deal.price} points. Accept, decline, or counter?`);
         return true;
     }
 
@@ -3849,6 +4076,8 @@ export class WinnersDiceGame {
             responderCeiling: null,
             timerHandle: null,
             warningHandle: null,
+            serviceStartTime: null,
+            serviceDurationMs: 0,
         };
 
         this.bot.sendChat(`🎭 ${this.playerName(buyer)} is browsing the services menu...`);
@@ -3883,7 +4112,20 @@ export class WinnersDiceGame {
                 return this.handleServiceBuyerCounterValue(deal, raw);
 
             case "active":
-                return false;
+                // During the active timer, only the players involved are
+                // allowed to send recognized commands; everything else is
+                // silently consumed so the bot doesn't react to chatter.
+                if (sender !== deal.buyer && sender !== deal.seller) return false;
+                if (lower === "time") {
+                    this.whisperServiceTimeRemaining(sender);
+                    return true;
+                }
+                if (lower === "done") {
+                    this.handleServiceDone(sender);
+                    return true;
+                }
+                // Silently consume all other messages from either party.
+                return true;
         }
     }
 
@@ -4093,11 +4335,13 @@ export class WinnersDiceGame {
         state.spendingBalance -= price;
         seller.pendingBalance += half;
 
-        this.bot.sendChat(`✅ ${buyer.name} purchased a service from ${seller.name}: "${description}" for ${price} pts. ${seller.name} has 5 minutes. (${buyer.name} has ${state.spendingBalance} points left.)`);
-
-        const cancelNote = "Either of you can whisper !cancel to end this early — the payment already went through, so there's no refund.";
-        this.bot.whisper(deal.buyer, cancelNote);
-        this.bot.whisper(deal.seller, cancelNote);
+        const SERVICE_MINUTES = 5;
+        this.bot.sendChat(
+            `⏳ ${seller.name} is performing "${description}" for ${buyer.name} — ` +
+            `${SERVICE_MINUTES} minutes on the clock. ` +
+            `Use !done when complete, !time to check remaining time, or safeword to stop. ` +
+            `(${price} pts settled; ${buyer.name} has ${state.spendingBalance} pts left.)`
+        );
 
         deal.price = price;
         deal.stage = "active";
@@ -4107,12 +4351,15 @@ export class WinnersDiceGame {
     // Schedules the 3-minute warning whisper and the 5-minute expiry for an
     // active service deal.
     private startServiceTimer(deal: ServiceDeal): void {
+        deal.serviceStartTime = Date.now();
+        deal.serviceDurationMs = 5 * 60 * 1000;
+
         deal.warningHandle = setTimeout(() => {
             this.bot.whisper(deal.buyer, "⏳ 3 minutes remaining on the service.");
             this.bot.whisper(deal.seller, "⏳ 3 minutes remaining on the service.");
         }, 2 * 60 * 1000);
 
-        deal.timerHandle = setTimeout(() => this.expireServiceDeal(deal), 5 * 60 * 1000);
+        deal.timerHandle = setTimeout(() => this.expireServiceDeal(deal), deal.serviceDurationMs);
     }
 
     // Fires when an active service deal's 5-minute timer runs out — announces
@@ -4146,6 +4393,10 @@ export class WinnersDiceGame {
     private handleServiceDealCancel(sender: number): void {
         const deal = this.state.serviceDeal;
         if (!deal) return;
+
+        // !cancel is not available once the service is underway — only !done
+        // (winner) or safeword can stop it at that point.
+        if (deal.stage === "active") return;
 
         const otherParty = sender === deal.buyer ? deal.seller : deal.buyer;
         const alreadyVisibleToBoth = deal.stage !== "awaiting_description";

@@ -10,21 +10,15 @@
 
 ## MEDIUM PRIORITY
 
-1. **Clothing deal uses weak single-counter negotiation** — Bondage/lock/toy/service all use the shared 5-step engine with Rule A (first-counter cap) and Rule B (10%-gap-close floor). Clothing hand-rolls a single exchange: seller gets one counter, buyer can only accept/decline. `ClothingDeal` in `types.ts` structurally lacks `negotiationStep`/`initiatorFloor`/`responderCeiling`. Consider upgrading to the shared negotiation engine.
-
 2. **Dead code: `BondagePicker` class is never instantiated** — `bondagePicker.ts` is 1279 lines; ~950 implement a full "picker chooses restraints piece by piece" system (mode selection, slot consent, veto, popularity tracking, outfit logging) that is never used at runtime. `game.ts` only imports 4 small helpers/constants (confirmed — no `new BondagePicker(...)` anywhere). Either wire it in or delete it.
 
 3. **`!setstatus` can't set feedback to "declined"** — `validStatuses` (`game.ts`) still omits `"declined"` even though `FeedbackItemStatus` includes it and it's a valid resolved state. Admin has to hand-edit the JSON file.
 
 4. **`pendingChallengeDisambiguation` not cleared on reset/safeword** — It's a class field, not part of `GameState`, so it survives `!reset` and safeword (confirmed — neither `handleReset` nor `handleSafewordUsed` touches it). After a reset, a challenger's next message could be swallowed as a stale disambiguation answer.
 
-5. **Mid-game disconnects still just abort — no state-saving/resume** — `onMemberLeave` exists (see Completed): pre-game it cancels the negotiation immediately, mid-match it gives the remaining player a 3-minute grace period (or "quit") before ending things. But "ending things" is still a hard abort — same teardown as safeword/`!reset`, no `finishMatch`/carryover. Consider whether a disconnect-triggered end should instead persist state for the two players to resume later (similar in spirit to the per-pair points carryover added for normal match completion, but disconnects are a harder case: mid-round state, pending deals, applied bondage, etc.). Design TBD.
-
 ---
 
 ## Known Issues / Limitations
-
-- **Safeword handler: first live test did not work as expected** — needs debugging. Check whether the `SafewordUsed` socket event is actually firing, or whether the Action message pattern matching is off. (No changes found in `index.ts`/`game.ts` since this was flagged — still needs a live re-test.)
 
 - **Buyback: no wardrobe detection on re-equip**
   BC's ChatRoomSyncSingle fires on wardrobe changes but cannot distinguish clothing being *added* vs *removed*. When a player buys back their item, there's no way to detect them putting it back on. Buyback flow skips wardrobe monitoring — player just re-equips on their own after payment (confirmed unchanged in `startBuyback`/`handleBuybackResponse`). If we ever find a BC API event that signals item equipped, revisit this.
@@ -32,6 +26,8 @@
 ---
 
 ## Queued Features / Changes
+
+- **Standardize clothing/wardrobe-change detection between WD and BD** — WD's trade-handoff detection (`startWardrobeCheck`/`waitingForWardrobe` in `game.ts`) just treats *any* `ChatRoomSyncSingle` for the pending member as proof the item changed hands — no item-count check, no manual confirm command, and only a single one-time 2-minute nudge if it never fires (see "Buyback: no wardrobe detection on re-equip" above — same underlying gap). BD's penalty-removal detection (`markAwaitingRemoval`/`pendingRemovalBaselineCount`, appearance-count baseline vs fresh sync, `!removed` fallback, turn-gating fix) shipped 2026-07-11 in StripDiceBot and is meaningfully more robust. Plan: port BD's baseline-diff pattern into WD, add a manual confirm command, and consider extracting a shared "wardrobe watch" helper both bots import — same precedent as `bondagePicker.ts` (already built to be portable). On hold — DW wants to field-test the BD changes live first before touching WD or extracting shared code. Tracked in both bots' todo files so it doesn't get lost.
 
 - **Banking + clothing menus whisper-only** — All bank menus (continue/spend/endgame), spend menus, and clothing negotiation messages should be sent via whisper, not public chat. Still not the case: `startClothingDeal`/`proposeClothingDealToOpponent` and most `start*Deal` entry points intentionally `sendChat` an opening announcement (see "Early shop announcements" in Completed, 2026-07-09). That was a deliberate design choice made *after* this item was written, so it may be obsolete — worth a quick DW call on whether to drop this item or scope it down to just the bank/continue/endgame prompts (which already look whisper-only).
 
@@ -46,9 +42,8 @@
 See Completed for the full flow. Points committed during execute/block are intentionally burned (credited to neither player) — see "Per-pair points carryover" in Completed for the separate mechanic that persists each player's leftover *match* balance between matches. Still open:
 
 - **`!points` command** — not implemented; players currently only see balances via the whispers sent at the start of the end game proposal and inside the delivered proposal, not on demand. Should show both: current banked balance, and the current pot (what they'd gain by `!bank` right now) — a quick on-demand check during any live round, not just at end-game.
-- **End game anti-stalling**: consider requiring each counter to close at least 25% of the gap between the two sides' positions. Confirmed not implemented in `applyEndGameLoserCounter`/`applyEndGameWinnerCounter` (only the shared shop-deal negotiation has the 10%-gap-close rule — end-game's bespoke negotiation doesn't). Only implement if stalling becomes a real problem in playtesting.
-- **End game save/resume**: when safeword or reset is called during active end game, consider saving the agreed terms so the session can be resumed later. Design TBD — the `// TODO: Save/resume end game state across sessions` comment is still present in both `handleSafewordUsed` and `handleReset`.
-- **End game timer/password lock slot**: `bc_items.json` has no literal "ItemLeash" BC group — `executeEndGame()`/`expireEndGame()` still use `ItemNeckRestraints` + `CollarLeash` as a stand-in (`END_GAME_LEASH_GROUP`/`END_GAME_LEASH_ITEM`). Revisit once there's a clearer idea of what BC asset should represent the timer lock.
+- **End game save/resume**: when safeword or reset is called during active end game, consider saving the agreed terms so the session can be resumed later. Design TBD — revisit later.
+- **End game timer/password lock slot**: `executeEndGame()`/`expireEndGame()` use `ItemNeckRestraints` + `CollarLeash` as a stand-in. Revisit once there's a clearer idea of what BC asset should represent the timer lock.
 
 _(add items here as they come up during playtesting)_
 
@@ -57,12 +52,17 @@ _(add items here as they come up during playtesting)_
 ## Reminders / Pending Tests
 
 - Test safeword in BD (StripDiceBot) — verify BD's Action message pattern catches the safeword event and triggers full bondage removal + game stop.
-- Re-test safeword in WD after debugging.
 - Test permission pre-flight: join a game with AllowItem disabled in BC settings and verify the bot blocks the challenge with the correct whisper message.
 
 ---
 
 ## Completed
+
+### Completed 2026-07-13
+- **End-game 10% gap-close rule**: `applyEndGameLoserCounter`/`applyEndGameWinnerCounter` now enforce a 10% gap-close requirement on every counter, regardless of gap size. Player is told the minimum if they go under.
+- **End-game bidding hints**: loser's proposal delivery whisper now explains the negotiation mechanics (1pt/min cost, how the loser's counter affects their own balance, block mechanic, 5-step binding rules, gap-close rule) and shows both players' current balances. Winner gets a parallel whisper with their floor and balance.
+- **In-room standby + `!done` command**: when Q2 = stay in this room, bot whispers the winner it's standing by and they can type `!done` to end early. `!done` cancels the timer and calls `expireEndGame()` immediately. Only active in in-room end games.
+- **Clothing deal upgraded to 5-step negotiation engine** — `ClothingDeal` in `types.ts` now has `negotiationStep`, `initiatorFloor`, `responderCeiling`. Counter/accept flow rewired through `applyInitiatorOffer`/`applyResponderCounter` with Rule A (first-counter cap) and Rule B (10%-gap-close floor), matching all other deal types. Cancel remains symmetric for both parties.
 
 ### Completed Today (2026-07-10)
 - **Per-pair points carryover**: `pair_balances.json` (gitignored, same pattern as `players.json`) tracks each player's leftover balance independently per opponent, keyed by the sorted member-number pair. Written at `finishMatch`/`resolveMercy` only — safeword and admin `!reset` do NOT write it. At challenge-accept time (`promptCarryoverOrBeginSettings`), if a saved entry exists for the pair, both players are asked whether to use it; both must agree or both start at zero and the saved entry is deleted outright. A's balance against B never affects A's balance against C.

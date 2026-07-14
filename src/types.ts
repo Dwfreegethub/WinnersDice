@@ -169,8 +169,10 @@ export type ClothingDealStage =
     | "awaiting_opponent_response"
     // Opponent said "counter" with no value — waiting for the number.
     | "awaiting_opponent_counter_value"
-    // Opponent countered — waiting for the buyer to accept/decline.
-    | "awaiting_buyer_counter_response";
+    // Opponent countered — waiting for the buyer to accept/decline/counter.
+    | "awaiting_buyer_counter_response"
+    // Buyer said "counter" with no value — waiting for the number.
+    | "awaiting_buyer_counter_value";
 
 // In-progress clothing purchase negotiated via the spend menu.
 export interface ClothingDeal {
@@ -180,6 +182,13 @@ export interface ClothingDeal {
     price: number | null;
     counterPrice: number | null;
     stage: ClothingDealStage;
+    // 0 before the buyer's first offer; 1-5 tracking the structured
+    // negotiation steps described in game.ts (applyInitiatorOffer/applyResponderCounter).
+    negotiationStep: number;
+    // The buyer's opening offer — their counters can never go below this.
+    initiatorFloor: number | null;
+    // The opponent's first counter — their later counters can never go above this.
+    responderCeiling: number | null;
 }
 
 // In-progress "actions & services" purchase negotiated via the spend menu:
@@ -214,6 +223,10 @@ export interface ServiceDeal {
     responderCeiling: number | null;
     timerHandle: NodeJS.Timeout | null;
     warningHandle: NodeJS.Timeout | null;
+    // Set (to Date.now()) when the active timer starts; null until then.
+    serviceStartTime: number | null;
+    // Total duration of the active timer in ms (always 5 * 60 * 1000).
+    serviceDurationMs: number;
 }
 
 // A piece of bondage currently applied in a match. `slot` is the picker-facing
@@ -420,6 +433,9 @@ export interface EndGameProposal {
     loserCeiling: number | null;
     winnerLastOffer: number;
     loserLastCounter: number | null;
+    // True when Q2 = stay in this room; false when Q2 = move. Determines
+    // whether the standby whisper and !done command are available after execution.
+    inRoom: boolean;
     // Points tracking — set once execution happens.
     winnerPointsCommitted: number;
     loserPointsCommitted: number;
@@ -436,6 +452,12 @@ export interface ActiveEndGame {
     loserPointsSpent: number;
     timer: NodeJS.Timeout;
     appliedLockSlots: string[];
+    // Mirrors EndGameProposal.inRoom — true when the session is happening in
+    // this room, enabling the standby whisper and the winner's !done command.
+    inRoom: boolean;
+    // Date.now() at the moment the end-game timer started — used by !time
+    // to compute remaining seconds.
+    activeStartTime: number;
 }
 
 // The requester's !mercy concession request, walking through the winner's
