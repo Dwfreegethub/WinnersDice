@@ -556,10 +556,16 @@ export class WinnersDiceGame {
 
     // Wardrobe-change checks awaiting a ChatRoomSyncSingle for the opponent
     // in a clothing deal, keyed by the opponent's member number.
+    // baselineCount is their Appearance.length captured when the deal
+    // closed (see startWardrobeCheck) — onSyncSingle only treats a fresh
+    // sync as confirmation once the count actually drops below it, rather
+    // than trusting any resync event. Null when no cached appearance was
+    // available at that moment (falls back to trust-any-sync).
     private pendingWardrobeChecks: Map<number, {
         buyer: number;
         item: string;
         timer: NodeJS.Timeout;
+        baselineCount: number | null;
     }> = new Map();
 
     // Full character data from the most recent room sync or join event, keyed
@@ -779,6 +785,9 @@ export class WinnersDiceGame {
                 break;
             case "!testlock":
                 this.handleTestLock(sender, args);
+                break;
+            case "!removed":
+                this.handleRemovedConfirmation(sender);
                 break;
             case "!done":
                 this.handleDone(sender);
@@ -3993,7 +4002,7 @@ export class WinnersDiceGame {
         this.bot.whisper(deal.buyer, breakdown);
         this.bot.whisper(deal.opponent, breakdown);
 
-        const waitMsg = `⏳ Waiting for ${opponent.name} to remove ${item} from their wardrobe. The game is paused until then.`;
+        const waitMsg = `⏳ Waiting for ${opponent.name} to remove ${item} from their wardrobe. The game is paused until then. (${opponent.name} can whisper !removed to confirm manually if it doesn't clear on its own.)`;
         this.bot.whisper(deal.buyer, waitMsg);
         this.bot.whisper(deal.opponent, waitMsg);
 
@@ -4004,8 +4013,10 @@ export class WinnersDiceGame {
 
     // Watches for a ChatRoomSyncSingle wardrobe change from `opponent`
     // within WARDROBE_CHECK_TIMEOUT_MS, blocking all game commands until it
-    // arrives. If none arrives in time, nudges the buyer to follow up
-    // directly, but keeps the game paused.
+    // arrives (verified via item-count drop, or a manual !removed from
+    // opponent — see onSyncSingle/handleRemovedConfirmation). If none
+    // arrives in time, nudges the buyer to follow up directly, but keeps
+    // the game paused.
     private startWardrobeCheck(buyer: number, opponent: number, item: string): void {
         const existing = this.pendingWardrobeChecks.get(opponent);
         if (existing) clearTimeout(existing.timer);
@@ -4013,11 +4024,46 @@ export class WinnersDiceGame {
         const timeoutAt = Date.now() + WARDROBE_CHECK_TIMEOUT_MS;
         this.state.waitingForWardrobe = { memberNumber: opponent, item, timeoutAt };
 
+        const baselineCount = this.roomCharacters.get(opponent)?.Appearance?.length ?? null;
+
         const timer = setTimeout(() => {
             this.bot.whisper(buyer, `⚠️ ${this.playerName(opponent)} hasn't made a wardrobe change yet. You may need to follow up.`);
         }, WARDROBE_CHECK_TIMEOUT_MS);
 
-        this.pendingWardrobeChecks.set(opponent, { buyer, item, timer });
+        this.pendingWardrobeChecks.set(opponent, { buyer, item, timer, baselineCount });
+    }
+
+    // Confirms the opponent's wardrobe check either (a) automatically, once
+    // onSyncSingle sees their Appearance count drop below the baseline
+    // captured when the deal closed, or (b) manually, via !removed —
+    // mirrors StripDiceBot's handleRemoved(). Clears the pending check and
+    // resumes the buyer's menu either way.
+    private completeWardrobeCheck(memberNumber: number): void {
+        const pending = this.pendingWardrobeChecks.get(memberNumber);
+        if (!pending) return;
+
+        clearTimeout(pending.timer);
+        this.pendingWardrobeChecks.delete(memberNumber);
+
+        if (this.state.waitingForWardrobe?.memberNumber === memberNumber) {
+            this.state.waitingForWardrobe = null;
+        }
+
+        this.bot.sendChat(`👗 ${this.playerName(memberNumber)} has handed over their ${pending.item}! The game continues.`);
+
+        this.sendPostWardrobeMenu(pending.buyer);
+    }
+
+    // Manual fallback for a pending wardrobe check — lets the opponent
+    // confirm the handoff themselves instead of waiting solely on BC's sync
+    // event to land. Mirrors StripDiceBot's !removed command.
+    private handleRemovedConfirmation(sender: number): void {
+        const waiting = this.state.waitingForWardrobe;
+        if (!waiting || waiting.memberNumber !== sender) {
+            this.bot.whisper(sender, "There's nothing pending for you to confirm right now.");
+            return;
+        }
+        this.completeWardrobeCheck(sender);
     }
 
     // Whispers `sender` that the game is paused if a wardrobe change is
@@ -6112,16 +6158,17 @@ export class WinnersDiceGame {
         const pending = this.pendingWardrobeChecks.get(memberNumber);
         if (!pending) return;
 
-        clearTimeout(pending.timer);
-        this.pendingWardrobeChecks.delete(memberNumber);
-
-        if (this.state.waitingForWardrobe?.memberNumber === memberNumber) {
-            this.state.waitingForWardrobe = null;
+        // Prefer verifying an actual item-count drop over trusting any sync
+        // event — a resync can land for reasons unrelated to the traded
+        // item. Null baseline (no cached appearance when the deal closed)
+        // falls back to the old trust-any-sync behavior rather than never
+        // resolving.
+        const freshCount = Array.isArray(data.Character?.Appearance) ? data.Character.Appearance.length : null;
+        if (pending.baselineCount !== null && freshCount !== null && freshCount >= pending.baselineCount) {
+            return; // nothing actually changed yet — keep waiting
         }
 
-        this.bot.sendChat(`👗 ${this.playerName(memberNumber)} has handed over their ${pending.item}! The game continues.`);
-
-        this.sendPostWardrobeMenu(pending.buyer);
+        this.completeWardrobeCheck(memberNumber);
     }
 
     // Whispers the buyer what to do next once a clothing deal's wardrobe

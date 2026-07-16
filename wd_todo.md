@@ -4,7 +4,7 @@
 
 1. Decide what to do about clothing — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
    - Key question on automatic strip: `removeItem(memberNumber, "Cloth")` uses the same socket event as bondage removal and should work for clothing slots. The unknown is whether BC's server will honor it from a bot that isn't whitelisted. Needs a live test — add a debug command (`!teststrip`) that calls `removeItem` on the Cloth slot to confirm. (Not yet added.)
-2. **Price tracking** — track what prices items actually sold for during shop negotiations, so players and admins can see historical pricing data. Design TBD (could be per-session log, persistent file, or whisper on request via !prices). Not implemented — no `!prices` command or price log in `game.ts`.
+   - **Superseded by a full design** — see [`design_wardrobe_helper.md`](design_wardrobe_helper.md) (2026-07-14). Covers the `!teststrip` question plus a full "bot as wardrobe helper" feature: remembers exact worn items (Name/Color/Property, not just count) so it can narrow down which BC Group a vague description means, whisper-confirm when ambiguous, and act-or-advise (direct removeItem/applyItem when permission allows, else tell the other player exactly what to do by hand) for `!stuck`/`!redress` commands. Motivated by real test-game behavior: players apply bondage before removing clothing, so a bound player may need help reaching an item mid-match. DW is holding off on implementation for now — doc is written to be handed to a dispatched session later without needing this conversation's context.
 
 ---
 
@@ -15,6 +15,12 @@
 3. **`!setstatus` can't set feedback to "declined"** — `validStatuses` (`game.ts`) still omits `"declined"` even though `FeedbackItemStatus` includes it and it's a valid resolved state. Admin has to hand-edit the JSON file.
 
 4. **`pendingChallengeDisambiguation` not cleared on reset/safeword** — It's a class field, not part of `GameState`, so it survives `!reset` and safeword (confirmed — neither `handleReset` nor `handleSafewordUsed` touches it). After a reset, a challenger's next message could be swallowed as a stale disambiguation answer.
+
+---
+
+## LOW PRIORITY
+
+1. **Price tracking** — track what prices items actually sold for during shop negotiations, so players and admins can see historical pricing data. Design TBD (could be per-session log, persistent file, or whisper on request via !prices). Not implemented — no `!prices` command or price log in `game.ts`. Downgraded from High — not sure yet whether this will actually get used.
 
 ---
 
