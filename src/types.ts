@@ -74,6 +74,11 @@ export interface GameConfig {
 // Settled via the !propose/!accept/!counter/!decline flow (or the yes/no flow).
 export type NegotiationKey = keyof GameConfig;
 
+// Which BC room configuration the match runs in (multi-room handoff —
+// see design_multi_room.md). Chosen as the final negotiation question,
+// independently by both players; a mismatch falls back to "private".
+export type RoomType = "spectator" | "private" | "locked";
+
 // A proposed value for one setting, awaiting a response from the other player.
 export interface NegotiationProposal {
     key: NegotiationKey;
@@ -116,6 +121,12 @@ export interface NegotiationState {
     // True only once carryoverStage is "done" AND both players agreed to use
     // the saved balance — read when building PlayerState at match start.
     useCarryover: boolean;
+    // Final negotiation question, asked once every NEGOTIATION_ORDER key is
+    // settled: which room type the match runs in. Both players answer
+    // independently; a mismatch resolves to "private" (see handleRoomTypeAnswer).
+    roomTypeStage: "not_asked" | "awaiting" | "done";
+    roomTypeAnswers: Partial<Record<number, RoomType>>;
+    roomType: RoomType | null;
 }
 
 // An item this player has sold to their opponent, available to buy back
@@ -594,6 +605,47 @@ export interface PairBalanceEntry {
     // player's balance against a third player.
     balances: Record<string, number>;
     lastUpdated: string;
+}
+
+// ============================================================
+// MULTI-ROOM HANDOFF QUEUE
+// ============================================================
+// See design_multi_room.md. Coordination between the lobby bot and room
+// bots happens entirely through handoffs/{pending,claimed,results}/ — no
+// shared in-memory state, no direct inter-process calls.
+
+// Written by the lobby bot to handoffs/pending/<id>.json once negotiation
+// finishes. A room bot claims it via an atomic rename to handoffs/claimed/.
+export interface HandoffEntry {
+    id: string;
+    createdAt: string;
+    expiresAt: string;
+    players: {
+        challenger: { memberNumber: number; name: string };
+        opponent: { memberNumber: number; name: string };
+    };
+    config: GameConfig;
+    roomType: RoomType;
+    // Carried-over balance (if any — see PairBalanceEntry) each player starts
+    // the match with. Baked in here rather than left for the room bot to look
+    // up, since pair_balances.json is lobby-bot-owned only (see design_multi_room.md).
+    startingBalances: { challenger: number; opponent: number };
+    // Set to the claiming bot's BOT_ROLE once claimed.
+    claimedBy?: string;
+}
+
+// Written by a room bot to handoffs/results/<id>.json at match end. The
+// lobby bot polls this directory, applies the outcome to players.json /
+// pair_balances.json, and moves the file to handoffs/results/processed/.
+export interface MatchResultEntry {
+    handoffId: string;
+    completedAt: string;
+    winner: number;
+    loser: number;
+    winnerPointsEarned: number;
+    loserPointsLost: number;
+    endReason: "normal" | "mercy" | "safeword" | "disconnect" | "reset";
+    pairBalances: Record<string, number>;
 }
 
 export type FeedbackItemStatus = "pending" | "reviewing" | "testing" | "implemented" | "declined" | "partly_implemented";

@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { BCConnection } from "./connection";
 import { log, logError, centralTimestamp } from "./logger";
-import { secrets } from "./secrets";
+import { secrets, botRole } from "./secrets";
 import {
     ActiveBondage,
     ActiveEndGame,
@@ -18,13 +18,16 @@ import {
     FeedbackStatusEntry,
     GameConfig,
     GameState,
+    HandoffEntry,
     LockDeal,
+    MatchResultEntry,
     MercyRequest,
     NegotiationKey,
     NegotiationState,
     PairBalanceEntry,
     PlayerRecord,
     PlayerState,
+    RoomType,
     RoundResult,
     ServiceDeal,
     SoldItem,
@@ -32,6 +35,7 @@ import {
     ToyDeal,
 } from "./types";
 import { PICK_SLOTS, PickSlot, PICK_LIST_TOP_N, loadBcItemCatalog } from "./bondagePicker";
+import { writeHandoff, listPendingResults, markResultProcessed } from "./handoff";
 
 const FEEDBACK_STATUS_LABELS: Record<FeedbackItemStatus, string> = {
     pending: "⏳ Pending review",
@@ -143,6 +147,23 @@ const CONSENT_ALL_QUESTION =
     "WinnersDice is an adult game involving stripping, bondage, use of locks and restraints, sexual situations, " +
     "and potentially actions & services or being under the other player's control for a period of time. " +
     "Do you both agree to all of this? (yes / no)";
+
+// Final negotiation question — see design_multi_room.md. Both players answer
+// independently; a mismatch falls back to "private" (handleRoomTypeAnswer).
+const ROOM_TYPE_QUESTION =
+    "Last question — what kind of room would you like? " +
+    "1) Spectator — public, anyone can watch  " +
+    "2) Private — hidden, just you two  " +
+    "3) Locked — hidden and locked, admin-only access. " +
+    "(reply with 1, 2, or 3)";
+
+function parseRoomTypeAnswer(text: string): RoomType | null {
+    const trimmed = text.trim().toLowerCase();
+    if (trimmed === "1" || trimmed === "spectator" || trimmed === "public") return "spectator";
+    if (trimmed === "2" || trimmed === "private" || trimmed === "hidden") return "private";
+    if (trimmed === "3" || trimmed === "locked" || trimmed === "lock") return "locked";
+    return null;
+}
 
 function rollD20(): number {
     return Math.floor(Math.random() * 20) + 1;
@@ -605,6 +626,13 @@ export class WinnersDiceGame {
         this.loadFeedbackStatus();
         this.loadPlayerRecords();
         this.loadPairBalances();
+
+        // Multi-room mode (BOT_ROLE=main): poll for match results room bots
+        // have written, on the same cadence as a room bot's own pending-handoff
+        // poll (see design_multi_room.md).
+        if (botRole === "main") {
+            setInterval(() => this.processHandoffResults(), 10_000);
+        }
     }
 
     private createIdleState(): GameState {
@@ -905,6 +933,18 @@ export class WinnersDiceGame {
         if (negotiation && negotiation.awaitingCounterFrom === sender) {
             negotiation.awaitingCounterFrom = null;
             this.handleCounter(sender, msg);
+            return;
+        }
+
+        // Final negotiation question — both players answer independently
+        // (see handleRoomTypeAnswer).
+        if (negotiation && this.state.phase === "negotiating" && negotiation.roomTypeStage === "awaiting") {
+            const parsed = parseRoomTypeAnswer(lower);
+            if (parsed === null) {
+                this.bot.whisper(sender, `I didn't catch that — reply 1 (Spectator), 2 (Private), or 3 (Locked).`);
+                return;
+            }
+            this.handleRoomTypeAnswer(sender, parsed);
             return;
         }
 
@@ -1340,6 +1380,9 @@ export class WinnersDiceGame {
             carryoverStage: "not_asked",
             carryoverAnswers: {},
             useCarryover: false,
+            roomTypeStage: "not_asked",
+            roomTypeAnswers: {},
+            roomType: null,
         };
 
         this.state = {
@@ -1515,6 +1558,45 @@ export class WinnersDiceGame {
         this.beginSettingsNegotiation();
     }
 
+    // Dispatches one player's independent answer to ROOM_TYPE_QUESTION. Once
+    // both have answered: matching answers win outright; a mismatch falls
+    // back to "private" (see design_multi_room.md's TBD note, resolved by DW
+    // on 2026-07-16 — default-to-private on disagreement).
+    private handleRoomTypeAnswer(sender: number, value: RoomType): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.roomTypeStage !== "awaiting") {
+            return;
+        }
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) {
+            return;
+        }
+
+        negotiation.roomTypeAnswers[sender] = value;
+
+        const challengerAnswer = negotiation.roomTypeAnswers[negotiation.challenger.memberNumber];
+        const opponentAnswer = negotiation.roomTypeAnswers[negotiation.opponent.memberNumber];
+
+        if (challengerAnswer === undefined || opponentAnswer === undefined) {
+            const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+            const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+            this.bot.sendChat(`${responder.name} picks ${value}. Waiting on ${other.name}...`);
+            return;
+        }
+
+        const resolved: RoomType = challengerAnswer === opponentAnswer ? challengerAnswer : "private";
+        negotiation.roomTypeStage = "done";
+        negotiation.roomTypeAnswers = {};
+        negotiation.roomType = resolved;
+
+        if (challengerAnswer === opponentAnswer) {
+            this.bot.sendChat(`Both players agreed — room type: ${resolved}.`);
+        } else {
+            this.bot.sendChat(`${negotiation.challenger.name} and ${negotiation.opponent.name} picked different room types — defaulting to private.`);
+        }
+
+        this.finishNegotiation();
+    }
+
     private beginSettingsNegotiation(): void {
         this.bot.sendChat(
             `Let's negotiate the match settings. Either player can type !cancel at any time to abort.`
@@ -1531,6 +1613,13 @@ export class WinnersDiceGame {
 
         const key = nextNegotiationKey(negotiation.config);
         if (key === null) {
+            if (negotiation.roomTypeStage === "not_asked") {
+                negotiation.roomTypeStage = "awaiting";
+                negotiation.roomTypeAnswers = {};
+                this.bot.sendChat(`${negotiation.challenger.name} and ${negotiation.opponent.name}: ${ROOM_TYPE_QUESTION}`);
+                return;
+            }
+            if (negotiation.roomTypeStage === "awaiting") return;
             this.finishNegotiation();
             return;
         }
@@ -1975,6 +2064,13 @@ export class WinnersDiceGame {
         const challengerStart = carryoverEntry?.balances[String(negotiation.challenger.memberNumber)] ?? 0;
         const opponentStart = carryoverEntry?.balances[String(negotiation.opponent.memberNumber)] ?? 0;
 
+        // Multi-room mode: the lobby bot never runs matches itself. Hand off
+        // to a room bot instead of building match state — see design_multi_room.md.
+        if (botRole === "main") {
+            this.handOffMatch(negotiation, config, challengerStart, opponentStart);
+            return;
+        }
+
         const players: [PlayerState, PlayerState] = [
             { memberNumber: negotiation.challenger.memberNumber, name: negotiation.challenger.name, balance: challengerStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
             { memberNumber: negotiation.opponent.memberNumber, name: negotiation.opponent.name, balance: opponentStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
@@ -2029,6 +2125,29 @@ export class WinnersDiceGame {
         }
 
         this.startMatch();
+    }
+
+    // Multi-room mode (BOT_ROLE=main): writes the agreed match to
+    // handoffs/pending/ for a room bot to claim, instead of running it here.
+    // See design_multi_room.md's full flow.
+    private handOffMatch(negotiation: NegotiationState, config: GameConfig, challengerStart: number, opponentStart: number): void {
+        writeHandoff({
+            players: {
+                challenger: { memberNumber: negotiation.challenger.memberNumber, name: negotiation.challenger.name },
+                opponent: { memberNumber: negotiation.opponent.memberNumber, name: negotiation.opponent.name },
+            },
+            config,
+            roomType: negotiation.roomType ?? "private",
+            startingBalances: { challenger: challengerStart, opponent: opponentStart },
+        });
+
+        this.bot.sendChat(
+            `All settings agreed! A game room is being prepared for ${negotiation.challenger.name} and ${negotiation.opponent.name} — you'll receive an invite shortly.`
+        );
+        this.bot.whisper(negotiation.challenger.memberNumber, "Your game room is being prepared — hang tight, you'll get an invite shortly.");
+        this.bot.whisper(negotiation.opponent.memberNumber, "Your game room is being prepared — hang tight, you'll get an invite shortly.");
+
+        this.state = this.createIdleState();
     }
 
     private startMatch(): void {
@@ -6765,6 +6884,40 @@ export class WinnersDiceGame {
             lastUpdated: centralTimestamp(),
         };
         this.savePairBalances();
+    }
+
+    // Multi-room mode (BOT_ROLE=main): applies match results a room bot
+    // wrote to handoffs/results/. The lobby bot is the sole writer for
+    // players.json and pair_balances.json (see design_multi_room.md), so
+    // this mirrors recordGameCompletion/savePairCarryover rather than
+    // calling them directly (those take live PlayerState, not a result file).
+    private processHandoffResults(): void {
+        for (const result of listPendingResults()) {
+            const winnerRecord = this.playerRecords[String(result.winner)];
+            const loserRecord = this.playerRecords[String(result.loser)];
+            if (winnerRecord) {
+                winnerRecord.gamesPlayed++;
+                winnerRecord.gamesWon++;
+            }
+            if (loserRecord) {
+                loserRecord.gamesPlayed++;
+            }
+            if (winnerRecord || loserRecord) this.savePlayerRecords();
+
+            const pairMembers = Object.keys(result.pairBalances).map(Number);
+            if (pairMembers.length === 2) {
+                const [a, b] = pairMembers;
+                this.pairBalances[this.pairKey(a, b)] = {
+                    memberNumbers: [a, b],
+                    balances: result.pairBalances,
+                    lastUpdated: centralTimestamp(),
+                };
+                this.savePairBalances();
+            }
+
+            log(`[Handoff] Processed result ${result.handoffId} (winner #${result.winner}, ${result.endReason}).`);
+            markResultProcessed(result.handoffId);
+        }
     }
 
     // Reads feedback.log and returns the set of member numbers that have

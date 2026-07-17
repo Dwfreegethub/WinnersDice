@@ -5,6 +5,7 @@ import { WinnersDiceGame } from "./game";
 import { log, logError } from "./logger";
 import { decodeMessage } from "./decodeMessage";
 import { Player, BCChatMessage, BCRoomSync, BCMemberEvent } from "./types";
+import { botRole, secrets } from "./secrets";
 
 process.on('uncaughtException', (err) => {
     console.error('[CRASH] Uncaught exception:', err);
@@ -29,6 +30,12 @@ function stripOOC(msg: string): string {
 }
 
 async function main() {
+    log(`BOT_ROLE=${botRole}`);
+    if (!secrets.username || !secrets.password) {
+        logError(`No credentials configured for BOT_ROLE=${botRole} in secrets.ts. Refusing to start.`);
+        process.exit(1);
+    }
+
     const pendingUpdatePath = path.join(__dirname, "..", "pending_update.txt");
     let updateNote: string | null = null;
     if (fs.existsSync(pendingUpdatePath)) {

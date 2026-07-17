@@ -9,5 +9,6 @@ players.json
 pair_balances.json
 wrapper.output
 bondage_usage.json
+handoffs/
 winnersdice.err
 winnersdice.out
