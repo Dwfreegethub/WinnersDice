@@ -137,21 +137,40 @@ export class BCConnection {
     }
 
     public joinRoom(): void {
-        log(`Creating room: ${secrets.roomName}`);
+        this.createRoom(secrets.roomName);
+    }
+
+    // Room-bot use (multi-room mode): creates a room under an arbitrary
+    // name, e.g. a randomized Private room name (see design_multi_room.md).
+    // Found live 2026-07-16: ChatRoomAdmin/Update does NOT rename an
+    // existing room (Visibility/Locked updates via configureRoomForMatch
+    // do take effect, just not Name) — so a name change has to go through
+    // leaveRoom() + createRoom() instead, same as the bot's own startup.
+    public createRoom(name: string): void {
+        log(`Creating room: ${name}`);
         this.socket.emit("ChatRoomCreate", {
-            Name: secrets.roomName,
+            Name: name,
             Description: "WinnersDice is a high-stakes, two-player dice duel with adult consequences. Challenge someone, negotiate what's on the line -rounds, stripping, bondage, toys, maybe more- then roll.",
             Background: "NightClub",
             Space: "X",
             Game: "",
             Admin: [this.playerNumber, ...secrets.adminMemberNumbers],
             Ban: [],
-            Limit: 10,
+            Limit: secrets.roomLimit,
             BlockCategory: [],
             Language: "EN",
             Visibility: ["Admin"],
             Access: ["All"],
         });
+    }
+
+    // Room-bot use: leaves the current room, e.g. right before createRoom()
+    // with a different name. Payload/response handling is unverified —
+    // ChatRoomLeave is confirmed to exist as a real BC event (seen used by
+    // a separate community bot framework, bondage-club-bot-hub-master) but
+    // this bot has never called it before. Needs a live test.
+    public leaveRoom(): void {
+        this.socket.emit("ChatRoomLeave");
     }
 
     public makeRoomPrivate(): void {
@@ -166,11 +185,42 @@ export class BCConnection {
                 Game: "",
                 Admin: [this.playerNumber, ...secrets.adminMemberNumbers],
                 Ban: [],
-                Limit: 10,
+                Limit: secrets.roomLimit,
                 BlockCategory: [],
                 Language: "EN",
                 Visibility: ["Admin"],
                 Access: ["All"],
+            },
+        });
+    }
+
+    // Room-bot use (multi-room mode — see design_multi_room.md): reconfigures
+    // the room's name/visibility/lock for a claimed match, or back to its
+    // default idle state between matches. Visibility ["All"] = listed/public
+    // (Spectator); ["Admin"] = hidden from browse/search (Private, Locked) —
+    // confirmed by this bot's own existing joinRoom()/makeRoomPrivate() usage.
+    // The `Locked` field itself is NOT verified against WinnersDice/StripDiceBot's
+    // own history — it's inferred from a separate community bot framework
+    // (bondage-club-bot-hub-master) that sends the same Room shape with a
+    // Locked boolean alongside Name/Admin/Limit/etc. Needs a live test.
+    public configureRoomForMatch(opts: { name: string; visibility: "public" | "hidden"; locked: boolean }): void {
+        this.socket.emit("ChatRoomAdmin", {
+            MemberNumber: this.playerNumber,
+            Action: "Update",
+            Room: {
+                Name: opts.name,
+                Description: "WinnersDice is a high-stakes, two-player dice duel with adult consequences. Challenge someone, negotiate what's on the line -rounds, stripping, bondage, toys, maybe more- then roll.",
+                Background: "NightClub",
+                Space: "X",
+                Game: "",
+                Admin: [this.playerNumber, ...secrets.adminMemberNumbers],
+                Ban: [],
+                Limit: secrets.roomLimit,
+                BlockCategory: [],
+                Language: "EN",
+                Visibility: opts.visibility === "public" ? ["All"] : ["Admin"],
+                Access: ["All"],
+                Locked: opts.locked,
             },
         });
     }

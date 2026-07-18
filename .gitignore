@@ -7,6 +7,8 @@ feedback_status.json
 lock_release_log.txt
 players.json
 pair_balances.json
+player_settings.json
+pair_settings.json
 wrapper.output
 bondage_usage.json
 handoffs/

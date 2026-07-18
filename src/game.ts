@@ -25,7 +25,10 @@ import {
     NegotiationKey,
     NegotiationState,
     PairBalanceEntry,
+    PairSettingsEntry,
     PlayerRecord,
+    PlayerSettingsEntry,
+    SavedGameConfig,
     PlayerState,
     RoomType,
     RoundResult,
@@ -35,7 +38,7 @@ import {
     ToyDeal,
 } from "./types";
 import { PICK_SLOTS, PickSlot, PICK_LIST_TOP_N, loadBcItemCatalog } from "./bondagePicker";
-import { writeHandoff, listPendingResults, markResultProcessed } from "./handoff";
+import { writeHandoff, listPendingHandoffs, claimHandoff, writeResult, listPendingResults, markResultProcessed, listClaimedHandoffs } from "./handoff";
 
 const FEEDBACK_STATUS_LABELS: Record<FeedbackItemStatus, string> = {
     pending: "⏳ Pending review",
@@ -151,10 +154,10 @@ const CONSENT_ALL_QUESTION =
 // Final negotiation question — see design_multi_room.md. Both players answer
 // independently; a mismatch falls back to "private" (handleRoomTypeAnswer).
 const ROOM_TYPE_QUESTION =
-    "Last question — what kind of room would you like? " +
-    "1) Spectator — public, anyone can watch  " +
-    "2) Private — hidden, just you two  " +
-    "3) Locked — hidden and locked, admin-only access. " +
+    "Last question — what kind of room would you like?\n" +
+    "1) Spectator — public, anyone can watch\n" +
+    "2) Private — hidden, just you two\n" +
+    "3) Locked — hidden and locked, admin-only access\n" +
     "(reply with 1, 2, or 3)";
 
 function parseRoomTypeAnswer(text: string): RoomType | null {
@@ -570,6 +573,13 @@ export class WinnersDiceGame {
     private pairBalances: Record<string, PairBalanceEntry> = {};
     private readonly pairBalancesPath = path.join(__dirname, "..", "pair_balances.json");
 
+    // Per-player and per-pair saved negotiation settings — see SavedGameConfig,
+    // PlayerSettingsEntry, PairSettingsEntry (types.ts). Written at finishNegotiation().
+    private playerSettings: Record<number, PlayerSettingsEntry> = {};
+    private readonly playerSettingsPath = path.join(__dirname, "..", "player_settings.json");
+    private pairSettings: Record<string, PairSettingsEntry> = {};
+    private readonly pairSettingsPath = path.join(__dirname, "..", "pair_settings.json");
+
     private readonly pendingUpdatePath = path.join(__dirname, "..", "pending_update.txt");
 
     // Cap on streak for the *next* match, admin-settable via !setstreak.
@@ -616,6 +626,22 @@ export class WinnersDiceGame {
     // Only meaningful while state.endGameProposal.proposalStage === "q4_locks".
     private endGameAwaitingLockSlotsInput: boolean = false;
 
+    // Multi-room mode (BOT_ROLE !== "main" — see design_multi_room.md): the
+    // handoff this room bot has claimed and is either waiting on player
+    // arrival for, or actively running the match for. Null while idle/polling.
+    private activeHandoff: HandoffEntry | null = null;
+    private handoffEntryTimer: NodeJS.Timeout | null = null;
+    // True once this room bot has checked handoffs/claimed/ for orphaned
+    // claims left over from a previous run that was killed/crashed mid-match
+    // without going through a normal end path — see reapOwnOrphanedClaims.
+    private hasReapedOrphanedClaims = false;
+
+    // Lobby bot (BOT_ROLE=main): handoff ids already relayed to their two
+    // players via relayClaimedRoomInvites, so a repeat poll doesn't re-whisper
+    // them. In-memory only — worst case on a lobby-bot restart is one
+    // harmless repeat whisper, not lost state.
+    private relayedRoomInvites: Set<string> = new Set();
+
     constructor(bot: BCConnection, roomMembers: Map<number, Player>) {
         this.bot = bot;
         this.roomMembers = roomMembers;
@@ -626,12 +652,23 @@ export class WinnersDiceGame {
         this.loadFeedbackStatus();
         this.loadPlayerRecords();
         this.loadPairBalances();
+        this.loadPlayerSettings();
+        this.loadPairSettings();
 
         // Multi-room mode (BOT_ROLE=main): poll for match results room bots
         // have written, on the same cadence as a room bot's own pending-handoff
-        // poll (see design_multi_room.md).
+        // poll (see design_multi_room.md). Also relay each claimed match's
+        // resolved room name to its two players as soon as it's known.
         if (botRole === "main") {
             setInterval(() => this.processHandoffResults(), 10_000);
+            setInterval(() => this.relayClaimedRoomInvites(), 5_000);
+        } else {
+            // Room bot: poll for handoffs to claim. joinRoom() (index.ts,
+            // via BCConnection.connect()/joinRoom()) already creates the
+            // room in the correct default state (Hidden, unlocked, static
+            // base name) — nothing to reset here at construction time,
+            // since the room doesn't exist yet until that connects.
+            setInterval(() => this.pollForHandoff(), 5_000);
         }
     }
 
@@ -755,6 +792,8 @@ export class WinnersDiceGame {
                     this.handleChallengeAcceptAnswer(sender, true);
                 } else if (this.isAwaitingCarryoverChoice()) {
                     this.handleCarryoverChoiceAnswer(sender, true);
+                } else if (this.isAwaitingPairSettingsShortcut()) {
+                    this.handlePairSettingsShortcutAnswer(sender, true);
                 } else if (this.isAwaitingConsentAll()) {
                     this.handleConsentAllAnswer(sender, true);
                 } else {
@@ -766,6 +805,8 @@ export class WinnersDiceGame {
                     this.handleChallengeAcceptAnswer(sender, false);
                 } else if (this.isAwaitingCarryoverChoice()) {
                     this.handleCarryoverChoiceAnswer(sender, false);
+                } else if (this.isAwaitingPairSettingsShortcut()) {
+                    this.handlePairSettingsShortcutAnswer(sender, false);
                 } else if (this.isAwaitingConsentAll()) {
                     this.handleConsentAllAnswer(sender, false);
                 } else {
@@ -937,8 +978,14 @@ export class WinnersDiceGame {
         }
 
         // Final negotiation question — both players answer independently
-        // (see handleRoomTypeAnswer).
-        if (negotiation && this.state.phase === "negotiating" && negotiation.roomTypeStage === "awaiting") {
+        // (see handleRoomTypeAnswer). Sender must be one of the two match
+        // participants — without this check, BC echoes the bot's own
+        // whispers back as incoming messages from the bot's own member
+        // number, which would fail to parse and re-trigger this same
+        // reprompt whisper, looping forever until BC's flood protection
+        // kicks the connection (found live 2026-07-16).
+        if (negotiation && this.state.phase === "negotiating" && negotiation.roomTypeStage === "awaiting"
+            && (sender === negotiation.challenger.memberNumber || sender === negotiation.opponent.memberNumber)) {
             const parsed = parseRoomTypeAnswer(lower);
             if (parsed === null) {
                 this.bot.whisper(sender, `I didn't catch that — reply 1 (Spectator), 2 (Private), or 3 (Locked).`);
@@ -982,6 +1029,18 @@ export class WinnersDiceGame {
             return;
         }
 
+        if (lower === "accept" && negotiation && this.state.phase === "negotiating" && negotiation.settingsCompareStage === "awaiting"
+            && (sender === negotiation.challenger.memberNumber || sender === negotiation.opponent.memberNumber)) {
+            this.handleSettingsCompareAnswer(sender, "accept");
+            return;
+        }
+
+        if (lower === "saved" && negotiation && this.state.phase === "negotiating" && negotiation.settingsCompareStage === "awaiting"
+            && (sender === negotiation.challenger.memberNumber || sender === negotiation.opponent.memberNumber)) {
+            this.handleSettingsCompareAnswer(sender, "saved");
+            return;
+        }
+
         if (lower === "yes" || lower === "y") {
             if (negotiation && this.state.phase === "negotiating") {
                 if (negotiation.pending) {
@@ -990,6 +1049,10 @@ export class WinnersDiceGame {
                 }
                 if (negotiation.carryoverStage === "awaiting") {
                     this.handleCarryoverChoiceAnswer(sender, true);
+                    return;
+                }
+                if (negotiation.pairSettingsStage === "awaiting") {
+                    this.handlePairSettingsShortcutAnswer(sender, true);
                     return;
                 }
                 if (negotiation.consentAllStage === "awaiting") {
@@ -1008,6 +1071,10 @@ export class WinnersDiceGame {
             if (negotiation && this.state.phase === "negotiating" && !negotiation.pending) {
                 if (negotiation.carryoverStage === "awaiting") {
                     this.handleCarryoverChoiceAnswer(sender, false);
+                    return;
+                }
+                if (negotiation.pairSettingsStage === "awaiting") {
+                    this.handlePairSettingsShortcutAnswer(sender, false);
                     return;
                 }
                 if (negotiation.consentAllStage === "awaiting") {
@@ -1303,6 +1370,13 @@ export class WinnersDiceGame {
             return;
         }
 
+        // Multi-room mode: room bots never negotiate (see design_multi_room.md)
+        // — they only run matches handed to them via the handoff queue.
+        if (botRole !== "main") {
+            this.bot.whisper(sender, "This room is reserved for a specific match — challenges aren't handled here.");
+            return;
+        }
+
         const targetName = args.replace(/^@/, "").trim();
         if (!targetName) {
             this.bot.sendChat("Usage: !challenge @PlayerName");
@@ -1383,6 +1457,16 @@ export class WinnersDiceGame {
             roomTypeStage: "not_asked",
             roomTypeAnswers: {},
             roomType: null,
+            pairSettingsStage: "not_asked",
+            pairSettingsAnswers: {},
+            pairSettingsTimer: null,
+            savedPairConfig: null,
+            usedPairSettingsShortcut: false,
+            challengerPlayerConfig: this.playerSettings[challenger.memberNumber]?.config ?? null,
+            opponentPlayerConfig: this.playerSettings[opponent.memberNumber]?.config ?? null,
+            settingsCompareStage: "not_asked",
+            settingsCompareAnswers: {},
+            settingsCompareTimer: null,
         };
 
         this.state = {
@@ -1499,7 +1583,7 @@ export class WinnersDiceGame {
         if (!entry || (challengerCarry <= 0 && opponentCarry <= 0)) {
             negotiation.carryoverStage = "done";
             negotiation.useCarryover = false;
-            this.beginSettingsNegotiation();
+            this.promptSettingsShortcutOrBeginNegotiation(negotiation);
             return;
         }
 
@@ -1555,7 +1639,7 @@ export class WinnersDiceGame {
             this.bot.sendChat("Starting fresh — the saved carryover for this pair has been cleared.");
         }
 
-        this.beginSettingsNegotiation();
+        this.promptSettingsShortcutOrBeginNegotiation(negotiation);
     }
 
     // Dispatches one player's independent answer to ROOM_TYPE_QUESTION. Once
@@ -1594,7 +1678,7 @@ export class WinnersDiceGame {
             this.bot.sendChat(`${negotiation.challenger.name} and ${negotiation.opponent.name} picked different room types — defaulting to private.`);
         }
 
-        this.finishNegotiation();
+        this.promptSettingsCompareOrFinish(negotiation);
     }
 
     private beginSettingsNegotiation(): void {
@@ -2064,6 +2148,15 @@ export class WinnersDiceGame {
         const challengerStart = carryoverEntry?.balances[String(negotiation.challenger.memberNumber)] ?? 0;
         const opponentStart = carryoverEntry?.balances[String(negotiation.opponent.memberNumber)] ?? 0;
 
+        // Save negotiation settings for future "use same settings?" shortcut.
+        this.saveNegotiationSettings(negotiation, {
+            minRounds: config.minRounds,
+            stripping: config.stripping,
+            bondage: config.bondage,
+            toys: config.toys,
+            services: config.services,
+        });
+
         // Multi-room mode: the lobby bot never runs matches itself. Hand off
         // to a room bot instead of building match state — see design_multi_room.md.
         if (botRole === "main") {
@@ -2071,9 +2164,29 @@ export class WinnersDiceGame {
             return;
         }
 
+        this.launchMatch(
+            config,
+            negotiation.challenger,
+            negotiation.opponent,
+            challengerStart,
+            opponentStart
+        );
+    }
+
+    // Builds match state and starts play. Shared by the legacy direct-play
+    // fallback above (botRole !== "main" during negotiation) and the room
+    // bot's claimed-match start (see startClaimedMatch) — those two are the
+    // only paths that ever reach "playing" phase.
+    private launchMatch(
+        config: GameConfig,
+        challenger: { memberNumber: number; name: string },
+        opponent: { memberNumber: number; name: string },
+        challengerStart: number,
+        opponentStart: number
+    ): void {
         const players: [PlayerState, PlayerState] = [
-            { memberNumber: negotiation.challenger.memberNumber, name: negotiation.challenger.name, balance: challengerStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
-            { memberNumber: negotiation.opponent.memberNumber, name: negotiation.opponent.name, balance: opponentStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
+            { memberNumber: challenger.memberNumber, name: challenger.name, balance: challengerStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
+            { memberNumber: opponent.memberNumber, name: opponent.name, balance: opponentStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
         ];
 
         this.state = {
@@ -2148,6 +2261,195 @@ export class WinnersDiceGame {
         this.bot.whisper(negotiation.opponent.memberNumber, "Your game room is being prepared — hang tight, you'll get an invite shortly.");
 
         this.state = this.createIdleState();
+    }
+
+    // ============================================================
+    // MULTI-ROOM MODE — ROOM BOT (BOT_ROLE !== "main")
+    // ============================================================
+    // See design_multi_room.md. A room bot never negotiates — it polls
+    // handoffs/pending/ for work, configures its one static room per the
+    // claimed match's roomType, waits for both named players to arrive,
+    // then runs the match via launchMatch() same as any direct-play game.
+
+    // Static base name for Spectator/Locked, or base + a fresh random
+    // 3-digit suffix for Private (so a Private room's name can't be
+    // reused/guessed from a previous match — see design_multi_room.md's
+    // Room Types section).
+    private resolveRoomName(roomType: RoomType): string {
+        if (roomType !== "private") return secrets.roomName;
+        // No separator — "WD Room 1" + "42" = "WD Room 142". 2 digits
+        // (00-99) is plenty of randomness at this scale and keeps the name
+        // short.
+        const suffix = String(Math.floor(Math.random() * 100)).padStart(2, "0");
+        const name = `${secrets.roomName}${suffix}`;
+        // BC's room name cap is confirmed live 2026-07-16: 20 chars works
+        // ("WinnersDice Room 1 3"), 22 chars fails with "InvalidRoomData"
+        // ("WinnersDice Room 1 265"). secrets.ts's gamebot1 roomName was
+        // shortened to leave margin, but warn loudly if it (or the format
+        // here) ever creeps back over the limit rather than failing
+        // silently at claim time.
+        if (name.length > 20) {
+            logError(`[Handoff] Private room name "${name}" (${name.length} chars) may exceed BC's room name limit — shorten secrets.roomName.`);
+        }
+        return name;
+    }
+
+    private pollForHandoff(): void {
+        if (!this.bot.isConnected() || this.state.phase !== "idle" || this.activeHandoff) return;
+
+        if (!this.hasReapedOrphanedClaims) {
+            this.hasReapedOrphanedClaims = true;
+            this.reapOwnOrphanedClaims();
+        }
+
+        for (const entry of listPendingHandoffs()) {
+            const roomName = this.resolveRoomName(entry.roomType);
+            const claimed = claimHandoff(entry, botRole, roomName);
+            if (claimed) {
+                this.setupClaimedRoom(claimed);
+                return;
+            }
+            // Rename lost the race to another room bot — try the next pending entry.
+        }
+    }
+
+    // Runs once, the first time this room bot is idle and connected. If a
+    // previous run of this same botRole crashed or was killed mid-match, its
+    // claim never got a result written and just sits in handoffs/claimed/
+    // forever — found live 2026-07-17 (a stale claim caused the lobby bot to
+    // whisper a leftover room invite from an old test on its next restart).
+    // Closes each one out as an aborted match and puts the room back to its
+    // default state, since a fresh process has no memory of what state a
+    // stale claim's room might have been left in.
+    private reapOwnOrphanedClaims(): void {
+        let reaped = false;
+        for (const claimed of listClaimedHandoffs()) {
+            if (claimed.claimedBy !== botRole) continue;
+            log(`[Handoff] Reaping orphaned claim ${claimed.id} left over from a previous run.`);
+            this.writeRoomBotResult(claimed, "reset", null, null, 0, 0);
+            reaped = true;
+        }
+        if (reaped) {
+            this.bot.configureRoomForMatch({ name: secrets.roomName, visibility: "hidden", locked: false });
+        }
+    }
+
+    private setupClaimedRoom(handoff: HandoffEntry): void {
+        this.activeHandoff = handoff;
+        const roomName = handoff.roomName!;
+
+        log(`[Handoff] Claimed ${handoff.id} — configuring room "${roomName}" as ${handoff.roomType}.`);
+        if (handoff.roomType === "private") {
+            // Private's randomized name requires an actual rename — found
+            // live 2026-07-16 that ChatRoomAdmin/Update does NOT change an
+            // existing room's Name, so this leaves and recreates fresh
+            // instead. createRoom()'s defaults (Visibility: Admin = Hidden,
+            // unlocked) already match what Private needs, so no follow-up
+            // configureRoomForMatch call is needed.
+            this.bot.leaveRoom();
+            this.bot.createRoom(roomName);
+        } else {
+            // Spectator/Locked keep the static base name — Visibility/Locked
+            // toggle via Update in place (confirmed working live 2026-07-16).
+            this.bot.configureRoomForMatch({
+                name: roomName,
+                visibility: handoff.roomType === "spectator" ? "public" : "hidden",
+                // Unlocked during the entry window even for Locked matches —
+                // re-locked once both players are confirmed present (checkHandoffArrival).
+                locked: false,
+            });
+        }
+
+        this.handoffEntryTimer = setTimeout(() => this.expireHandoffEntry(handoff.id), 5 * 60 * 1000);
+        this.checkHandoffArrival();
+    }
+
+    // Called from onMemberJoin/onRoomSync — checks whether both of the
+    // active handoff's named players are now in this bot's room, and starts
+    // the match the moment they both are.
+    private checkHandoffArrival(): void {
+        const handoff = this.activeHandoff;
+        if (!handoff || this.state.phase !== "idle") return;
+
+        const { challenger, opponent } = handoff.players;
+        if (!this.roomMembers.has(challenger.memberNumber) || !this.roomMembers.has(opponent.memberNumber)) {
+            return;
+        }
+
+        if (this.handoffEntryTimer) {
+            clearTimeout(this.handoffEntryTimer);
+            this.handoffEntryTimer = null;
+        }
+
+        if (handoff.roomType === "locked") {
+            this.bot.configureRoomForMatch({ name: handoff.roomName!, visibility: "hidden", locked: true });
+        }
+
+        this.bot.sendChat(`Both players are here — let's begin!`);
+        this.launchMatch(handoff.config, challenger, opponent, handoff.startingBalances.challenger, handoff.startingBalances.opponent);
+    }
+
+    // One or both named players never showed up within the entry window.
+    private expireHandoffEntry(handoffId: string): void {
+        const handoff = this.activeHandoff;
+        if (!handoff || handoff.id !== handoffId) return;
+
+        log(`[Handoff] ${handoffId} expired waiting for players to arrive.`);
+        this.bot.sendChat(`This game room's invite expired — nobody arrived in time. Resetting for the next match.`);
+        this.writeRoomBotResult(handoff, "disconnect", null, null, 0, 0);
+        this.resetRoomBotForNextMatch();
+    }
+
+    // Shared teardown for every way a room-bot-run match can end (see
+    // writeRoomBotResult's call sites). Unlocks/renames the room back to
+    // its static default and clears activeHandoff so pollForHandoff can
+    // pick up the next pending entry.
+    private resetRoomBotForNextMatch(): void {
+        if (this.handoffEntryTimer) {
+            clearTimeout(this.handoffEntryTimer);
+            this.handoffEntryTimer = null;
+        }
+        const wasPrivate = this.activeHandoff?.roomType === "private";
+        this.activeHandoff = null;
+
+        if (wasPrivate) {
+            // Leave the randomly-named room and recreate the static base
+            // one — same reasoning as setupClaimedRoom (Update can't rename).
+            this.bot.leaveRoom();
+            this.bot.createRoom(secrets.roomName);
+        } else {
+            this.bot.configureRoomForMatch({ name: secrets.roomName, visibility: "hidden", locked: false });
+        }
+    }
+
+    // Writes the match's outcome to handoffs/results/ for the lobby bot to
+    // apply to players.json/pair_balances.json. pairBalances only carries
+    // real leftover balances for a "normal"/"mercy" ending — safeword/reset/
+    // disconnect endings never save carryover (mirrors the existing
+    // single-bot convention documented on PairBalanceEntry in types.ts).
+    private writeRoomBotResult(
+        handoff: HandoffEntry,
+        endReason: MatchResultEntry["endReason"],
+        winner: number | null,
+        loser: number | null,
+        winnerPointsEarned: number,
+        loserPointsLost: number
+    ): void {
+        const pairBalances: Record<string, number> = {};
+        if ((endReason === "normal" || endReason === "mercy") && this.state.players) {
+            for (const p of this.state.players) pairBalances[String(p.memberNumber)] = p.balance;
+        }
+
+        writeResult({
+            handoffId: handoff.id,
+            completedAt: centralTimestamp(),
+            winner,
+            loser,
+            winnerPointsEarned,
+            loserPointsLost,
+            endReason,
+            pairBalances,
+        });
     }
 
     private startMatch(): void {
@@ -2521,8 +2823,16 @@ export class WinnersDiceGame {
             `${winner.name} ends the match! Final scores — ${p1.name}: ${p1.balance}, ${p2.name}: ${p2.balance}. ${resultMsg}`
         );
 
-        this.recordGameCompletion(finalWinnerMemberNumber, [p1, p2]);
-        this.savePairCarryover(p1, p2);
+        if (this.activeHandoff) {
+            // Room bot: report via the handoff queue instead of touching
+            // players.json/pair_balances.json directly (lobby-bot-owned).
+            const loser = finalWinnerMemberNumber === null ? null : (finalWinnerMemberNumber === p1.memberNumber ? p2.memberNumber : p1.memberNumber);
+            this.writeRoomBotResult(this.activeHandoff, "normal", finalWinnerMemberNumber, loser, 0, 0);
+            this.resetRoomBotForNextMatch();
+        } else {
+            this.recordGameCompletion(finalWinnerMemberNumber, [p1, p2]);
+            this.savePairCarryover(p1, p2);
+        }
 
         this.clearPendingWardrobeChecks();
         this.releaseAllActiveLocks();
@@ -2744,8 +3054,14 @@ export class WinnersDiceGame {
         );
 
         this.state.mercyRequest = null;
-        this.recordGameCompletion(winner.memberNumber, state.players);
-        this.savePairCarryover(conceder, winner);
+
+        if (this.activeHandoff) {
+            this.writeRoomBotResult(this.activeHandoff, "mercy", winner.memberNumber, conceder.memberNumber, 0, 0);
+            this.resetRoomBotForNextMatch();
+        } else {
+            this.recordGameCompletion(winner.memberNumber, state.players);
+            this.savePairCarryover(conceder, winner);
+        }
 
         this.clearPendingWardrobeChecks();
         this.clearEndGameState();
@@ -6346,6 +6662,11 @@ export class WinnersDiceGame {
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
         this.clearServiceDeal();
+
+        if (state.phase === "playing" && this.activeHandoff) {
+            this.writeRoomBotResult(this.activeHandoff, "safeword", null, null, 0, 0);
+            this.resetRoomBotForNextMatch();
+        }
         this.state = this.createIdleState();
 
         this.bot.sendChat(`⛔ ${playerName} has used their safeword. The game has been stopped.`);
@@ -6447,6 +6768,7 @@ export class WinnersDiceGame {
     private endGameDueToDisconnect(disconnectedMemberNumber: number): void {
         const playerName = this.roomMembers.get(disconnectedMemberNumber)?.name ?? `Player #${disconnectedMemberNumber}`;
         const otherMemberNumber = this.getOtherPlayerMemberNumber(disconnectedMemberNumber);
+        const wasPlaying = this.state.phase === "playing";
 
         log(`DISCONNECT: Ending match — ${playerName} (#${disconnectedMemberNumber}) did not return in time.`);
 
@@ -6457,6 +6779,11 @@ export class WinnersDiceGame {
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
         this.clearServiceDeal();
+
+        if (wasPlaying && this.activeHandoff) {
+            this.writeRoomBotResult(this.activeHandoff, "disconnect", null, null, 0, 0);
+            this.resetRoomBotForNextMatch();
+        }
         this.state = this.createIdleState();
 
         this.bot.sendChat(`⛔ Game ended due to ${playerName} losing connection.`);
@@ -6538,6 +6865,14 @@ export class WinnersDiceGame {
         this.releaseAllActiveBondage();
         this.releaseActiveToy();
         this.clearServiceDeal();
+
+        // Room bot: whether the match had actually started ("playing") or
+        // it was still waiting for both players to arrive, an admin reset
+        // ends this handoff — report it and free the room bot to poll again.
+        if (this.activeHandoff) {
+            this.writeRoomBotResult(this.activeHandoff, "reset", null, null, 0, 0);
+            this.resetRoomBotForNextMatch();
+        }
         this.state = this.createIdleState();
         this.bot.sendChat("Game has been reset by admin.");
     }
@@ -6792,7 +7127,20 @@ export class WinnersDiceGame {
         }
 
         this.recordPlayerSeen(memberNumber, name);
-        this.sendWelcomeWhisper(memberNumber, name);
+
+        // Multi-room mode (room bot): a join by one of the two players
+        // named on the currently-claimed handoff gets a distinct greeting
+        // and triggers the arrival check, instead of the generic welcome.
+        const handoff = this.activeHandoff;
+        const isHandoffPlayer = handoff !== null
+            && (memberNumber === handoff.players.challenger.memberNumber || memberNumber === handoff.players.opponent.memberNumber);
+        if (isHandoffPlayer) {
+            this.bot.whisper(memberNumber, `Welcome — waiting on your opponent to join, then we'll begin.`);
+            this.checkHandoffArrival();
+        } else {
+            this.sendWelcomeWhisper(memberNumber, name);
+        }
+
         this.notifyFeedbackStatus(memberNumber, name);
     }
 
@@ -6803,6 +7151,10 @@ export class WinnersDiceGame {
             this.roomCharacters.set(char.MemberNumber, char);
             this.recordPlayerSeen(char.MemberNumber, name);
         }
+        // Multi-room mode (room bot): catches the case where both handoff
+        // players were already present at the time of a full resync (e.g.
+        // after a reconnect), which wouldn't otherwise fire onMemberJoin.
+        if (this.activeHandoff) this.checkHandoffArrival();
     }
 
     // Room greeting whispered to a joining player (never to the room, and
@@ -6869,6 +7221,271 @@ export class WinnersDiceGame {
         }
     }
 
+    // ============================================================
+    // NEGOTIATION SETTINGS PERSISTENCE
+    // ============================================================
+
+    private loadPlayerSettings(): void {
+        try {
+            const raw = fs.readFileSync(this.playerSettingsPath, "utf8");
+            this.playerSettings = JSON.parse(raw);
+        } catch {
+            this.playerSettings = {};
+        }
+    }
+
+    private savePlayerSettings(): void {
+        try {
+            fs.writeFileSync(this.playerSettingsPath, JSON.stringify(this.playerSettings, null, 2), "utf8");
+        } catch (err) {
+            logError(`[WD] Failed to write player_settings.json: ${err}`);
+        }
+    }
+
+    private loadPairSettings(): void {
+        try {
+            const raw = fs.readFileSync(this.pairSettingsPath, "utf8");
+            this.pairSettings = JSON.parse(raw);
+        } catch {
+            this.pairSettings = {};
+        }
+    }
+
+    private savePairSettings(): void {
+        try {
+            fs.writeFileSync(this.pairSettingsPath, JSON.stringify(this.pairSettings, null, 2), "utf8");
+        } catch (err) {
+            logError(`[WD] Failed to write pair_settings.json: ${err}`);
+        }
+    }
+
+    // Called at finishNegotiation() before launching the match. Writes both
+    // per-player and per-pair entries so returning players can skip re-negotiation.
+    private saveNegotiationSettings(negotiation: NegotiationState, config: SavedGameConfig): void {
+        const { challenger, opponent } = negotiation;
+        const now = centralTimestamp();
+
+        this.playerSettings[challenger.memberNumber] = { memberNumber: challenger.memberNumber, config, lastUpdated: now };
+        this.playerSettings[opponent.memberNumber] = { memberNumber: opponent.memberNumber, config, lastUpdated: now };
+        this.savePlayerSettings();
+
+        const key = this.pairKey(challenger.memberNumber, opponent.memberNumber);
+        this.pairSettings[key] = {
+            memberNumbers: [challenger.memberNumber, opponent.memberNumber],
+            config,
+            lastUpdated: now,
+        };
+        this.savePairSettings();
+    }
+
+    // Returns a compact human-readable summary of saved settings for whispers.
+    private formatSavedConfig(config: SavedGameConfig): string {
+        return [
+            `Rounds: ${config.minRounds} min`,
+            `Stripping: ${config.stripping ? "yes" : "no"}`,
+            `Bondage: ${config.bondage ? "yes" : "no"}`,
+            `Toys: ${config.toys ? "yes" : "no"}`,
+            `Services: ${config.services ? "yes" : "no"}`,
+        ].join(" · ");
+    }
+
+    // After carryover resolves: if this pair has saved settings, whisper both
+    // players and ask whether to skip negotiation. Otherwise begin normally.
+    private promptSettingsShortcutOrBeginNegotiation(negotiation: NegotiationState): void {
+        const key = this.pairKey(negotiation.challenger.memberNumber, negotiation.opponent.memberNumber);
+        const entry = this.pairSettings[key];
+
+        if (!entry) {
+            this.beginSettingsNegotiation();
+            return;
+        }
+
+        negotiation.pairSettingsStage = "awaiting";
+        negotiation.pairSettingsAnswers = {};
+        negotiation.savedPairConfig = entry.config;
+
+        const summary = this.formatSavedConfig(entry.config);
+        const msg = `You've played together before! Last time you agreed on: ${summary}. Use the same settings? (yes/no — 30 seconds or we'll negotiate fresh)`;
+        this.bot.whisper(negotiation.challenger.memberNumber, msg);
+        this.bot.whisper(negotiation.opponent.memberNumber, msg);
+
+        negotiation.pairSettingsTimer = setTimeout(() => {
+            if (this.state.negotiation?.pairSettingsStage !== "awaiting") return;
+            log("[WD] Pair settings shortcut timed out — proceeding to normal negotiation.");
+            negotiation.pairSettingsStage = "done";
+            this.bot.whisper(negotiation.challenger.memberNumber, "No answer in time — negotiating fresh.");
+            this.bot.whisper(negotiation.opponent.memberNumber, "No answer in time — negotiating fresh.");
+            this.beginSettingsNegotiation();
+        }, 30_000);
+    }
+
+    private isAwaitingPairSettingsShortcut(): boolean {
+        return this.state.phase === "negotiating" && this.state.negotiation?.pairSettingsStage === "awaiting";
+    }
+
+    private handlePairSettingsShortcutAnswer(sender: number, value: boolean): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.pairSettingsStage !== "awaiting") return;
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) return;
+
+        negotiation.pairSettingsAnswers[sender] = value;
+
+        const challengerAnswer = negotiation.pairSettingsAnswers[negotiation.challenger.memberNumber];
+        const opponentAnswer = negotiation.pairSettingsAnswers[negotiation.opponent.memberNumber];
+
+        // One player answered — let the other know and wait.
+        if (challengerAnswer === undefined || opponentAnswer === undefined) {
+            const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+            const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+            this.bot.whisper(responder.memberNumber, `Got it — waiting on ${other.name}...`);
+            return;
+        }
+
+        // Both answered — resolve.
+        if (negotiation.pairSettingsTimer) {
+            clearTimeout(negotiation.pairSettingsTimer);
+            negotiation.pairSettingsTimer = null;
+        }
+        negotiation.pairSettingsStage = "done";
+
+        if (challengerAnswer && opponentAnswer && negotiation.savedPairConfig) {
+            // Both said yes — apply saved config and skip to room type.
+            negotiation.usedPairSettingsShortcut = true;
+            const cfg = negotiation.savedPairConfig;
+            negotiation.config.minRounds = cfg.minRounds;
+            negotiation.config.stripping = cfg.stripping;
+            negotiation.config.bondage = cfg.bondage;
+            negotiation.config.toys = cfg.toys;
+            negotiation.config.services = cfg.services;
+            negotiation.consentAllStage = "done"; // mark skipped so promptNextSetting doesn't re-ask
+            this.bot.sendChat(`Both players agreed to reuse previous settings: ${this.formatSavedConfig(cfg)}. Skipping to room type.`);
+            this.promptNextSetting();
+        } else {
+            // At least one said no — negotiate fresh.
+            this.bot.whisper(negotiation.challenger.memberNumber, "Negotiating fresh.");
+            this.bot.whisper(negotiation.opponent.memberNumber, "Negotiating fresh.");
+            this.beginSettingsNegotiation();
+        }
+    }
+
+    // After room type resolves: if at least one player has player-level settings
+    // and the pair shortcut wasn't used, whisper them a comparison and let them
+    // switch to their saved settings before the match starts.
+    private promptSettingsCompareOrFinish(negotiation: NegotiationState): void {
+        // Skip if we already used the pair shortcut — settings are already known.
+        if (negotiation.usedPairSettingsShortcut) {
+            this.finishNegotiation();
+            return;
+        }
+
+        const { challenger, opponent } = negotiation;
+        const experienced: { player: { memberNumber: number; name: string }; config: SavedGameConfig }[] = [];
+        if (negotiation.challengerPlayerConfig) experienced.push({ player: challenger, config: negotiation.challengerPlayerConfig });
+        if (negotiation.opponentPlayerConfig) experienced.push({ player: opponent, config: negotiation.opponentPlayerConfig });
+
+        if (experienced.length === 0) {
+            this.finishNegotiation();
+            return;
+        }
+
+        // Build a summary of what was just negotiated for comparison.
+        const negotiated: SavedGameConfig = {
+            minRounds: negotiation.config.minRounds ?? 3,
+            stripping: negotiation.config.stripping ?? false,
+            bondage: negotiation.config.bondage ?? false,
+            toys: negotiation.config.toys ?? false,
+            services: negotiation.config.services ?? false,
+        };
+
+        negotiation.settingsCompareStage = "awaiting";
+        negotiation.settingsCompareAnswers = {};
+
+        for (const { player, config } of experienced) {
+            const items: string[] = [];
+            const keys: (keyof SavedGameConfig)[] = ["minRounds", "stripping", "bondage", "toys", "services"];
+            for (const k of keys) {
+                const match = (negotiated as any)[k] === (config as any)[k];
+                const label = k === "minRounds" ? `Rounds: ${(negotiated as any)[k]} min` : `${k.charAt(0).toUpperCase() + k.slice(1)}: ${(negotiated as any)[k] ? "yes" : "no"}`;
+                items.push(`${match ? "✅" : "❌"} ${label}${match ? "" : ` (your last: ${k === "minRounds" ? (config as any)[k] + " min" : ((config as any)[k] ? "yes" : "no")})`}`);
+            }
+            const msg = `Here's how the agreed settings compare to your last game:\n${items.join(" · ")}\nAccept these settings or switch to your saved ones? (accept/saved — 30 seconds or we'll continue)`;
+            this.bot.whisper(player.memberNumber, msg);
+        }
+
+        // If only one player is experienced, the other isn't being asked — mark them as accepted.
+        if (experienced.length === 1) {
+            const otherNum = experienced[0].player.memberNumber === challenger.memberNumber
+                ? opponent.memberNumber
+                : challenger.memberNumber;
+            negotiation.settingsCompareAnswers[otherNum] = "accept";
+        }
+
+        negotiation.settingsCompareTimer = setTimeout(() => {
+            if (this.state.negotiation?.settingsCompareStage !== "awaiting") return;
+            log("[WD] Settings compare timed out — finishing with negotiated settings.");
+            negotiation.settingsCompareStage = "done";
+            this.finishNegotiation();
+        }, 30_000);
+    }
+
+    private isAwaitingSettingsCompare(): boolean {
+        return this.state.phase === "negotiating" && this.state.negotiation?.settingsCompareStage === "awaiting";
+    }
+
+    private handleSettingsCompareAnswer(sender: number, value: "accept" | "saved"): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.settingsCompareStage !== "awaiting") return;
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) return;
+
+        negotiation.settingsCompareAnswers[sender] = value;
+
+        const challengerAnswer = negotiation.settingsCompareAnswers[negotiation.challenger.memberNumber];
+        const opponentAnswer = negotiation.settingsCompareAnswers[negotiation.opponent.memberNumber];
+
+        // Process immediately if someone said "saved" — first saved wins (challenger takes priority).
+        const savedPlayer =
+            challengerAnswer === "saved" ? { player: negotiation.challenger, config: negotiation.challengerPlayerConfig } :
+            opponentAnswer === "saved"   ? { player: negotiation.opponent,   config: negotiation.opponentPlayerConfig } :
+            null;
+
+        if (savedPlayer && savedPlayer.config) {
+            if (negotiation.settingsCompareTimer) {
+                clearTimeout(negotiation.settingsCompareTimer);
+                negotiation.settingsCompareTimer = null;
+            }
+            negotiation.settingsCompareStage = "done";
+            const cfg = savedPlayer.config;
+            negotiation.config.minRounds = cfg.minRounds;
+            negotiation.config.stripping = cfg.stripping;
+            negotiation.config.bondage = cfg.bondage;
+            negotiation.config.toys = cfg.toys;
+            negotiation.config.services = cfg.services;
+            this.bot.whisper(negotiation.challenger.memberNumber, `Using ${savedPlayer.player.name}'s previous settings: ${this.formatSavedConfig(cfg)}.`);
+            this.bot.whisper(negotiation.opponent.memberNumber, `Using ${savedPlayer.player.name}'s previous settings: ${this.formatSavedConfig(cfg)}.`);
+            this.finishNegotiation();
+            return;
+        }
+
+        // Both said accept — proceed with negotiated settings.
+        if (challengerAnswer === "accept" && opponentAnswer === "accept") {
+            if (negotiation.settingsCompareTimer) {
+                clearTimeout(negotiation.settingsCompareTimer);
+                negotiation.settingsCompareTimer = null;
+            }
+            negotiation.settingsCompareStage = "done";
+            this.finishNegotiation();
+            return;
+        }
+
+        // One answered, still waiting on the other.
+        const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+        const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+        const otherAnswer = negotiation.settingsCompareAnswers[other.memberNumber];
+        if (otherAnswer === undefined) {
+            this.bot.whisper(responder.memberNumber, `Got it — waiting on ${other.name}...`);
+        }
+    }
+
     // Records each player's final balance as this pair's carryover for next
     // time they play each other. Called from finishMatch and resolveMercy
     // only — a safeword or admin !reset teardown intentionally does NOT
@@ -6893,8 +7510,10 @@ export class WinnersDiceGame {
     // calling them directly (those take live PlayerState, not a result file).
     private processHandoffResults(): void {
         for (const result of listPendingResults()) {
-            const winnerRecord = this.playerRecords[String(result.winner)];
-            const loserRecord = this.playerRecords[String(result.loser)];
+            // winner/loser are null for a tie or an aborted match (safeword/
+            // reset/disconnect) — nobody's gamesWon/gamesPlayed gets credited then.
+            const winnerRecord = result.winner !== null ? this.playerRecords[String(result.winner)] : undefined;
+            const loserRecord = result.loser !== null ? this.playerRecords[String(result.loser)] : undefined;
             if (winnerRecord) {
                 winnerRecord.gamesPlayed++;
                 winnerRecord.gamesWon++;
@@ -6917,6 +7536,22 @@ export class WinnersDiceGame {
 
             log(`[Handoff] Processed result ${result.handoffId} (winner #${result.winner}, ${result.endReason}).`);
             markResultProcessed(result.handoffId);
+        }
+    }
+
+    // Multi-room mode (BOT_ROLE=main): a claimed handoff's roomName isn't
+    // known up front (Private randomizes it fresh per match — see
+    // design_multi_room.md), so the lobby bot polls handoffs/claimed/ for it
+    // to appear and relays it to both players as soon as it does.
+    private relayClaimedRoomInvites(): void {
+        for (const handoff of listClaimedHandoffs()) {
+            if (!handoff.roomName || this.relayedRoomInvites.has(handoff.id)) continue;
+
+            this.relayedRoomInvites.add(handoff.id);
+            const { challenger, opponent } = handoff.players;
+            this.bot.whisper(challenger.memberNumber, `Your game room is ready — join "${handoff.roomName}" to begin!`);
+            this.bot.whisper(opponent.memberNumber, `Your game room is ready — join "${handoff.roomName}" to begin!`);
+            log(`[Handoff] Relayed room "${handoff.roomName}" to ${challenger.name} and ${opponent.name} for ${handoff.id}.`);
         }
     }
 

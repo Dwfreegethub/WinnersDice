@@ -43,16 +43,23 @@ export function writeHandoff(entry: Omit<HandoffEntry, "id" | "createdAt" | "exp
 }
 
 // Unexpired pending handoffs, oldest first. A room bot polls this and
-// attempts claimHandoff() on whichever it wants to take.
+// attempts claimHandoff() on whichever it wants to take. Expired entries are
+// deleted here rather than just skipped — found live 2026-07-17 that they
+// otherwise just accumulate forever with nothing ever cleaning them up.
 export function listPendingHandoffs(): HandoffEntry[] {
     ensureHandoffDirs();
     const now = Date.now();
     const entries: HandoffEntry[] = [];
     for (const file of fs.readdirSync(PENDING_DIR)) {
         if (!file.endsWith(".json")) continue;
+        const filePath = path.join(PENDING_DIR, file);
         try {
-            const entry: HandoffEntry = JSON.parse(fs.readFileSync(path.join(PENDING_DIR, file), "utf8"));
-            if (new Date(entry.expiresAt).getTime() < now) continue; // expired — left for the lobby bot to reap
+            const entry: HandoffEntry = JSON.parse(fs.readFileSync(filePath, "utf8"));
+            if (new Date(entry.expiresAt).getTime() < now) {
+                try { fs.unlinkSync(filePath); } catch { /* already gone — fine */ }
+                log(`[Handoff] Reaped expired pending handoff ${entry.id}.`);
+                continue;
+            }
             entries.push(entry);
         } catch (err) {
             logError(`[Handoff] Failed to read pending handoff ${file}: ${err}`);
@@ -65,7 +72,10 @@ export function listPendingHandoffs(): HandoffEntry[] {
 // Atomically claims a pending handoff via rename into claimed/. Returns the
 // claimed entry (with claimedBy set) on success, or null if another bot won
 // the race (the source file is already gone by the time rename runs).
-export function claimHandoff(entry: HandoffEntry, botRole: string): HandoffEntry | null {
+// roomName is the actual BC room to join, resolved by the caller (static
+// base name, or base + random suffix for Private) — written immediately so
+// the lobby bot can relay it to both players as soon as it's known.
+export function claimHandoff(entry: HandoffEntry, botRole: string, roomName: string): HandoffEntry | null {
     const fromPath = path.join(PENDING_DIR, `${entry.id}.json`);
     const toPath = path.join(CLAIMED_DIR, `${entry.id}.json`);
     try {
@@ -73,10 +83,27 @@ export function claimHandoff(entry: HandoffEntry, botRole: string): HandoffEntry
     } catch {
         return null;
     }
-    const claimed: HandoffEntry = { ...entry, claimedBy: botRole };
+    const claimed: HandoffEntry = { ...entry, claimedBy: botRole, roomName };
     fs.writeFileSync(toPath, JSON.stringify(claimed, null, 2), "utf8");
-    log(`[Handoff] ${botRole} claimed ${entry.id} (${entry.players.challenger.name} vs ${entry.players.opponent.name}).`);
+    log(`[Handoff] ${botRole} claimed ${entry.id} (${entry.players.challenger.name} vs ${entry.players.opponent.name}), room "${roomName}".`);
     return claimed;
+}
+
+// Lists claimed handoffs (a room bot's currently-active or recently-active
+// matches). The lobby bot polls this to learn each match's resolved
+// roomName as soon as it's set, so it can relay the invite to both players.
+export function listClaimedHandoffs(): HandoffEntry[] {
+    ensureHandoffDirs();
+    const entries: HandoffEntry[] = [];
+    for (const file of fs.readdirSync(CLAIMED_DIR)) {
+        if (!file.endsWith(".json")) continue;
+        try {
+            entries.push(JSON.parse(fs.readFileSync(path.join(CLAIMED_DIR, file), "utf8")));
+        } catch (err) {
+            logError(`[Handoff] Failed to read claimed handoff ${file}: ${err}`);
+        }
+    }
+    return entries;
 }
 
 // Called by a room bot at match end. Writes the outcome to handoffs/results/

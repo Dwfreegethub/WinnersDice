@@ -94,7 +94,7 @@ Room type is chosen during negotiation (new question, added last in `NEGOTIATION
 
 - BC room set to **Hidden** (not listed in the room browser, can't be found by search).
 - Players can come and go freely — no lock.
-- Keeps casual outsiders out, nothing more.
+- **Room name is randomized** (decided 2026-07-16): being Hidden only keeps the room out of search/browse — anyone who's ever seen the exact name can still join it directly. Since there's no lock on this tier, the name is the only thing doing the work, so a static name is not enough. At claim time the room bot renames its room from the static base name (e.g. `"WD Room 1"`) to `"<base name>##"` — a random 2-digit suffix (00-99) appended with no separator, e.g. `"WD Room 142"` (decided 2026-07-16, simplified from an earlier space + 3-digit design after hitting BC's room-name length cap) — then renames it back to the plain base name once the match ends and the room is ready for the next handoff. Spectator and Locked keep the static base name — Spectator has no privacy to protect, and Locked's actual barrier is the room lock, not the name.
 
 ### Locked
 
@@ -139,10 +139,10 @@ On finding a file:
 After claiming:
 1. Read handoff file
 2. Configure BC room based on `roomType`:
-   - Spectator → set room to Public
-   - Private → set room to Hidden
-   - Locked → set room to Hidden + Locked (unlock for entry window)
-3. Whisper both players: "Your game room is ready — join [room name] to begin."
+   - Spectator → set room to Public, name stays the static base name
+   - Private → set room to Hidden, **rename to `"<base name>##"` with a fresh random 2-digit suffix, no separator**
+   - Locked → set room to Hidden + Locked (unlock for entry window), name stays the static base name
+3. Whisper both players the room name to join (for Private, this is the freshly-generated randomized name — it isn't known ahead of time and isn't guessable from a previous match).
 
 ### 5. Player arrival (room bot)
 
@@ -165,7 +165,7 @@ Match runs normally using existing game logic. Room bot does **not** write to `p
 At match end (normal, mercy, safeword, disconnect, reset):
 1. Write `MatchResultEntry` to `handoffs/results/<id>.json`
 2. If locked room: unlock it
-3. Configure room back to default state (Hidden, unlocked, ready for next match)
+3. Configure room back to default state (Hidden, unlocked, static base name — undoes the Private random-suffix rename if one was applied)
 4. Resume polling `handoffs/pending/` for next handoff
 
 ### 8. Result processing (lobby bot)
@@ -240,13 +240,21 @@ Adding a room bot = add a new entry here + a new BC account in secrets.ts.
 6. ~~In `finishNegotiation()`: write handoff instead of calling `startMatch()`~~
 7. ~~Add results polling loop; update `players.json` and `pair_balances.json` from results~~
 
-### Phase 3 — Room bot
+### Phase 3 — Room bot — built and live-tested 2026-07-16. Spectator + Private confirmed working; Locked does NOT actually lock yet (known gap, left in place — see wd_todo.md)
 
-8. On startup: configure BC room to default state (Hidden, unlocked)
-9. Poll `handoffs/pending/`; claim with atomic rename
-10. On claim: configure room for `roomType`, whisper players to join
-11. Track player arrival; start match once both present; re-lock if locked type
-12. At match end: write result, unlock room, resume polling
+8. ~~On startup: configure BC room to default state (Hidden, unlocked)~~ — turned out to not need an explicit reset call; `joinRoom()`'s own `ChatRoomCreate` already establishes this baseline, and calling `configureRoomForMatch` any earlier (e.g. at construction) would fire before the room exists.
+9. ~~Poll `handoffs/pending/`; claim with atomic rename~~ — `pollForHandoff()`, every 5s, only while idle and not already holding a claim.
+10. ~~On claim: configure room for `roomType`, whisper players to join~~ — `setupClaimedRoom()`. The "whisper players to join" half turned out to need a round-trip: the room bot can't reliably whisper players who are still in the *lobby* room (BC whispers are room-scoped), so instead the room bot writes the resolved `roomName` back into the claimed handoff file, and a new lobby-bot-side poll (`relayClaimedRoomInvites()`, every 5s against `handoffs/claimed/`) picks it up and does the actual whispering once it's known.
+11. ~~Track player arrival; start match once both present; re-lock if locked type~~ — `checkHandoffArrival()`, hooked into both `onMemberJoin` and `onRoomSync` (the latter covers both players already being present at a reconnect-triggered resync). 5-minute entry timeout (`expireHandoffEntry`) matches the handoff's own expiry window.
+12. ~~At match end: write result, unlock room, resume polling~~ — `writeRoomBotResult()` + `resetRoomBotForNextMatch()`, called from every match-ending path (finishMatch, resolveMercy, safeword, disconnect-timeout, admin `!reset`) via a `this.activeHandoff` check, so `botRole === "main"`'s existing direct-play behavior is untouched.
+
+**Corrections/additions made while building this that the earlier design text didn't cover:**
+- `MatchResultEntry.winner`/`loser` are `number | null` (mirrors `finishMatch`'s existing tie handling) — a tie, or an aborted match (safeword/reset/disconnect), has no winner to credit. `pairBalances` is the authoritative score, not these two fields, and it's only populated for `"normal"`/`"mercy"` endings — safeword/reset/disconnect never save carryover, matching the single-bot convention already documented on `PairBalanceEntry`.
+- Room bots now explicitly refuse `!challenge` (`"This room is reserved for a specific match..."`) — without this, a bystander in the room bot's own room could start a real negotiation there that would play out directly (old single-bot behavior) instead of through the handoff queue, since `WinnersDiceGame` is the same class for both roles.
+- **Confirmed live 2026-07-16 — does NOT work:** `connection.ts`'s `configureRoomForMatch()` sends a `Locked: boolean` field in the `ChatRoomAdmin`/`Update` payload. The code ran correctly (claimed as `"locked"`, both players detected, the re-lock call fired), but BC silently ignored `Locked` the same way it ignored `Name` on a plain Update. Unlike the rename, leave+recreate isn't a viable fix here — both players are already in the room by the time it needs to lock, and leaving would very likely eject them. Left as a known gap (see wd_todo.md) rather than guessing again at another unverified field/mechanism; real fix needs the actual correct protocol call, which would need either real BC client/server source or inspecting live socket traffic from a manual lock via BC's own UI.
+- **Confirmed live 2026-07-16 (Spectator test):** `ChatRoomAdmin`/`Update`'s `Visibility` field does take effect — Room 1 correctly went Public, and an uninvited third party found and joined it.
+- **Confirmed live 2026-07-16 (Private test):** `ChatRoomAdmin`/`Update` does **NOT** rename an existing room — the `Name` field is silently ignored (the room stayed under its old name; players were told a room name that didn't exist). Fixed by giving Private its own path: `leaveRoom()` + `createRoom(newName)` instead of `configureRoomForMatch`, both when claiming a Private handoff and when resetting back to the static base name afterward. `leaveRoom()` (`ChatRoomLeave`) is itself unverified against this bot's own history — same caveat as `Locked`, needs a live test.
+- **Confirmed live 2026-07-16:** BC room names are capped at exactly **20 characters** — `"WinnersDice Room 1 3"` (20 chars) works, `"WinnersDice Room 1 265"` (22 chars) fails with `"InvalidRoomData"`. `secrets.ts`'s gamebot1 `roomName` was shortened to `"WD Room 1"`, and the Private suffix simplified to 2 digits with no separator (`"WD Room 142"`, 11 chars total) — plenty of margin, and 00-99 is enough randomness at this scale. Next room bot follows the same pattern: `"WD Room 2"`. `resolveRoomName()` warns (doesn't block) if a final name ever exceeds 20 chars.
 
 ### Phase 4 — Spectator behavior
 
@@ -263,6 +271,8 @@ Adding a room bot = add a new entry here + a new BC account in secrets.ts.
 - **Leash mechanic** — test whether BC leash-drag socket events interact with room transitions; could be used to "pull" a player into the game room instead of just whispering them. Not blocking anything.
 - **Spectator participation** — spectators invited into service deals or end-of-game scenarios. Design TBD.
 - **Multiple room bots** — add more entries to PM2 config + BC accounts. No code changes needed beyond secrets.ts.
-- **bondage_usage.json / feedback_status.json ownership** — decide main-bot-only vs per-bot before Phase 3.
-- **Entry timeout duration** — how long to wait for players to arrive before writing a disconnect result. TBD.
+- **bondage_usage.json / feedback_status.json ownership** — still shared (both roles read/write the same path, since both processes run from the same directory). Not fixed — worst case is last-writer-wins on usage stats or a feedback dedup flag, not a functional break, so this stayed deferred rather than blocking Phase 3.
+- ~~**Entry timeout duration**~~ — resolved 2026-07-16: 5 minutes, matching the handoff's own expiry window.
 - ~~**Room type default**~~ — resolved 2026-07-16: defaults to Private on mismatch.
+- **Live testing** — none of Phase 3 has been run against a real BC connection yet (claim race between multiple room bots, the room rename/lock calls, the arrival tracking, all of it). Needs a real test pass with `gamebot1` actually running before trusting this in front of players.
+- **Found + fixed live 2026-07-17:** a claim that never resolves (room bot process killed/crashed mid-match, no `!reset`) leaves its `handoffs/claimed/` file behind forever — and every lobby bot restart re-whispered its (possibly stale) room name to both players again, since the "already relayed" tracking is in-memory only. Fixed two ways: `listPendingHandoffs()` now deletes expired pending entries instead of leaving them to accumulate, and a room bot reaps its own orphaned claims (writes an aborted `"reset"` result, resets the room) the first time it's idle after connecting.

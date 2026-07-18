@@ -127,6 +127,27 @@ export interface NegotiationState {
     roomTypeStage: "not_asked" | "awaiting" | "done";
     roomTypeAnswers: Partial<Record<number, RoomType>>;
     roomType: RoomType | null;
+    // "Pair shortcut" — if pair_settings.json has an entry for this pair, both
+    // players are whispered before settings negotiation starts: "use same settings?"
+    // Both must say yes to skip negotiation. Either saying no proceeds normally.
+    pairSettingsStage: "not_asked" | "awaiting" | "done";
+    pairSettingsAnswers: Partial<Record<number, boolean>>;
+    pairSettingsTimer: NodeJS.Timeout | null;
+    savedPairConfig: SavedGameConfig | null;
+    // True if the pair shortcut was used (both said yes) — suppresses the
+    // end-of-negotiation compare that runs for the single-experienced-player case.
+    usedPairSettingsShortcut: boolean;
+    // Loaded from player_settings.json at negotiation start. Used for the
+    // end-of-negotiation compare when there's no pair entry (see settingsCompareStage).
+    challengerPlayerConfig: SavedGameConfig | null;
+    opponentPlayerConfig: SavedGameConfig | null;
+    // "Settings compare" — after all settings and room type are resolved, if at
+    // least one player has player-level settings and the pair shortcut wasn't used,
+    // the experienced player(s) are whispered a comparison and offered "accept/saved".
+    // 30-second timeout → accept.
+    settingsCompareStage: "not_asked" | "awaiting" | "done";
+    settingsCompareAnswers: Partial<Record<number, "accept" | "saved">>;
+    settingsCompareTimer: NodeJS.Timeout | null;
 }
 
 // An item this player has sold to their opponent, available to buy back
@@ -607,6 +628,33 @@ export interface PairBalanceEntry {
     lastUpdated: string;
 }
 
+// Subset of GameConfig saved per-player and per-pair so returning players can
+// reuse previous settings. Room type is always re-asked (context-dependent)
+// and runtime fields (bondageAppliedBy, lockDuration, maxStreak) are excluded.
+export interface SavedGameConfig {
+    minRounds: number;
+    stripping: boolean;
+    bondage: boolean;
+    toys: boolean;
+    services: boolean;
+}
+
+// Per-player most-recent negotiation settings, keyed by memberNumber in
+// player_settings.json. Written at finishNegotiation() for every player.
+export interface PlayerSettingsEntry {
+    memberNumber: number;
+    config: SavedGameConfig;
+    lastUpdated: string;
+}
+
+// Per-pair last-agreed negotiation settings, keyed by pairKey() in
+// pair_settings.json. Written at finishNegotiation() alongside PlayerSettingsEntry.
+export interface PairSettingsEntry {
+    memberNumbers: [number, number];
+    config: SavedGameConfig;
+    lastUpdated: string;
+}
+
 // ============================================================
 // MULTI-ROOM HANDOFF QUEUE
 // ============================================================
@@ -632,6 +680,13 @@ export interface HandoffEntry {
     startingBalances: { challenger: number; opponent: number };
     // Set to the claiming bot's BOT_ROLE once claimed.
     claimedBy?: string;
+    // The actual BC room name to join, resolved by the claiming room bot
+    // (static base name for Spectator/Locked, base + random 3-digit suffix
+    // for Private — see design_multi_room.md). Absent until claimed; the
+    // lobby bot polls handoffs/claimed/ for this to appear, then relays it
+    // to both players (it can't be known up front since Private's name is
+    // randomized fresh per match).
+    roomName?: string;
 }
 
 // Written by a room bot to handoffs/results/<id>.json at match end. The
@@ -640,8 +695,11 @@ export interface HandoffEntry {
 export interface MatchResultEntry {
     handoffId: string;
     completedAt: string;
-    winner: number;
-    loser: number;
+    // null for a tie or an aborted match (safeword/reset/disconnect) —
+    // mirrors finishMatch's existing finalWinnerMemberNumber:number|null.
+    // pairBalances (not these fields) is the authoritative final score.
+    winner: number | null;
+    loser: number | null;
     winnerPointsEarned: number;
     loserPointsLost: number;
     endReason: "normal" | "mercy" | "safeword" | "disconnect" | "reset";
