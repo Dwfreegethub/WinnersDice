@@ -121,9 +121,25 @@ export interface NegotiationState {
     // True only once carryoverStage is "done" AND both players agreed to use
     // the saved balance — read when building PlayerState at match start.
     useCarryover: boolean;
+    // Asked once every NEGOTIATION_ORDER key is settled, before roomTypeStage
+    // — only when BOT_ROLE=main and the (single) room bot is already mid-match
+    // (see handoff.ts's listClaimedHandoffs). Both players must independently
+    // agree to play right in the lobby room (public) instead of waiting for
+    // the breakout room to free up; either "no" cancels the match outright.
+    // "not_asked" also covers the case where the room bot isn't busy, in
+    // which case this stage is skipped straight to "done" and roomTypeStage
+    // proceeds as normal.
+    lobbyFallbackStage: "not_asked" | "awaiting" | "done";
+    lobbyFallbackAnswers: Partial<Record<number, boolean>>;
+    // True only once lobbyFallbackStage resolved "yes" from both players —
+    // read at finishNegotiation() to run the match via launchMatch() directly
+    // instead of handing off to a room bot.
+    playInLobby: boolean;
     // Final negotiation question, asked once every NEGOTIATION_ORDER key is
     // settled: which room type the match runs in. Both players answer
     // independently; a mismatch resolves to "private" (see handleRoomTypeAnswer).
+    // Skipped (left "done") when playInLobby is true — the room type question
+    // is moot once the match is already staying in the public lobby.
     roomTypeStage: "not_asked" | "awaiting" | "done";
     roomTypeAnswers: Partial<Record<number, RoomType>>;
     roomType: RoomType | null;
@@ -330,6 +346,10 @@ export type BondageDealKind = "apply" | "removal";
 export type BondageDealStage =
     // Waiting for the placer's slot choice (apply deals only).
     | "awaiting_slot"
+    // Waiting for the wearer's slot choice — which of their own worn items
+    // to buy back (removal deals only, shop-menu-initiated; the !buybondage
+    // command skips this by naming the slot directly as an argument).
+    | "awaiting_removal_slot"
     // Waiting for the placer's item choice (apply deals only).
     | "awaiting_item"
     // Placer typed a name that only fuzzy-matched (not exact) — waiting for
@@ -460,11 +480,18 @@ export interface EndGameProposal {
     requestedLockSlots: string[];
     description: string;
     // Negotiation state (5-step) — see game.ts's handleEndGameNegotiation.
+    // Fixed anchor for the whole negotiation, set once at Q1 and never
+    // changed: the winner's real target. Both caps (winner can never raise
+    // past 90% of this; loser's second move is capped at 10% of this) and
+    // the loser's final cost (originalMinutes - finalMinutes) are computed
+    // against it.
     negotiationStep: number;
-    winnerFloor: number;
-    loserCeiling: number | null;
-    winnerLastOffer: number;
-    loserLastCounter: number | null;
+    originalMinutes: number;
+    // The value currently on the table — starts equal to originalMinutes,
+    // moves down when the loser spends to lower it, moves up (capped) when
+    // the winner spends to raise it back. Whatever it is when either side
+    // accepts is what settles.
+    currentMinutes: number;
     // True when Q2 = stay in this room; false when Q2 = move. Determines
     // whether the standby whisper and !done command are available after execution.
     inRoom: boolean;
@@ -490,6 +517,10 @@ export interface ActiveEndGame {
     // Date.now() at the moment the end-game timer started — used by !time
     // to compute remaining seconds.
     activeStartTime: number;
+    // True only when the bot added a collar to the loser's ItemNeck slot so
+    // the leash had something to attach to (see ensureCollarForLeash). Teardown
+    // removes it along with the leash; an already-present collar is left alone.
+    collarAdded: boolean;
 }
 
 // The requester's !mercy concession request, walking through the winner's
@@ -609,6 +640,20 @@ export interface PlayerRecord {
     gamesPlayed: number;
     gamesWon: number;
     feedbackGiven: boolean;
+    /** Newest changelog version this player has read via !changelog. */
+    lastChangelogVersion?: string;
+}
+
+// One shipped update, appended to changelog.json when a bot restarts and
+// picks up a pending_update.txt version not already recorded there. Oldest
+// first. The lobby and room bots share this file, same as pending_update.txt —
+// appends are deduplicated by version so whichever restarts first wins and the
+// other is a no-op.
+export interface ChangelogEntry {
+    version: string;
+    headline: string;
+    detail: string;
+    major: boolean;
 }
 
 // Per-pair leftover point balance, carried over into the next match between

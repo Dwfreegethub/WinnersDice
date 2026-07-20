@@ -1,0 +1,26 @@
+[
+  {
+    "version": "2026-07-12T12:00:00-05:00",
+    "headline": "Carryover points between matches, a grace period for disconnects, and readable lock passwords.",
+    "detail": "Leftover points no longer vanish at the end of a match. If you play the same opponent again and you both opt in when the challenge is accepted, whatever you had left carries into the new match.\nIf someone drops out mid-match the game no longer ends instantly — there's a countdown giving them a chance to reconnect and pick up where you left off.\nLock passwords are now built from a word list instead of random characters, so they're far easier to read out and type back correctly.",
+    "major": true
+  },
+  {
+    "version": "2026-07-15T12:00:00-05:00",
+    "headline": "The bot now notices what you actually took off.",
+    "detail": "Clothing removal is detected from your wardrobe directly, the same way the Strip Dice bot has done it for a while, rather than relying entirely on you confirming each item by hand. Fewer mismatches between what the bot thinks you're wearing and what you actually are.",
+    "major": true
+  },
+  {
+    "version": "2026-07-19T20:01:44-05:00",
+    "headline": "R130's new restraints are in, and brand-new gear is flagged so it doesn't get buried.",
+    "detail": "Checked the R130 release against BC's actual asset file and added the genuinely-new restraints: the Cybertech gas mask (head/hood) and the Chastity Tunnel Piercings.\nBoth show up in the player-pick flow and in the shop's buy-bondage menu. New items get pinned to the top of their slot's list with a 🆕 marker, so fresh gear isn't buried underneath whatever everyone has been picking for months.",
+    "major": true
+  },
+  {
+    "version": "2026-07-20T12:00:00-05:00",
+    "headline": "You can now friend the bot to see when it's online, and !changelog shows what's new.",
+    "detail": "Friending: BC only shows two people to each other on their friend lists when both have added the other, so adding the bot on its own never did anything. Now, if you use BC's \"Add friend with notification\" option on the bot, it adds you back automatically — after that the bot appears in your friend list whenever it's online, so you can tell the table is open without hunting for it. Once the lobby is publicly listed you'll see the room name and player count there too. The \"add without notifying\" option sends the bot no signal at all, so if you used that one (or added the bot a while ago), whisper !friend and it'll add you back. !unfriend removes you again at any time. No beeps are sent — this is display only.\nChangelog: room chat no longer gets a wall of text after every update. Restarts announce a single headline for the big changes only, and if something shipped while you were away you'll get a one-line nudge on your way in. Whisper !changelog any time for the last few updates in full.",
+    "major": true
+  }
+]

@@ -106,6 +106,18 @@ Room type is chosen during negotiation (new question, added last in `NEGOTIATION
 
 ---
 
+## Lobby Fallback (single-room-bot capacity)
+
+Added 2026-07-18, while there's still only one room bot (`gamebot1`) — see "Multiple room bots" below. Since all three room types above hand off to that same room bot, only one match can run at a time no matter which type players pick, and a second couple negotiating in parallel would just queue in `handoffs/pending/` with no visible progress until the first match ends.
+
+To use the lobby bot's own idle capacity in the meantime: right before the room-type question (`promptNextSetting`'s `key === null` branch, lobby bot only), the negotiation checks `listClaimedHandoffs().length > 0` — i.e. is the room bot already mid-match. If so, it asks both players (independently, like the consent question) whether they're OK playing right in the public lobby room instead of waiting. Either "no" cancels the match outright (no private fallback exists to offer). Both "yes" sets `playInLobby` on the negotiation, skips the room-type question entirely (moot — it's public lobby play either way), and `finishNegotiation()` calls `launchMatch()` directly instead of writing a handoff — the same code path the pre-multi-room single-bot build always used, kept alive today as `botRole !== "main"`'s fallback.
+
+While that in-lobby match runs, the lobby bot's own `state.phase` is `"playing"`, so it can't negotiate a third challenge until it wraps up (same constraint the old single-bot build always had) — `!challenge` during that window gets a "match currently being played here" whisper instead of being silently ignored.
+
+This whole mechanic becomes unnecessary once a second room bot exists — `listClaimedHandoffs()` would rarely find every room bot busy at once, and even those brief windows have a nowhere-else-to-go answer that's no worse than the queue behavior today.
+
+---
+
 ## Full Flow
 
 ### 1. Negotiation (lobby bot)

@@ -241,6 +241,14 @@ export const CONSENT_TOKEN_GROUPS: Record<string, string[]> = {
 export const DEFAULT_BONDAGE_ITEM_LIMIT = 7;
 // How many popular items to list per slot (plus one random wildcard).
 export const PICK_LIST_TOP_N = 9;
+// Recently-added BC items (by asset codename) to spotlight: pinned to the top
+// of their slot's pick list with a 🆕 marker regardless of usage, since players
+// like trying new gear and a zero-usage item would otherwise never rank. Remove
+// a codename once it's no longer "new". Display-only — usage stats untouched.
+export const NEW_ITEMS: ReadonlySet<string> = new Set<string>([
+    "CybertechMask", // R130 — ItemHood/ItemHead
+    "ModularVulvaPiercings", // R130 "Chastity Tunnel Piercings" — ItemVulvaPiercings (verified in-game 2026-07-19)
+]);
 // Minimum distinct areas a player-pick player must consent to (Mouth counts
 // as one area even though it holds up to 3 gag layers).
 export const MIN_CONSENT_AREAS = 6;
@@ -821,11 +829,19 @@ export class BondagePicker<P extends BondagePickerPlayer = BondagePickerPlayer> 
         const catalogItems = this.itemCatalog.get(group) ?? [];
         const usage = this.bondageUsage[group] ?? {};
 
-        const options: string[] = Object.entries(usage)
-            .filter(([name, count]) => count > 0 && !excluded.includes(name) && catalogItems.includes(name))
+        // Pin any new items for this slot to the front (see NEW_ITEMS) so
+        // players always see the latest gear regardless of usage history.
+        const options: string[] = [...NEW_ITEMS].filter(
+            n => catalogItems.includes(n) && !excluded.includes(n)
+        );
+
+        for (const [name] of Object.entries(usage)
+            .filter(([name, count]) => count > 0 && !excluded.includes(name) && catalogItems.includes(name) && !options.includes(name))
             .sort((a, b) => b[1] - a[1])
-            .slice(0, PICK_LIST_TOP_N)
-            .map(([name]) => name);
+            .slice(0, PICK_LIST_TOP_N)) {
+            if (options.length >= PICK_LIST_TOP_N) break;
+            options.push(name);
+        }
 
         if (options.length < PICK_LIST_TOP_N) {
             for (const outfit of this.bootstrapOutfits) {
@@ -850,8 +866,9 @@ export class BondagePicker<P extends BondagePickerPlayer = BondagePickerPlayer> 
     private formatPickList(slotDisplay: string, options: string[], hasRandom: boolean): string {
         const lines = [`Slot: ${slotDisplay} — pick one:`];
         options.forEach((name, i) => {
+            const newMarker = NEW_ITEMS.has(name) ? " 🆕 new!" : "";
             const marker = hasRandom && i === options.length - 1 ? ` ← random pick (not in top ${PICK_LIST_TOP_N})` : "";
-            lines.push(`${i + 1}. ${name}${marker}`);
+            lines.push(`${i + 1}. ${name}${newMarker}${marker}`);
         });
         lines.push("Or type any item name from this slot.");
         return lines.join("\n");

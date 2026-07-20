@@ -3,6 +3,7 @@ import * as path from "path";
 import { BCConnection } from "./connection";
 import { log, logError, centralTimestamp } from "./logger";
 import { secrets, botRole } from "./secrets";
+import { readPendingUpdate, getSeenVersion, markVersionSeen } from "./pendingUpdate";
 import {
     ActiveBondage,
     ActiveEndGame,
@@ -27,6 +28,7 @@ import {
     PairBalanceEntry,
     PairSettingsEntry,
     PlayerRecord,
+    ChangelogEntry,
     PlayerSettingsEntry,
     SavedGameConfig,
     PlayerState,
@@ -37,7 +39,7 @@ import {
     SpendOption,
     ToyDeal,
 } from "./types";
-import { PICK_SLOTS, PickSlot, PICK_LIST_TOP_N, loadBcItemCatalog } from "./bondagePicker";
+import { PICK_SLOTS, PickSlot, PICK_LIST_TOP_N, NEW_ITEMS, loadBcItemCatalog } from "./bondagePicker";
 import { writeHandoff, listPendingHandoffs, claimHandoff, writeResult, listPendingResults, markResultProcessed, listClaimedHandoffs } from "./handoff";
 
 const FEEDBACK_STATUS_LABELS: Record<FeedbackItemStatus, string> = {
@@ -151,6 +153,13 @@ const CONSENT_ALL_QUESTION =
     "and potentially actions & services or being under the other player's control for a period of time. " +
     "Do you both agree to all of this? (yes / no)";
 
+// Asked instead of ROOM_TYPE_QUESTION when the (single) room bot is already
+// mid-match — see promptNextSetting's lobbyFallbackStage check. Both players
+// answer independently; either "no" cancels the match.
+const LOBBY_FALLBACK_QUESTION =
+    "The private room is currently in use by another match — right now we can only offer public play here in the lobby. " +
+    "Want to play here instead? (yes/no)";
+
 // Final negotiation question — see design_multi_room.md. Both players answer
 // independently; a mismatch falls back to "private" (handleRoomTypeAnswer).
 const ROOM_TYPE_QUESTION =
@@ -175,6 +184,12 @@ function rollD20(): number {
 // Default cap on each player's earned streak, used until an admin changes it
 // with !setstreak between games.
 const DEFAULT_MAX_STREAK = 10;
+
+// How many past updates changelog.json keeps, and how many of those
+// !changelog whispers back. Showing fewer than we keep means a player
+// returning after a long absence gets the recent highlights, not all history.
+const CHANGELOG_MAX_ENTRIES = 40;
+const CHANGELOG_ENTRIES_SHOWN = 5;
 
 // Cost in points to purchase +1 through +5 boost (index 0 = level 1).
 const BOOST_PRICES = [40, 100, 225, 500, 1000];
@@ -568,6 +583,7 @@ export class WinnersDiceGame {
 
     private playerRecords: Record<string, PlayerRecord> = {};
     private readonly playerRecordsPath = path.join(__dirname, "..", "players.json");
+    private readonly changelogPath = path.join(__dirname, "..", "changelog.json");
 
     // Per-pair leftover point carryover — see PairBalanceEntry.
     private pairBalances: Record<string, PairBalanceEntry> = {};
@@ -579,8 +595,6 @@ export class WinnersDiceGame {
     private readonly playerSettingsPath = path.join(__dirname, "..", "player_settings.json");
     private pairSettings: Record<string, PairSettingsEntry> = {};
     private readonly pairSettingsPath = path.join(__dirname, "..", "pair_settings.json");
-
-    private readonly pendingUpdatePath = path.join(__dirname, "..", "pending_update.txt");
 
     // Cap on streak for the *next* match, admin-settable via !setstreak.
     private defaultMaxStreak: number = DEFAULT_MAX_STREAK;
@@ -772,6 +786,15 @@ export class WinnersDiceGame {
             case "!readme":
                 this.handleReadme(sender);
                 break;
+            case "!changelog":
+                this.handleChangelog(sender);
+                break;
+            case "!friend":
+                this.handleFriendRequest(sender, this.roomMembers.get(sender)?.name ?? `Player #${sender}`);
+                break;
+            case "!unfriend":
+                this.handleUnfriend(sender);
+                break;
             case "!challenge":
                 this.handleChallenge(sender, args);
                 break;
@@ -796,6 +819,8 @@ export class WinnersDiceGame {
                     this.handlePairSettingsShortcutAnswer(sender, true);
                 } else if (this.isAwaitingConsentAll()) {
                     this.handleConsentAllAnswer(sender, true);
+                } else if (this.isAwaitingLobbyFallback()) {
+                    this.handleLobbyFallbackAnswer(sender, true);
                 } else {
                     this.handleYesNoAnswer(sender, true);
                 }
@@ -809,6 +834,8 @@ export class WinnersDiceGame {
                     this.handlePairSettingsShortcutAnswer(sender, false);
                 } else if (this.isAwaitingConsentAll()) {
                     this.handleConsentAllAnswer(sender, false);
+                } else if (this.isAwaitingLobbyFallback()) {
+                    this.handleLobbyFallbackAnswer(sender, false);
                 } else {
                     this.handleYesNoAnswer(sender, false);
                 }
@@ -997,8 +1024,20 @@ export class WinnersDiceGame {
 
         // The challenger is being asked for a numeric setting (e.g. minimum
         // rounds) and hasn't proposed a value yet — treat any extractable
-        // number in their reply as that proposal.
-        if (negotiation && this.state.phase === "negotiating" && !negotiation.pending) {
+        // number in their reply as that proposal. Guarded against every
+        // pre-negotiation sub-stage still being "awaiting" — without this,
+        // any non-numeric reply from the challenger (e.g. "no" to the
+        // carryover question) got wrongly swallowed here as an invalid
+        // minRounds answer instead of ever reaching the real handler below
+        // (found live 2026-07-17 — only broke for the challenger, since this
+        // block is challenger-only; the opponent's replies were never at risk).
+        const preNegotiationStageActive = negotiation !== null && (
+            negotiation.carryoverStage === "awaiting" ||
+            negotiation.pairSettingsStage === "awaiting" ||
+            negotiation.settingsCompareStage === "awaiting" ||
+            negotiation.consentAllStage === "awaiting"
+        );
+        if (negotiation && this.state.phase === "negotiating" && !negotiation.pending && !preNegotiationStageActive) {
             const key = nextNegotiationKey(negotiation.config);
             if (key !== null && !isYesNoKey(key) && sender === negotiation.challenger.memberNumber) {
                 const num = extractNumber(msg);
@@ -1059,6 +1098,10 @@ export class WinnersDiceGame {
                     this.handleConsentAllAnswer(sender, true);
                     return;
                 }
+                if (negotiation.lobbyFallbackStage === "awaiting") {
+                    this.handleLobbyFallbackAnswer(sender, true);
+                    return;
+                }
                 const key = nextNegotiationKey(negotiation.config);
                 if (key !== null && isYesNoKey(key)) {
                     this.handleYesNoAnswer(sender, true);
@@ -1079,6 +1122,10 @@ export class WinnersDiceGame {
                 }
                 if (negotiation.consentAllStage === "awaiting") {
                     this.handleConsentAllAnswer(sender, false);
+                    return;
+                }
+                if (negotiation.lobbyFallbackStage === "awaiting") {
+                    this.handleLobbyFallbackAnswer(sender, false);
                     return;
                 }
                 const key = nextNegotiationKey(negotiation.config);
@@ -1111,9 +1158,48 @@ export class WinnersDiceGame {
 
         text +=
             `!feedback <text> - Send feedback (whisper only)\n` +
+            `!friend - Add me to your friend list so you can see when I'm online (!unfriend to undo)\n` +
+            `!changelog - See what's changed recently\n` +
             `Tip: all commands work in chat or as a whisper to me.`;
 
         this.sendLongWhisper(sender, text);
+    }
+
+    // Reciprocate a friending so the player can see the bot on their friend
+    // list. BC has no friend-request event: picking "Add friend with
+    // notification" makes their client send a Hidden ChatRoomFriendRequestAdd
+    // chat message, which index.ts routes here. The silent option sends
+    // nothing at all, so !friend exists as the manual path to the same place.
+    // This room idles at Visibility ["Admin"], so friends see only that the
+    // bot is online — the server hides the room name for restricted rooms.
+    public handleFriendRequest(memberNumber: number, name: string): void {
+        if (this.bot.isFriend(memberNumber)) {
+            this.bot.whisper(memberNumber,
+                `You're already on my friend list! If you can't see me, add me from your own ` +
+                `friend list too — BC only shows us to each other when we've both added.`
+            );
+            return;
+        }
+
+        this.bot.addFriend(memberNumber);
+        log(`Friend request from ${name} (#${memberNumber}) — added back.`);
+        this.bot.whisper(memberNumber,
+            `Added you back! 🎲 I'll now show up on your friend list whenever I'm online, ` +
+            `so you can tell at a glance when the table is open. This room stays unlisted, ` +
+            `so you'll see that I'm on rather than the room name itself. If you haven't ` +
+            `added me on your side yet, do that and I'll appear. Whisper !unfriend to undo.`
+        );
+    }
+
+    private handleUnfriend(memberNumber: number): void {
+        if (!this.bot.removeFriend(memberNumber)) {
+            this.bot.whisper(memberNumber, "You weren't on my friend list to begin with.");
+            return;
+        }
+        this.bot.whisper(memberNumber,
+            `Removed you from my friend list — I won't show up there any more. ` +
+            `Whisper !friend if you ever want me back.`
+        );
     }
 
     private handleReadme(memberNumber: number): void {
@@ -1170,6 +1256,7 @@ export class WinnersDiceGame {
             `clothing - Buy a clothing item from your opponent\n` +
             `bondage - Apply bondage to your opponent (you pay half goes to them)\n` +
             `locks - Lock your opponent's bondage; they can buy out anytime from their post-bank menu\n` +
+            `buy back bondage - Pay to have your own bondage removed (opponent sets the price)\n` +
             `buyback - Buy back something you sold, at double the price\n` +
             `toys - Purchase a timed toy session\n` +
             `actions & services - Request a service from your opponent\n` +
@@ -1177,7 +1264,7 @@ export class WinnersDiceGame {
             `cancel - Back out\n\n` +
             `=== Bondage Removal ===\n` +
             `!removebondage <slot> - (placer) Remove bondage you applied, free\n` +
-            `!buybondage <slot> - (wearer) Request a buyout — placer sets the price`;
+            `!buybondage <slot> - (wearer) Request a buyout directly — same as "buy back bondage" in the shop, just skips the slot menu`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -1222,6 +1309,20 @@ export class WinnersDiceGame {
     private isServiceCounterStage(stage: string): boolean {
         return stage === "awaiting_seller_response" || stage === "awaiting_seller_counter_value"
             || stage === "awaiting_buyer_counter_response" || stage === "awaiting_buyer_counter_value";
+    }
+
+    // Post-Bank ("What next?") and Shop context help — scoped to usage
+    // mechanics not already stated by the menu's own option lines
+    // (postBankPromptText/openSpendMenu), rather than restating them.
+    private postBankHintText(): string {
+        return `💰 Your banked points are safe no matter what you pick here — nothing costs anything by itself. ` +
+            `You can go into the shop (2) and back out as many times as you like before choosing continue or endgame — spending doesn't use up your turn.`;
+    }
+
+    private shopHintText(): string {
+        return `🛍️ Reply with just the number shown — words like "boost" won't work, only the digit. ` +
+            `Everything here except boost negotiates a price with your opponent first — nothing's charged until they accept; boost is the one fixed-price, self-serve option. ` +
+            `0 (Back) doesn't cancel anything — it just returns you to continue/spend/endgame, and you can come back into the shop as many times as you want.`;
     }
 
     private dealCounterHintText(canCancel: boolean): string {
@@ -1323,21 +1424,28 @@ export class WinnersDiceGame {
                 this.bot.whisper(sender, this.endGameQuestionPromptText(proposal));
                 return;
             }
-            if (proposal.proposalStage === "negotiating" &&
-                (sender === proposal.winnerMemberNumber || sender === proposal.loserMemberNumber)) {
+            if (proposal.proposalStage === "negotiating" && sender === proposal.winnerMemberNumber) {
                 this.bot.whisper(sender,
-                    `⚔️ yes to accept, or counter <minutes> to negotiate — no flat decline on this one. ` +
-                    `(Round 5 is the final say — no more countering after that.)`
+                    `⚔️ yes to accept, "counter <amount>" to spend points raising it back (capped at 90% of your original ask), or "decline" to block the whole deal. ` +
+                    `(Step 4 is the final say — no more back-and-forth after that.)`
+                );
+                return;
+            }
+            if (proposal.proposalStage === "negotiating" && sender === proposal.loserMemberNumber) {
+                this.bot.whisper(sender,
+                    `⚔️ yes to accept, or "counter <amount>" to cut it further — no flat decline on this one, only accept or cut more. ` +
+                    `(Step 4 is the final say — no more back-and-forth after that.)`
                 );
                 return;
             }
         }
 
         if (state.phase === "playing" && state.awaitingPostBank === sender) {
-            this.handleHelpShop(sender);
             if (state.spendMenuOpen) {
+                this.bot.whisper(sender, this.shopHintText());
                 this.openSpendMenu(sender);
             } else {
+                this.bot.whisper(sender, this.postBankHintText());
                 this.bot.whisper(sender, this.postBankPromptText(sender));
             }
             return;
@@ -1367,6 +1475,12 @@ export class WinnersDiceGame {
         if (this.checkPendingUpdate()) return;
 
         if (this.state.phase !== "idle") {
+            if (botRole === "main") {
+                const reason = this.state.phase === "negotiating"
+                    ? "Another match is currently being set up here"
+                    : "A match is currently being played here in the lobby";
+                this.bot.whisper(sender, `${reason} — try again in a few minutes.`);
+            }
             return;
         }
 
@@ -1454,6 +1568,9 @@ export class WinnersDiceGame {
             carryoverStage: "not_asked",
             carryoverAnswers: {},
             useCarryover: false,
+            lobbyFallbackStage: "not_asked",
+            lobbyFallbackAnswers: {},
+            playInLobby: false,
             roomTypeStage: "not_asked",
             roomTypeAnswers: {},
             roomType: null,
@@ -1697,6 +1814,17 @@ export class WinnersDiceGame {
 
         const key = nextNegotiationKey(negotiation.config);
         if (key === null) {
+            if (negotiation.lobbyFallbackStage === "not_asked") {
+                if (botRole === "main" && listClaimedHandoffs().length > 0) {
+                    negotiation.lobbyFallbackStage = "awaiting";
+                    negotiation.lobbyFallbackAnswers = {};
+                    this.bot.sendChat(`${negotiation.challenger.name} and ${negotiation.opponent.name}: ${LOBBY_FALLBACK_QUESTION}`);
+                    return;
+                }
+                negotiation.lobbyFallbackStage = "done";
+            }
+            if (negotiation.lobbyFallbackStage === "awaiting") return;
+
             if (negotiation.roomTypeStage === "not_asked") {
                 negotiation.roomTypeStage = "awaiting";
                 negotiation.roomTypeAnswers = {};
@@ -1933,6 +2061,53 @@ export class WinnersDiceGame {
         this.promptNextSetting();
     }
 
+    private isAwaitingLobbyFallback(): boolean {
+        return this.state.phase === "negotiating" && this.state.negotiation?.lobbyFallbackStage === "awaiting";
+    }
+
+    // Dispatches one player's yes/no answer to LOBBY_FALLBACK_QUESTION. Both
+    // must agree to play in the public lobby room — unlike roomTypeStage, a
+    // mismatch (or either "no") cancels the match rather than defaulting to
+    // anything, since there's no private fallback available right now.
+    private handleLobbyFallbackAnswer(sender: number, value: boolean): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.lobbyFallbackStage !== "awaiting") {
+            return;
+        }
+
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) {
+            return;
+        }
+
+        negotiation.lobbyFallbackAnswers[sender] = value;
+
+        const challengerAnswer = negotiation.lobbyFallbackAnswers[negotiation.challenger.memberNumber];
+        const opponentAnswer = negotiation.lobbyFallbackAnswers[negotiation.opponent.memberNumber];
+
+        if (challengerAnswer === undefined || opponentAnswer === undefined) {
+            const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+            const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+            this.bot.sendChat(`${responder.name} says ${value ? "yes" : "no"}. Waiting on ${other.name}...`);
+            return;
+        }
+
+        const agreed = challengerAnswer && opponentAnswer;
+        negotiation.lobbyFallbackStage = "done";
+        negotiation.lobbyFallbackAnswers = {};
+
+        if (!agreed) {
+            this.bot.sendChat(`No match will be played right now — the private room is still in use. Feel free to !challenge again once it frees up.`);
+            this.clearChallengeAcceptanceTimer(negotiation);
+            this.state = this.createIdleState();
+            return;
+        }
+
+        negotiation.playInLobby = true;
+        negotiation.roomTypeStage = "done";
+        this.bot.sendChat(`Both players agreed — you'll play right here in the lobby.`);
+        this.promptSettingsCompareOrFinish(negotiation);
+    }
+
     private handleCancel(sender: number): void {
         const state = this.state;
 
@@ -2159,7 +2334,10 @@ export class WinnersDiceGame {
 
         // Multi-room mode: the lobby bot never runs matches itself. Hand off
         // to a room bot instead of building match state — see design_multi_room.md.
-        if (botRole === "main") {
+        // Exception: playInLobby (see handleLobbyFallbackAnswer) — both players
+        // agreed to play right here rather than wait for the busy room bot, so
+        // fall through to launchMatch() same as the non-main path below.
+        if (botRole === "main" && !negotiation.playInLobby) {
             this.handOffMatch(negotiation, config, challengerStart, opponentStart);
             return;
         }
@@ -3082,11 +3260,19 @@ export class WinnersDiceGame {
     // answers 5 questions (Q1-Q5), the full proposal is delivered to the
     // loser, and then up to 5 negotiation steps play out (mirroring the
     // turn order of the shared bondage/lock/toy price negotiation, but with
-    // bespoke cost math: the loser's cost is winnerFloor - agreedMinutes,
+    // bespoke cost math: the loser's cost is originalMinutes - agreedMinutes,
     // deducted from their raw balance since they're not in a bank session).
-    // Ends either in EXECUTION (timer + password lock, plus any requested
-    // extra lock slots) or a BLOCK (loser counters to zero or below — both
-    // sides lose their committed points, game continues).
+    // Reworked 2026-07-17 — DW's design: Q1 is the winner's real target
+    // (originalMinutes); the loser spends to cut currentMinutes down
+    // (unlimited first move, down to 0 if they want; every round after that,
+    // both the loser's cuts and the winner's raises must move by at least
+    // 10% of originalMinutes each time — no tiny nibbles). The winner can
+    // spend to raise it back but never past 90% of originalMinutes. Ends
+    // either in EXECUTION (timer + password lock, plus any requested extra
+    // lock slots) or a BLOCK (winner explicitly declines — both sides lose
+    // whatever the current numbers implied, game continues). Cutting to 0 is
+    // no longer an automatic block — it's just a normal value that goes back
+    // to the winner to respond to.
     // ============================================================
 
     private isEndGameProposalQuestionStage(stage: EndGameProposal["proposalStage"]): boolean {
@@ -3099,6 +3285,25 @@ export class WinnersDiceGame {
         const me = state.players!.find(p => p.memberNumber === forMemberNumber)!;
         const other = state.players!.find(p => p.memberNumber !== forMemberNumber)!;
         return `Your balance: ${me.balance} pts | ${other.name}'s balance: ${other.balance} pts`;
+    }
+
+    // The winner's absolute ceiling once the loser has cut the time — they
+    // can spend to raise it back, but never past 90% of their original ask,
+    // no matter how many rounds happen.
+    private endGameWinnerCeiling(originalMinutes: number): number {
+        return Math.floor(originalMinutes * 0.9);
+    }
+
+    // Minimum move size for every round EXCEPT the loser's first move (which
+    // stays fully free — any amount, including straight to 0). Both the
+    // loser's second cut and every winner raise must close by at least this
+    // much — a flat 10% of the original ask, not of wherever the number
+    // currently sits — so nobody can trickle by 1 minute a round. Corrected
+    // 2026-07-17: this was originally built as a MAXIMUM on the loser's
+    // second move, which was backwards — DW wants a minimum, mirroring the
+    // pre-rework gap-close rule, on both sides' later rounds.
+    private endGameMinimumMove(originalMinutes: number): number {
+        return Math.round(originalMinutes * 0.10);
     }
 
     private startEndGameProposal(sender: number): void {
@@ -3122,10 +3327,8 @@ export class WinnersDiceGame {
             requestedLockSlots: [],
             description: "",
             negotiationStep: 0,
-            winnerFloor: 0,
-            loserCeiling: null,
-            winnerLastOffer: 0,
-            loserLastCounter: null,
+            originalMinutes: 0,
+            currentMinutes: 0,
             winnerPointsCommitted: 0,
             loserPointsCommitted: 0,
         };
@@ -3135,8 +3338,9 @@ export class WinnersDiceGame {
 
         this.bot.whisper(winner.memberNumber,
             `⚔️ End game initiated. Let's set the terms.\n\n` +
-            `Q1 of 5 — How many minutes do you want to claim? Each point = 1 minute and will be spent from your balance ` +
-            `(you have ${state.spendingBalance} pts available). Type a number.`
+            `Q1 of 5 — How many minutes do you want to claim? This is your real target, but expect ${loser.name} to spend points to cut it down — that's normal, not a rejection. ` +
+            `If they do, you can spend points to raise it back (at least 10% of whatever you answer here each time you do), but never past 90% of it — once it's been cut, you can't fully recover it. ` +
+            `Each point = 1 minute and will be spent from your balance (you have ${state.spendingBalance} pts available). Type a number.`
         );
     }
 
@@ -3185,8 +3389,8 @@ export class WinnersDiceGame {
         }
 
         proposal.proposedMinutes = n;
-        proposal.winnerFloor = n;
-        proposal.winnerLastOffer = n;
+        proposal.originalMinutes = n;
+        proposal.currentMinutes = n;
         proposal.negotiationStep = 1;
         proposal.proposalStage = "q2_location";
 
@@ -3319,30 +3523,32 @@ export class WinnersDiceGame {
             : `Staying in this room (${proposal.privacy})`;
         const locksText = proposal.requestedLockSlots.length > 0 ? proposal.requestedLockSlots.join(", ") : "none";
 
+        const minimumMove = this.endGameMinimumMove(proposal.originalMinutes);
+
         this.sendLongWhisper(loser.memberNumber,
             `⚔️ ${winner.name} has proposed an end game:\n\n` +
-            `• Time claimed: ${proposal.proposedMinutes} minutes\n` +
+            `• Time asked: ${proposal.proposedMinutes} minutes\n` +
             `• Location: ${locationText}\n` +
             `• Locks: ${locksText}\n` +
             `• Their plans: ${proposal.description}\n` +
             `──────────────────────\n` +
             `Balances — You: ${loser.balance} pts | ${winner.name}: ${winner.balance} pts\n\n` +
             `HOW THIS WORKS:\n` +
-            `• ${winner.name}'s opening ask costs them 1 pt per minute — their ask of ${proposal.proposedMinutes} min costs them ${proposal.proposedMinutes} pts.\n` +
-            `• If you counter to [X] min: ${winner.name} pays [X] pts, YOU pay ${proposal.proposedMinutes} - X pts from your own balance.\n` +
-            `  (Countering low = you take on more cost to cut the time. Countering near the ask = cheap for you, but more minutes.)\n` +
-            `• Countering to 0 or below is a BLOCK: the deal collapses, both sides' committed points are burned, and the match resumes.\n` +
-            `• Up to 5 rounds of negotiation. Rounds 4 and 5 are binding — no backing out.\n` +
-            `• 10% gap-close rule: each counter must close the gap by at least 10% — you can't trickle down by 1 each time.\n\n` +
-            `To ACCEPT: say "yes" — ${winner.name} pays ${proposal.proposedMinutes} pts, you pay nothing.\n` +
-            `To NEGOTIATE: reply "counter [minutes]" with a lower number.\n` +
-            `  ↳ You cannot decline outright — only accept or negotiate (or counter to 0 to block).`
+            `• You spend points to cut the time down — 1 pt per minute you cut. Say how much LOWER you want it, not a target number (e.g. "counter 15" cuts it by 15, it's not a new total).\n` +
+            `• You can cut it all the way to 0 on this first move if you want/can afford it — that's not an automatic block, it just goes to ${winner.name} to respond.\n` +
+            `• ${winner.name} can then accept wherever it lands, spend to raise it back — at least ${minimumMove} min each time they do, capped so they can never recover past 90% of their original ${proposal.proposedMinutes} min ask — or decline outright and block the whole deal.\n` +
+            `• If it comes back to you for a second move, you'll need to cut it by at least ${minimumMove} more min (10% of the original ask) — no tiny nibbles.\n` +
+            `• Up to 5 rounds total. Round 4 is binding — no more back-and-forth after that.\n` +
+            `• If ${winner.name} declines at any point, the deal's off — whatever's already been committed on both sides is burned, no refunds, and the match resumes.\n\n` +
+            `To ACCEPT: say "yes" — ${winner.name} pays for however many minutes it's currently at, you pay nothing.\n` +
+            `To CUT IT: reply "counter [amount to lower it by]".\n` +
+            `  ↳ You cannot decline outright — only accept or cut it further.`
         );
 
-        // Parallel whisper to the winner: remind them of their floor and balance.
+        // Parallel whisper to the winner: remind them of their ask and balance.
         this.bot.whisper(winner.memberNumber,
             `⚔️ Proposal delivered to ${loser.name}. Waiting for their response.\n` +
-            `Your floor: ${proposal.winnerFloor} min (you cannot counter below this). Your balance: ${state.spendingBalance} pts.`
+            `Your ask: ${proposal.originalMinutes} min. If they cut it, your best-case recovery is ${this.endGameWinnerCeiling(proposal.originalMinutes)} min (90% of your ask) — you'll never fully get back to ${proposal.originalMinutes}. Your balance: ${state.spendingBalance} pts.`
         );
 
         if (proposal.location === "stay" && proposal.privacy === "public") {
@@ -3381,74 +3587,64 @@ export class WinnersDiceGame {
     private handleEndGameLoserResponse(proposal: EndGameProposal, lower: string, raw: string): boolean {
         const trimmed = lower.trim();
         if (trimmed === "yes" || trimmed === "accept") {
-            this.closeEndGameDeal(proposal, proposal.winnerLastOffer);
+            this.closeEndGameDeal(proposal, proposal.currentMinutes);
             return true;
         }
 
         if (trimmed.startsWith("counter")) {
             const n = extractNumber(raw);
             if (n === null) {
-                this.bot.whisper(proposal.loserMemberNumber, `Counter with how many minutes? e.g. "counter 20"`);
+                this.bot.whisper(proposal.loserMemberNumber, `How much do you want to lower it by? e.g. "counter 15" cuts 15 minutes off — not a new total.`);
                 return true;
             }
             return this.applyEndGameLoserCounter(proposal, n);
         }
 
-        this.bot.whisper(proposal.loserMemberNumber, `You cannot decline — reply "yes" to accept, or "counter <minutes>" to negotiate.`);
+        this.bot.whisper(proposal.loserMemberNumber, `You cannot decline — reply "yes" to accept, or "counter <amount to lower it by>" to cut it further.`);
         return true;
     }
 
+    // n here is the amount to cut OFF the current value, not a new target —
+    // see design note on EndGameProposal.currentMinutes. First move
+    // (negotiationStep 1) is unlimited, down to 0; second move (step 3) must
+    // cut by at least a flat 10% of originalMinutes.
     private applyEndGameLoserCounter(proposal: EndGameProposal, n: number): boolean {
         const loser = this.state.players!.find(p => p.memberNumber === proposal.loserMemberNumber)!;
+        const isFirstMove = proposal.negotiationStep === 1;
 
         if (n <= 0) {
-            this.blockEndGame(proposal, n);
+            this.bot.whisper(loser.memberNumber, `Give a positive number — how many minutes do you want to cut it by?`);
             return true;
         }
 
-        const isFirstCounter = proposal.negotiationStep === 1;
-
-        if (isFirstCounter && n >= proposal.winnerLastOffer) {
-            this.closeEndGameDeal(proposal, proposal.winnerLastOffer);
+        if (n > proposal.currentMinutes) {
+            this.bot.whisper(loser.memberNumber, `You can cut it down to 0 at most — that's ${proposal.currentMinutes} min right now.`);
             return true;
         }
 
-        if (!isFirstCounter && proposal.loserCeiling !== null && n > proposal.loserCeiling) {
-            this.bot.whisper(loser.memberNumber,
-                `Your counter must be lower than your previous counter of ${proposal.loserCeiling} min. (You're locked to go down from there.)`);
-            return true;
-        }
-
-        // 10% gap-close rule (applies on the second counter, step 3 only).
-        // The loser must move DOWN by at least 10% of the current gap, so they
-        // can't trickle by 1 each time. Unlike the shop rule, there is no minimum
-        // gap threshold — this applies regardless of gap size.
-        if (!isFirstCounter && proposal.loserLastCounter !== null) {
-            const gap = proposal.winnerLastOffer - proposal.loserLastCounter;
-            if (gap > 0) {
-                const movement = Math.round(gap * 0.10);
-                const minimum = proposal.loserLastCounter - movement;
-                if (n > minimum) {
-                    const winnerName = this.playerName(proposal.winnerMemberNumber);
-                    this.bot.whisper(loser.memberNumber,
-                        `Minimum counter: ${minimum} min — you must close the gap by at least 10%. ` +
-                        `(Gap between ${winnerName}'s offer of ${proposal.winnerLastOffer} and your counter of ${proposal.loserLastCounter} is ${gap} min; ` +
-                        `you must move at least ${movement} min.)`);
-                    return true;
-                }
+        if (!isFirstMove) {
+            // Must close by at least 10% of the original ask — unless
+            // there's less than that much room left before 0, in which case
+            // cutting the rest of the way is the only real move.
+            const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), proposal.currentMinutes);
+            if (n < minimumMove) {
+                const winnerName = this.playerName(proposal.winnerMemberNumber);
+                this.bot.whisper(loser.memberNumber,
+                    `You need to cut it by at least ${minimumMove} min this round (10% of ${winnerName}'s original ${proposal.originalMinutes} min ask) — you asked to cut ${n}.`);
+                return true;
             }
         }
 
-        const cost = proposal.winnerFloor - n;
+        const newCurrent = proposal.currentMinutes - n;
+        const cost = proposal.originalMinutes - newCurrent;
         if (loser.balance < cost) {
             this.bot.whisper(loser.memberNumber,
-                `You don't have enough points to back that counter. You'd need ${cost} pts but only have ${loser.balance}.`);
+                `You don't have enough points to back that — cutting it to ${newCurrent} min would cost you ${cost} pts total, but you only have ${loser.balance}.`);
             return true;
         }
 
-        proposal.loserLastCounter = n;
-        if (isFirstCounter) proposal.loserCeiling = n;
-        proposal.negotiationStep = isFirstCounter ? 2 : 4;
+        proposal.currentMinutes = newCurrent;
+        proposal.negotiationStep = isFirstMove ? 2 : 4;
 
         this.sendEndGameStateWhisper(proposal);
         return true;
@@ -3457,70 +3653,75 @@ export class WinnersDiceGame {
     private handleEndGameWinnerResponse(proposal: EndGameProposal, lower: string, raw: string): boolean {
         const trimmed = lower.trim();
         if (trimmed === "yes" || trimmed === "accept") {
-            const closeAt = proposal.loserLastCounter ?? proposal.winnerFloor;
-            this.closeEndGameDeal(proposal, closeAt);
+            this.closeEndGameDeal(proposal, proposal.currentMinutes);
+            return true;
+        }
+
+        if (trimmed === "decline") {
+            this.blockEndGame(proposal);
             return true;
         }
 
         if (trimmed.startsWith("counter")) {
             const n = extractNumber(raw);
             if (n === null) {
-                this.bot.whisper(proposal.winnerMemberNumber, `Counter with how many minutes? e.g. "counter 25"`);
+                this.bot.whisper(proposal.winnerMemberNumber, `How much do you want to raise it back by? e.g. "counter 10" adds 10 minutes back — not a new total.`);
                 return true;
             }
             return this.applyEndGameWinnerCounter(proposal, n);
         }
 
-        this.bot.whisper(proposal.winnerMemberNumber, `Reply "yes" to accept, or "counter <minutes>" to negotiate.`);
+        this.bot.whisper(proposal.winnerMemberNumber,
+            `Reply "yes" to accept, "counter <amount to raise it by>" to spend points raising it back, or "decline" to block the deal outright.`);
         return true;
     }
 
+    // n here is the amount to add BACK onto the current value, not a new
+    // target. Capped so the result never exceeds endGameWinnerCeiling —
+    // 90% of the original ask, no matter how many rounds happen — and must
+    // close by at least endGameMinimumMove each round, unless there's less
+    // than that much room left before the ceiling.
     private applyEndGameWinnerCounter(proposal: EndGameProposal, n: number): boolean {
         const state = this.state;
         const isFinal = proposal.negotiationStep === 4;
 
-        if (n < proposal.winnerFloor) {
-            this.bot.whisper(proposal.winnerMemberNumber, `Your counter must be at least your opening offer of ${proposal.winnerFloor} min.`);
-            return true;
-        }
-        if (isFinal && n < proposal.winnerLastOffer) {
-            this.bot.whisper(proposal.winnerMemberNumber, `Your final offer must be at least your previous offer of ${proposal.winnerLastOffer} min.`);
+        if (n <= 0) {
+            this.bot.whisper(proposal.winnerMemberNumber, `Give a positive number — how many minutes do you want to add back?`);
             return true;
         }
 
-        // 10% gap-close rule: winner must increase their offer by at least 10% of
-        // the current gap, preventing trickle counters. No minimum gap threshold —
-        // applies regardless of gap size (unlike the shop's 50-pt floor).
-        if (proposal.loserLastCounter !== null) {
-            const gap = proposal.winnerLastOffer - proposal.loserLastCounter;
-            if (gap > 0) {
-                const movement = Math.round(gap * 0.10);
-                const minimum = proposal.winnerLastOffer + movement;
-                if (n < minimum) {
-                    const loserName = this.playerName(proposal.loserMemberNumber);
-                    this.bot.whisper(proposal.winnerMemberNumber,
-                        `Minimum counter: ${minimum} min — you must close the gap by at least 10%. ` +
-                        `(Gap between your offer of ${proposal.winnerLastOffer} and ${loserName}'s counter of ${proposal.loserLastCounter} is ${gap} min; ` +
-                        `you must increase by at least ${movement} min.)`);
-                    return true;
-                }
-            }
-        }
-
-        if (proposal.loserLastCounter !== null && n >= proposal.loserLastCounter) {
-            this.closeEndGameDeal(proposal, proposal.loserLastCounter);
+        const ceiling = this.endGameWinnerCeiling(proposal.originalMinutes);
+        const roomToCeiling = Math.max(ceiling - proposal.currentMinutes, 0);
+        if (roomToCeiling <= 0) {
+            this.bot.whisper(proposal.winnerMemberNumber,
+                `You're already at your ceiling — ${ceiling} min (90% of your original ${proposal.originalMinutes}) is the most you can ever recover.`);
             return true;
         }
 
-        if (state.spendingBalance < n) {
-            this.bot.whisper(proposal.winnerMemberNumber, `You can't afford that — ${n} pts is more than your ${state.spendingBalance} balance.`);
+        const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), roomToCeiling);
+        if (n < minimumMove) {
+            this.bot.whisper(proposal.winnerMemberNumber,
+                `You need to raise it by at least ${minimumMove} min this round (10% of your original ${proposal.originalMinutes} min ask) — you offered ${n}.`);
             return true;
         }
 
-        proposal.winnerLastOffer = n;
+        const newCurrent = proposal.currentMinutes + n;
+        if (newCurrent > ceiling) {
+            this.bot.whisper(proposal.winnerMemberNumber,
+                `You can raise it by at most ${roomToCeiling} more min — ${ceiling} min (90% of your original ${proposal.originalMinutes}) is the most you can ever recover.`);
+            return true;
+        }
+
+        if (state.spendingBalance < newCurrent) {
+            this.bot.whisper(proposal.winnerMemberNumber,
+                `You can't afford that — ending up at ${newCurrent} min would cost ${newCurrent} pts, more than your ${state.spendingBalance} balance.`);
+            return true;
+        }
+
+        proposal.currentMinutes = newCurrent;
 
         if (isFinal) {
-            this.closeEndGameDeal(proposal, n);
+            this.closeEndGameDeal(proposal, newCurrent);
             return true;
         }
 
@@ -3532,38 +3733,53 @@ export class WinnersDiceGame {
     private sendEndGameStateWhisper(proposal: EndGameProposal): void {
         const winner = this.playerName(proposal.winnerMemberNumber);
         const loser = this.playerName(proposal.loserMemberNumber);
-        const loserCost = proposal.loserLastCounter !== null ? proposal.winnerFloor - proposal.loserLastCounter : 0;
-        const nextTurn = (proposal.negotiationStep === 2 || proposal.negotiationStep === 4) ? winner : loser;
+        const loserCostSoFar = proposal.originalMinutes - proposal.currentMinutes;
+        const isWinnerTurn = proposal.negotiationStep === 2 || proposal.negotiationStep === 4;
+        const isFinal = proposal.negotiationStep === 4;
 
         const text =
-            `📊 Current negotiation state:\n` +
-            `• ${winner}'s offer: ${proposal.winnerLastOffer} min (costs them ${proposal.winnerLastOffer} pts)\n` +
-            `• ${loser}'s counter: ${proposal.loserLastCounter ?? "not yet set"} min (would cost them ${loserCost} pts)\n` +
-            `${nextTurn}'s turn — step ${proposal.negotiationStep} of 5`;
+            `📊 Currently at ${proposal.currentMinutes} min — ${winner} would pay ${proposal.currentMinutes} pts, ${loser} would pay ${loserCostSoFar} pts if accepted as-is.\n` +
+            `${isWinnerTurn ? winner : loser}'s turn — step ${proposal.negotiationStep} of 5${isFinal ? " (final — no more back-and-forth after this)" : ""}.`;
 
         this.bot.whisper(proposal.winnerMemberNumber, text);
         this.bot.whisper(proposal.loserMemberNumber, text);
+
+        // Role-specific instructions to whoever's turn it actually is.
+        if (isWinnerTurn) {
+            const ceiling = this.endGameWinnerCeiling(proposal.originalMinutes);
+            const roomToCeiling = Math.max(ceiling - proposal.currentMinutes, 0);
+            const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), roomToCeiling);
+            this.bot.whisper(proposal.winnerMemberNumber,
+                `Reply "yes" to accept ${proposal.currentMinutes} min, "counter <amount>" to raise it back (at least ${minimumMove}, up to ${roomToCeiling} more — capped at ${ceiling} min total), or "decline" to block the whole deal.`
+            );
+        } else {
+            const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), proposal.currentMinutes);
+            this.bot.whisper(proposal.loserMemberNumber,
+                `Reply "yes" to accept ${proposal.currentMinutes} min, or "counter <amount>" to cut it further (at least ${minimumMove} min this round).`
+            );
+        }
     }
 
-    // The loser countered to zero (or below) — the "nuclear option". Both
-    // sides' currently-committed points are burned by design (same as a
-    // successful executeEndGame settlement — see its comment) with no
-    // refund, and the match continues as if endgame had never been called.
-    private blockEndGame(proposal: EndGameProposal, blockValue: number): void {
+    // The winner declined the deal outright — a new option (see
+    // applyEndGameLoserCounter's comment: cutting to 0 no longer
+    // auto-blocks, only this does). Whatever the current numbers imply is
+    // burned on both sides — no refunds, same principle as before — and the
+    // match resumes as if end game had never been called.
+    private blockEndGame(proposal: EndGameProposal): void {
         const state = this.state;
         const winner = state.players!.find(p => p.memberNumber === proposal.winnerMemberNumber)!;
         const loser = state.players!.find(p => p.memberNumber === proposal.loserMemberNumber)!;
 
-        const winnerCost = Math.min(proposal.winnerLastOffer, state.spendingBalance);
-        const loserCost = Math.min(Math.max(proposal.winnerFloor - blockValue, 0), loser.balance);
+        const winnerCost = Math.min(proposal.currentMinutes, state.spendingBalance);
+        const loserCost = Math.min(Math.max(proposal.originalMinutes - proposal.currentMinutes, 0), loser.balance);
 
         state.spendingBalance -= winnerCost;
         winner.balance = state.spendingBalance;
         loser.balance -= loserCost;
 
-        this.bot.sendChat("The end game was blocked. The game continues.");
-        this.bot.whisper(winner.memberNumber, `${loser.name} blocked the negotiation — you lose the ${winnerCost} pts you had committed.`);
-        this.bot.whisper(loser.memberNumber, `You blocked the negotiation — you lose ${loserCost} pts for walking away.`);
+        this.bot.sendChat("The end game was declined. The game continues.");
+        this.bot.whisper(winner.memberNumber, `You declined the negotiation — you lose the ${winnerCost} pts already implied by the current terms.`);
+        this.bot.whisper(loser.memberNumber, `${winner.name} declined the negotiation — you lose the ${loserCost} pts you'd already spent cutting the time.`);
 
         state.endGameProposal = null;
         this.endGameAwaitingLockSlotsInput = false;
@@ -3614,7 +3830,7 @@ export class WinnersDiceGame {
         const loser = state.players.find(p => p.memberNumber === proposal.loserMemberNumber)!;
 
         const winnerCost = Math.min(finalMinutes, state.spendingBalance);
-        const loserCost = Math.min(Math.max(proposal.winnerFloor - finalMinutes, 0), loser.balance);
+        const loserCost = Math.min(Math.max(proposal.originalMinutes - finalMinutes, 0), loser.balance);
 
         state.spendingBalance -= winnerCost;
         winner.balance = state.spendingBalance;
@@ -3663,6 +3879,10 @@ export class WinnersDiceGame {
         const password = END_GAME_LOCK_PASSWORD_WORDS[Math.floor(Math.random() * END_GAME_LOCK_PASSWORD_WORDS.length)];
         const lockProperty = this.buildTimerPasswordLockProperty(password, lockMinutes);
 
+        // A leash needs a collar to attach to — add one (locked to the same
+        // timer/password) if the loser isn't already wearing one.
+        const collarAdded = this.ensureCollarForLeash(loserMemberNumber, lockProperty);
+
         this.bot.applyItem(loserMemberNumber, END_GAME_LEASH_GROUP, END_GAME_LEASH_ITEM, "Default", lockProperty);
 
         const appliedLockSlots: string[] = [];
@@ -3694,6 +3914,7 @@ export class WinnersDiceGame {
             appliedLockSlots,
             inRoom,
             activeStartTime: Date.now(),
+            collarAdded,
         };
 
         // If the session is happening in this room, let the winner know the bot
@@ -3844,6 +4065,11 @@ export class WinnersDiceGame {
         if (!active) return;
 
         this.bot.removeItem(active.loserMemberNumber, END_GAME_LEASH_GROUP);
+        // Remove the collar too, but only if the bot added it for the leash —
+        // never strip a collar the player was already wearing.
+        if (active.collarAdded) {
+            this.bot.removeItem(active.loserMemberNumber, "ItemNeck");
+        }
         for (const group of active.appliedLockSlots) {
             const slotDisplay = PICK_SLOTS.find(s => s.group === group)?.display;
             const entry = slotDisplay
@@ -3880,6 +4106,9 @@ export class WinnersDiceGame {
         if (state.config!.bondage) options.push({ key: "bondage", label: `bondage — buy bondage for your opponent` });
         if (state.config!.bondage && this.lockableBondageSlotsFor(opponent.memberNumber).length > 0) {
             options.push({ key: "locks", label: `locks — pay to lock ${opponent.name}'s bondage; they can remove it later for 2× your price` });
+        }
+        if (state.config!.bondage && this.state.activeBondage.some(b => b.wearerMemberNumber === player.memberNumber)) {
+            options.push({ key: "bondagebuyback", label: `buy back bondage — pay to have your own bondage removed (${opponent.name} sets the price)` });
         }
         if (state.config!.toys && this.toyCatalog.length > 0) {
             options.push({ key: "toys", label: `toys — pick a toy, agree a price with ${opponent.name}, then use it for a set time` });
@@ -3993,6 +4222,15 @@ export class WinnersDiceGame {
                 return;
             }
             this.startBuyback(sender);
+            return;
+        }
+
+        if (key === "bondagebuyback") {
+            if (!state.config.bondage) {
+                this.bot.whisper(sender, "Bondage wasn't enabled for this match.");
+                return;
+            }
+            this.startBondageBuyback(sender);
             return;
         }
     }
@@ -4986,6 +5224,35 @@ export class WinnersDiceGame {
         return worn.map(b => `${b.slot} (${b.itemName})`).join(", ");
     }
 
+    // Single most popular collar (ItemNeck) from this bot's learned usage data,
+    // falling back to the first catalog entry. Null only if the catalog has no
+    // ItemNeck items at all.
+    private pickTopCollar(): string | null {
+        const catalogItems = this.itemCatalog.get("ItemNeck") ?? [];
+        if (catalogItems.length === 0) return null;
+        const usage = this.bondageUsage["ItemNeck"] ?? {};
+        const ranked = Object.entries(usage)
+            .filter(([name, count]) => count > 0 && catalogItems.includes(name))
+            .sort((a, b) => b[1] - a[1]);
+        return ranked.length > 0 ? ranked[0][0] : catalogItems[0];
+    }
+
+    // A leash (ItemNeckRestraints/CollarLeash) needs a collar in the ItemNeck
+    // slot to attach to. Call this right before applying a leash: if the target
+    // isn't already wearing a collar, apply the most popular one with the SAME
+    // lock property the leash is getting, so the two release together. Never
+    // overwrites an existing collar. Returns true only if a collar was added
+    // (so teardown knows to remove it — an already-present collar is left alone).
+    private ensureCollarForLeash(memberNumber: number, lockProperty: any): boolean {
+        const hasCollar = this.roomCharacters.get(memberNumber)?.Appearance
+            ?.some((item: any) => item?.Group === "ItemNeck" && item?.Name);
+        if (hasCollar) return false;
+        const collarName = this.pickTopCollar();
+        if (!collarName) return false;
+        this.bot.applyItem(memberNumber, "ItemNeck", collarName, "Default", lockProperty);
+        return true;
+    }
+
     // Top-N most popular items for this slot (from this bot's own usage
     // data), filled out with random catalog items so the list is never
     // sparse on a cold start (StripDiceBot's shared picker instead falls
@@ -4994,11 +5261,18 @@ export class WinnersDiceGame {
         const catalogItems = this.itemCatalog.get(group) ?? [];
         const usage = this.bondageUsage[group] ?? {};
 
-        const options: string[] = Object.entries(usage)
-            .filter(([name, count]) => count > 0 && !excluded.includes(name) && catalogItems.includes(name))
+        // Pin any new items for this slot to the front (see NEW_ITEMS) so
+        // players always see the latest gear regardless of usage history.
+        const options: string[] = [...NEW_ITEMS].filter(
+            n => catalogItems.includes(n) && !excluded.includes(n)
+        );
+        for (const [name] of Object.entries(usage)
+            .filter(([name, count]) => count > 0 && !excluded.includes(name) && catalogItems.includes(name) && !options.includes(name))
             .sort((a, b) => b[1] - a[1])
-            .slice(0, PICK_LIST_TOP_N)
-            .map(([name]) => name);
+            .slice(0, PICK_LIST_TOP_N)) {
+            if (options.length >= PICK_LIST_TOP_N) break;
+            options.push(name);
+        }
         const popularCount = options.length;
 
         const rest = catalogItems.filter(n => !options.includes(n) && !excluded.includes(n));
@@ -5013,8 +5287,9 @@ export class WinnersDiceGame {
     private formatBondagePickList(slotDisplay: string, wearerName: string, options: string[], hasRandom: boolean): string {
         const lines = [`Slot: ${slotDisplay} — pick an item to apply to ${wearerName}:`];
         options.forEach((name, i) => {
+            const newMarker = NEW_ITEMS.has(name) ? " 🆕 new!" : "";
             const marker = hasRandom && i === options.length - 1 ? ` ← random pick (not in top ${PICK_LIST_TOP_N})` : "";
-            lines.push(`${i + 1}. ${name}${marker}`);
+            lines.push(`${i + 1}. ${name}${newMarker}${marker}`);
         });
         lines.push("0. Back");
         lines.push("Or type any item name from this slot.");
@@ -5134,6 +5409,46 @@ export class WinnersDiceGame {
         this.bot.whisper(sender, `⏳ Offer sent to ${this.playerName(match.placerMemberNumber)}. Waiting for their response...${lockFeeNote}`);
     }
 
+    // Shop-menu entry point for a bondage buyout — same deal as !buybondage,
+    // just prompting for the slot instead of requiring it as a command
+    // argument. Only reachable when the wearer actually has bondage on.
+    private startBondageBuyback(sender: number): void {
+        const state = this.state;
+        if (!state.players) return;
+        if (this.blockedByShopDeal(sender)) return;
+        if (this.blockedByWardrobe(sender)) return;
+
+        const worn = state.activeBondage.filter(b => b.wearerMemberNumber === sender);
+        if (worn.length === 0) {
+            this.bot.whisper(sender, "You don't have any bondage on right now.");
+            return;
+        }
+
+        const placer = state.players.find(p => p.memberNumber !== sender)!;
+
+        state.bondageDeal = {
+            kind: "removal",
+            placer: placer.memberNumber,
+            wearer: sender,
+            slot: null,
+            itemName: null,
+            itemOptions: [],
+            price: null,
+            counterPrice: null,
+            stage: "awaiting_removal_slot",
+            pendingFuzzyItem: null,
+            negotiationStep: 0,
+            initiatorFloor: null,
+            responderCeiling: null,
+        };
+
+        this.bot.whisper(sender,
+            `Which of your items would you like to buy back?\n` +
+            worn.map((b, i) => `${i + 1}. ${b.slot} — ${b.itemName}`).join("\n") +
+            `\n0. Back`
+        );
+    }
+
     // !removebondage <slot> — free, instant, placer-only.
     private handleRemoveBondage(sender: number, args: string): void {
         const state = this.state;
@@ -5238,6 +5553,10 @@ export class WinnersDiceGame {
                 if (sender !== deal.placer) return false;
                 return this.handleBondageSlotChoice(deal, raw);
 
+            case "awaiting_removal_slot":
+                if (sender !== deal.wearer) return false;
+                return this.handleBondageRemovalSlotChoice(deal, raw);
+
             case "awaiting_item":
                 if (sender !== deal.placer) return false;
                 return this.handleBondageItemChoice(deal, raw);
@@ -5297,6 +5616,43 @@ export class WinnersDiceGame {
         deal.itemOptions = options;
         deal.stage = "awaiting_item";
         this.sendLongWhisper(deal.placer, this.formatBondagePickList(match.display, wearerName, options, hasRandom));
+        return true;
+    }
+
+    // Wearer's slot pick for a shop-menu-initiated buyout (see
+    // startBondageBuyback) — mirrors handleBuyBondage's tail once the slot
+    // is known: straight to asking the placer for a price, no item pick.
+    private handleBondageRemovalSlotChoice(deal: BondageDeal, raw: string): boolean {
+        const worn = this.state.activeBondage.filter(b => b.wearerMemberNumber === deal.wearer);
+
+        const trimmed = raw.trim();
+        if (trimmed === "0") {
+            this.handleBondageDealCancel(deal.wearer);
+            return true;
+        }
+
+        const idx = /^\d+$/.test(trimmed) ? parseInt(trimmed, 10) : null;
+        const match = (idx !== null && idx >= 1 && idx <= worn.length) ? worn[idx - 1] : null;
+        if (!match) {
+            this.bot.whisper(deal.wearer,
+                `That's not a valid number. Choose one:\n` +
+                worn.map((b, i) => `${i + 1}. ${b.slot} — ${b.itemName}`).join("\n") + `\n0. Back`);
+            return true;
+        }
+
+        deal.slot = match.slot;
+        deal.itemName = match.itemName;
+        deal.stage = "awaiting_price";
+
+        const slotLock = this.state.activeLocks.find(l => l.wearerMemberNumber === deal.wearer && l.slot === match.slot);
+        const lockFeeNote = slotLock
+            ? ` Note: this slot has a lock — a removal fee of ${this.lockRemovalCost(slotLock)} pts will be added to the final buyout price.`
+            : "";
+        const lockNote = slotLock ? ` (slot has a lock — wearer will also pay the ${this.lockRemovalCost(slotLock)} pt lock removal fee)` : "";
+
+        this.bot.whisper(deal.placer,
+            `${this.playerName(deal.wearer)} wants to buy back the ${match.itemName} on their ${match.slot}. How many points do you want to charge for removal?${lockNote}`);
+        this.bot.whisper(deal.wearer, `⏳ Offer sent to ${this.playerName(deal.placer)}. Waiting for their response...${lockFeeNote}`);
         return true;
     }
 
@@ -6891,6 +7247,9 @@ export class WinnersDiceGame {
         if (state.activeEndGame) {
             clearTimeout(state.activeEndGame.timer);
             this.bot.removeItem(state.activeEndGame.loserMemberNumber, END_GAME_LEASH_GROUP);
+            if (state.activeEndGame.collarAdded) {
+                this.bot.removeItem(state.activeEndGame.loserMemberNumber, "ItemNeck");
+            }
             state.activeEndGame = null;
         }
     }
@@ -7126,6 +7485,7 @@ export class WinnersDiceGame {
             this.bot.sendChat(`🎲 ${name} is back! The game continues.`);
         }
 
+        const isNewPlayer = !this.playerRecords[String(memberNumber)];
         this.recordPlayerSeen(memberNumber, name);
 
         // Multi-room mode (room bot): a join by one of the two players
@@ -7141,6 +7501,7 @@ export class WinnersDiceGame {
             this.sendWelcomeWhisper(memberNumber, name);
         }
 
+        this.nudgeChangelogIfBehind(memberNumber, isNewPlayer);
         this.notifyFeedbackStatus(memberNumber, name);
     }
 
@@ -7173,6 +7534,84 @@ export class WinnersDiceGame {
             : `There's a game in progress right now — feel free to watch!`;
 
         this.sendLongWhisper(memberNumber, intro + closing);
+    }
+
+    // ---- changelog ---------------------------------------------------
+
+    private loadChangelog(): ChangelogEntry[] {
+        try {
+            const parsed = JSON.parse(fs.readFileSync(this.changelogPath, "utf8"));
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+
+    // Records a shipped update so !changelog can report it later. Called from
+    // index.ts on startup. A no-op if the version is already recorded, which
+    // is what keeps the lobby and room bots from double-appending the same
+    // entry to the changelog.json they share.
+    public recordUpdate(entry: ChangelogEntry): void {
+        const entries = this.loadChangelog();
+        if (entries.some(e => e.version === entry.version)) return;
+        entries.push(entry);
+        try {
+            const trimmed = entries.slice(-CHANGELOG_MAX_ENTRIES);
+            fs.writeFileSync(this.changelogPath, JSON.stringify(trimmed, null, 2), "utf8");
+        } catch (err) {
+            logError(`[WD] Failed to write changelog.json: ${err}`);
+        }
+    }
+
+    // The version a returning player is compared against — null when nothing
+    // has shipped yet, which suppresses the nudge entirely.
+    private latestChangelogVersion(): string | null {
+        const entries = this.loadChangelog();
+        return entries.length ? entries[entries.length - 1].version : null;
+    }
+
+    // One short line on join for players who were away when something shipped,
+    // replacing the old habit of posting the whole update into room chat.
+    // Skipped for first-time visitors, who have no absence to catch up on.
+    private nudgeChangelogIfBehind(memberNumber: number, isNewPlayer: boolean): void {
+        if (isNewPlayer) return;
+        const latest = this.latestChangelogVersion();
+        if (!latest) return;
+        const record = this.playerRecords[String(memberNumber)];
+        if (record?.lastChangelogVersion === latest) return;
+
+        this.bot.whisper(memberNumber,
+            `📋 I've been updated since your last visit — whisper !changelog to see what changed.`
+        );
+    }
+
+    private handleChangelog(memberNumber: number): void {
+        const entries = this.loadChangelog();
+        if (!entries.length) {
+            this.bot.whisper(memberNumber, "No changes recorded yet — you're up to date!");
+            return;
+        }
+
+        const shown = entries.slice(-CHANGELOG_ENTRIES_SHOWN).reverse();
+        const lines = shown.map(entry => {
+            const date = entry.version.split("T")[0] || entry.version;
+            const detail = entry.detail ? `\n${entry.detail}` : "";
+            return `— ${date} —\n${entry.headline}${detail}`;
+        });
+
+        const older = entries.length - shown.length;
+        const footer = older > 0 ? `\n\n(${older} older ${older === 1 ? "change" : "changes"} not shown.)` : "";
+
+        this.sendLongWhisper(memberNumber,
+            `=== What's New in WinnersDice ===\n\n${lines.join("\n\n")}${footer}`
+        );
+
+        // Mark caught up so the join nudge stops until the next update ships.
+        const record = this.playerRecords[String(memberNumber)];
+        if (record) {
+            record.lastChangelogVersion = entries[entries.length - 1].version;
+            this.savePlayerRecords();
+        }
     }
 
     private loadPlayerRecords(): void {
@@ -7610,27 +8049,19 @@ export class WinnersDiceGame {
     // ============================================================
 
     private checkPendingUpdate(): boolean {
-        if (!fs.existsSync(this.pendingUpdatePath)) return false;
+        const current = readPendingUpdate();
+        if (!current) return false;
+        if (current.version === getSeenVersion(botRole)) return false;
 
-        let note = "";
-        try {
-            note = fs.readFileSync(this.pendingUpdatePath, "utf8").trim();
-        } catch {
-            note = "";
-        }
-
+        const note = current.note;
         const message = note
             ? `Heads up — I'll be restarting shortly for an update: ${note}. Be right back!`
             : `Heads up — I'll be restarting shortly for an update. Be right back!`;
 
         this.bot.sendChat(message);
-        log(`Pending update detected${note ? ` (${note})` : ""}. Restarting...`);
+        log(`Pending update detected (version ${current.version})${note ? ` (${note})` : ""}. Restarting...`);
 
-        try {
-            fs.unlinkSync(this.pendingUpdatePath);
-        } catch (err) {
-            logError(`[WD] Failed to delete pending_update.txt: ${err}`);
-        }
+        markVersionSeen(botRole, current.version);
 
         setTimeout(() => {
             process.exit(0);

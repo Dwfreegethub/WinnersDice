@@ -26,6 +26,8 @@
 
 ## Known Issues / Limitations
 
+- **Multi-room: the lobby and room bots can silently drift out of sync** — idea from DW, 2026-07-17. `winnersdice` (lobby) and `winnersdice-room1` (gamebot1) share one directory/git checkout/build, and coordinate restarts through a single shared `pending_update.txt`. The risk: `checkPendingUpdate()` reads *and deletes* that file the first time either process hits one of its own checkpoints (`!challenge`, match end) — so whichever process happens to check first consumes the note and restarts onto the new build, but the *other* process never sees it and just keeps running the old code indefinitely, with no indication anything's wrong. `pending_update.txt` limits how bad this can get (both usually restart close together in practice) but doesn't prevent it. Not urgent — no fix designed yet. Options to consider later: per-role pending-update files instead of one shared one, a version/build-hash check the two processes could cross-verify against each other, or just always restarting both together from the panel instead of relying on self-detection.
+
 - **Buyback: no wardrobe detection on re-equip**
   BC's ChatRoomSyncSingle fires on wardrobe changes but cannot distinguish clothing being *added* vs *removed*. When a player buys back their item, there's no way to detect them putting it back on. Buyback flow skips wardrobe monitoring — player just re-equips on their own after payment (confirmed unchanged in `startBuyback`/`handleBuybackResponse`). If we ever find a BC API event that signals item equipped, revisit this.
 
@@ -63,14 +65,23 @@ _(add items here as they come up during playtesting)_
 
 - Test safeword in BD (StripDiceBot) — verify BD's Action message pattern catches the safeword event and triggers full bondage removal + game stop.
 - Test permission pre-flight: join a game with AllowItem disabled in BC settings and verify the bot blocks the challenge with the correct whisper message.
+- **R130 items with unverified codenames** — new R130 restraints left OUT of `bc_items.json` because their exact BC asset codenames couldn't be found in the R130 `Female3DCG.js` (guessing risks silent apply-failure). To verify: apply the item in-game, then read the wrapper log's `ChatRoomSyncItem` for the real `Name` field, then add to `bc_items.json` (shared, both bots) and to `NEW_ITEMS` in `bondagePicker.ts` to spotlight it.
+  - ~~**Chastity Tunnel Piercings** (KyraObscura)~~ — RESOLVED 2026-07-19: DW applied it in-game; real codename is `ModularVulvaPiercings` in `ItemVulvaPiercings` ("Tunnel" is a modular type-option inside it, which is why the display name never matched an asset). Added to `bc_items.json` + `NEW_ITEMS`.
+  - ~~**Leashable Front Hand Tie** (Sarah)~~ — CLOSED 2026-07-19 (DW): it's a modular option of the existing `HempRope` item (already in the list), not a standalone asset. Nothing to add.
+  - For reference, the R130 changelog also mentioned `CageMuzzle` (already in the list) and `FullBodyStraps` (BC group `ItemAddon`, which the picker doesn't use — intentionally skipped).
+  - All R130 restraints now accounted for — this item can be removed from Pending Tests whenever the file's next tidied.
 
 ---
 
 ## Completed
 
+### Completed 2026-07-16
+- **End-game bidding reworked** (superseded the 2026-07-13 gap-close design below): Q1 is now the winner's real target (`originalMinutes`), not just an opening ask. Loser spends points to cut `currentMinutes` down — uncapped on their first move (can go to 0, which no longer auto-blocks — it just passes to the winner), capped at a flat 10% of `originalMinutes` on their second move only. Winner can spend to raise it back, capped so they can never exceed 90% of `originalMinutes` no matter how many rounds happen. Winner also gets an explicit **decline** option at either of their turns (new — previously only "no flat decline on this one"), which blocks the deal and burns whatever the current numbers implied on both sides, no refunds — same as before, just triggered by the winner's own choice instead of the loser cutting to ≤0. Both sides' "your turn" whispers now include the actual reply options and current caps, not just bare numbers (`sendEndGameStateWhisper`). Not live-tested yet.
+- **Better context on the "What next?" and shop screens**: typing `H`/help there no longer dumps the full `!help shop` catalog — just a couple of usage-mechanics tips (balance is safe either way, numbers-only replies, everything but boost negotiates a price) scoped to whichever of the two screens is actually showing.
+
 ### Completed 2026-07-13
-- **End-game 10% gap-close rule**: `applyEndGameLoserCounter`/`applyEndGameWinnerCounter` now enforce a 10% gap-close requirement on every counter, regardless of gap size. Player is told the minimum if they go under.
-- **End-game bidding hints**: loser's proposal delivery whisper now explains the negotiation mechanics (1pt/min cost, how the loser's counter affects their own balance, block mechanic, 5-step binding rules, gap-close rule) and shows both players' current balances. Winner gets a parallel whisper with their floor and balance.
+- ~~**End-game 10% gap-close rule**~~: superseded 2026-07-16 above — see that entry.
+- ~~**End-game bidding hints**~~: superseded 2026-07-16 above — the loser's delivery whisper and winner's parallel whisper were both rewritten for the new mechanic.
 - **In-room standby + `!done` command**: when Q2 = stay in this room, bot whispers the winner it's standing by and they can type `!done` to end early. `!done` cancels the timer and calls `expireEndGame()` immediately. Only active in in-room end games.
 - **Clothing deal upgraded to 5-step negotiation engine** — `ClothingDeal` in `types.ts` now has `negotiationStep`, `initiatorFloor`, `responderCeiling`. Counter/accept flow rewired through `applyInitiatorOffer`/`applyResponderCounter` with Rule A (first-counter cap) and Rule B (10%-gap-close floor), matching all other deal types. Cancel remains symmetric for both parties.
 

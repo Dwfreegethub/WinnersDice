@@ -8,6 +8,7 @@ const HEARTBEAT_TIMEOUT = 3 * 60 * 1000; // 3 minutes without ServerInfo = assum
 export class BCConnection {
     private socket: Socket;
     private playerNumber: number = 0;
+    private friendList: number[] = [];
     private connected: boolean = false;
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private onReconnectCallback: (() => void) | null = null;
@@ -49,6 +50,8 @@ export class BCConnection {
                 }
                 this.playerNumber = data.MemberNumber;
                 this.connected = true;
+                this.friendList = Array.isArray(data.FriendList) ? data.FriendList.slice() : [];
+                log(`Friend list loaded: ${this.friendList.length} entries.`);
 
                 this.socket.emit("AccountUpdate", {
                     Inventory:      data.Inventory      ?? [],
@@ -279,9 +282,6 @@ export class BCConnection {
             "ChatRoomMessage",
             "ChatRoomSyncItem",
             "ChatRoomSyncSingle",
-            "ChatRoomSyncCharacter",
-            "ChatRoomSyncExpression",
-            "ServerInfo",
             "AccountBeep",
         ];
         events.forEach(event => {
@@ -317,6 +317,38 @@ export class BCConnection {
 
     public getMemberNumber(): number {
         return this.playerNumber;
+    }
+
+    public isFriend(memberNumber: number): boolean {
+        return this.friendList.includes(memberNumber);
+    }
+
+    public getFriendCount(): number {
+        return this.friendList.length;
+    }
+
+    // BC's friend list is mutual-gated: a player only sees the bot if the bot
+    // lists them back. The server takes FriendList as a whole-array replace,
+    // so the full list goes out every time. It is persisted server-side and
+    // returned on the next login. Note this room idles at Visibility ["Admin"],
+    // so friends see only that the bot is online — the server withholds the
+    // room name and headcount for restricted rooms unless a match has been
+    // configured public via configureRoomForMatch.
+    public addFriend(memberNumber: number): boolean {
+        if (!memberNumber || this.friendList.includes(memberNumber)) return false;
+        this.friendList.push(memberNumber);
+        this.socket.emit("AccountUpdate", { FriendList: this.friendList });
+        log(`Friended #${memberNumber} (${this.friendList.length} total).`);
+        return true;
+    }
+
+    public removeFriend(memberNumber: number): boolean {
+        const index = this.friendList.indexOf(memberNumber);
+        if (index < 0) return false;
+        this.friendList.splice(index, 1);
+        this.socket.emit("AccountUpdate", { FriendList: this.friendList });
+        log(`Unfriended #${memberNumber} (${this.friendList.length} total).`);
+        return true;
     }
 
     public isConnected(): boolean {
