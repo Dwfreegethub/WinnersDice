@@ -8,6 +8,26 @@ export interface Player {
     name: string;
 }
 
+// One worn appearance item (clothing or bondage) inside a character's
+// Appearance array. Name/Color/Property are exactly what the bot needs to
+// re-apply (restore) an item later — see the wardrobe helper.
+export interface BCAppearanceItem {
+    Group: string;
+    Name?: string;
+    Color?: string | string[];
+    Property?: any;
+    [key: string]: any;
+}
+
+// One clothing item the wardrobe helper detected coming off a player during
+// a match, remembered so !redress can put it back exactly (see
+// design_wardrobe_helper.md §5.4).
+export interface RemovedClothingEntry {
+    group: string;
+    item: BCAppearanceItem;   // full Name/Color/Property record at removal time
+    removedAt: number;        // Date.now() at detection
+}
+
 // Minimal shape of a Bondage Club character record, as seen in
 // ChatRoomSync / ChatRoomSyncMemberJoin payloads.
 export interface BCCharacter {
@@ -17,6 +37,7 @@ export interface BCCharacter {
     ItemPermission?: number;
     WhiteList?: number[];
     GameVersion?: string;
+    Appearance?: BCAppearanceItem[];
     OnlineSharedSettings?: {
         // Global toggle — false means this player has blocked all item interactions from others.
         AllowItem?: boolean;

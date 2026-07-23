@@ -10,6 +10,8 @@ import {
     ActiveLock,
     ActiveToy,
     BCCharacter,
+    BCAppearanceItem,
+    RemovedClothingEntry,
     Player,
     BondageDeal,
     ClothingDeal,
@@ -264,6 +266,26 @@ const END_GAME_LOCK_SLOTS = ["ItemLegs", "ItemFeet", "ItemArms", "ItemHands", "I
 const END_GAME_LEASH_GROUP = "ItemNeckRestraints";
 const END_GAME_LEASH_ITEM = "CollarLeash";
 
+// ── Wardrobe helper (see design_wardrobe_helper.md) ──────────────────────
+// Body/cosmetic/expression appearance groups that are NOT clothing. Used as a
+// DENYLIST: a group is "clothing-relevant" iff its name does NOT start with
+// "Item" (that prefix is the bondage/restraint system, handled elsewhere) AND
+// it is not in this set. A denylist means new/updated addon clothing slots
+// (e.g. the "Luzi" community addon, updated independently of this bot) are
+// treated as clothing automatically, without a code change. Over-including a
+// borderline cosmetic item just adds a cheap extra candidate to a confirm
+// list; under-including would silently miss a real garment — so we err toward
+// including. Seeded from real production sync data; extend if new ones show up.
+const NON_CLOTHING_GROUPS = new Set<string>([
+    "ArmsLeft", "ArmsRight", "HandsLeft", "HandsRight", "Height", "BodyStyle", "BodyUpper", "BodyLower",
+    "Eyebrows", "Eyes", "Eyes2", "EyeShadow", "Mouth", "Nipples", "Pussy", "Pronouns", "Head", "Blush",
+    "Fluids", "Emoticon", "HairFront", "HairBack", "FacialHair", "BodyMarkings", "BodyMarkings2",
+    "Decals",
+    // Luzi addon cosmetic (non-clothing) slots seen in production:
+    "额外身高_Luzi", "额外头发_Luzi", "新前发_Luzi", "新后发_Luzi", "新前发_Luzi_stack",
+    "新后发_Luzi_stack", "左眼_Luzi", "右眼_Luzi", "身体痕迹_Luzi", "外观工具",
+]);
+
 // When the loser has no collar for the leash to attach to, we add this one.
 // Deliberately a plain, un-typed collar (LeatherCollar has no style/type
 // record): a lock-only Property is a COMPLETE valid property for it, so the
@@ -272,6 +294,10 @@ const END_GAME_LEASH_ITEM = "CollarLeash";
 // by BC when applied with a property that omits its type record. See
 // ensureCollarForLeash.
 const END_GAME_FRESH_COLLAR_ITEM = "LeatherCollar";
+
+// How long a !stuck / !redress numbered pick waits for the player's reply
+// before it's dropped.
+const WARDROBE_PICK_TIMEOUT_MS = 2 * 60 * 1000;
 
 // Word bank for the end-game timer/password lock's password (see
 // buildTimerPasswordLockProperty). Deliberately letters-only — BC's
@@ -640,6 +666,40 @@ export class WinnersDiceGame {
     // by member number. Used for permission pre-flight checks.
     private roomCharacters: Map<number, BCCharacter> = new Map();
 
+    // ── Wardrobe helper state (see design_wardrobe_helper.md) ────────────
+    // Last-known full item record (Name/Color/Property) for every appearance
+    // Group ever seen on a match participant, keyed `${memberNumber}:${Group}`.
+    // Unlike roomCharacters (replaced wholesale each sync, so a removed item's
+    // old value is lost), this is updated per-Group and NEVER cleared when a
+    // Group disappears — so it doubles as "last known state" memory, letting
+    // !redress re-apply an item exactly even after it's been off for a while.
+    private wardrobeItemCache: Map<string, BCAppearanceItem> = new Map();
+
+    // Per-player history of clothing-relevant items the bot detected coming
+    // off during the current match, most-recent-last. Feeds !redress. Session-
+    // scoped: survives a reconnect (teardown paths don't run on reconnect) but
+    // is cleared on reset / safeword / match end, same lifecycle as
+    // pendingWardrobeChecks.
+    private removedClothingHistory: Map<number, RemovedClothingEntry[]> = new Map();
+
+    // A !stuck / !redress numbered pick awaiting the invoker's reply. Self-only
+    // in v1, so memberNumber is both the invoker and the target.
+    private pendingWardrobeAction: {
+        memberNumber: number;
+        kind: "stuck" | "redress";
+        options: Array<{ group: string; item: BCAppearanceItem }>;
+        timer: NodeJS.Timeout;
+    } | null = null;
+
+    // Admin !testredress numbered pick awaiting the admin's reply. Unlike
+    // pendingWardrobeAction, invoker (adminNumber) and target differ.
+    private pendingTestRedress: {
+        adminNumber: number;
+        target: number;
+        options: Array<{ group: string; item: BCAppearanceItem }>;
+        timer: NodeJS.Timeout;
+    } | null = null;
+
     // Full BC item catalog (group -> item names), shared read-only reference
     // living one level above both bots' repos. Missing/invalid file disables
     // bondage purchases rather than crashing the bot (itemCatalog.size === 0).
@@ -969,6 +1029,18 @@ export class WinnersDiceGame {
             case "!testcufflock":
                 this.handleTestCuffLock(sender, args);
                 break;
+            case "!teststrip":
+                this.handleTestStrip(sender, args);
+                break;
+            case "!testredress":
+                this.handleTestRedress(sender, args);
+                break;
+            case "!stuck":
+                this.handleStuck(sender, args);
+                break;
+            case "!redress":
+                this.handleRedress(sender, args);
+                break;
             case "!removed":
                 this.handleRemovedConfirmation(sender);
                 break;
@@ -1029,6 +1101,18 @@ export class WinnersDiceGame {
         // challenger's next reply picks which one, before any negotiation exists.
         if (this.pendingChallengeDisambiguation?.challengerNumber === sender) {
             this.handleChallengeDisambiguationAnswer(sender, msg);
+            return;
+        }
+
+        // A numbered reply to a pending !stuck / !redress pick. Checked ahead of
+        // the playing-phase menus so the number resolves the wardrobe choice the
+        // player just opened rather than being read as a menu selection.
+        if (this.pendingWardrobeAction?.memberNumber === sender && this.resolveWardrobeSelection(sender, msg)) {
+            return;
+        }
+
+        // Admin numbered reply to a pending !testredress list.
+        if (this.pendingTestRedress?.adminNumber === sender && this.resolveTestRedressSelection(sender, msg)) {
             return;
         }
 
@@ -1376,7 +1460,9 @@ export class WinnersDiceGame {
             `!press - Roll again, risking your current pot\n` +
             `!endgame - End the match early (after minimum rounds)\n` +
             `!mercy - Concede early: forfeit half your points and owe a service\n` +
-            `!pause / !resume - Pause or resume the bot (either player — useful for RP)\n\n` +
+            `!pause / !resume - Pause or resume the bot (either player — useful for RP)\n` +
+            `!stuck [item] - Bound and can't reach your clothes? I'll take a garment off for you\n` +
+            `!redress [item] - Put a garment I took off back on\n\n` +
             `=== Streaks, Boosts & Curses ===\n` +
             `Each win: dice + streak + boost → pot × round multiplier\n` +
             `Natural 20 always wins the roll outright (+2 streak). Natural 1 always loses it outright, plus -1 to your rolls until you win.\n` +
@@ -1423,7 +1509,9 @@ export class WinnersDiceGame {
             `!setstreak <n> - Set streak bonus cap (default ${DEFAULT_MAX_STREAK})\n` +
             `!setstatus <memberNumber> <status> - Update a player's feedback status\n` +
             `!feedback list - View all feedback\n` +
-            `!testlock [@name] - Instantly apply a test timer/password lock (self by default) - no match needed`;
+            `!testlock [@name] - Instantly apply a test timer/password lock (self by default) - no match needed\n` +
+            `!teststrip [@name] [group] - Report clothing act/advise verdict + worn items; if a group is named, try to remove it (wardrobe-helper live test)\n` +
+            `!testredress @name [number|group] - List what you took off that player, numbered; reply a number (or pass one, e.g. "bra") to put it back on`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -3433,6 +3521,7 @@ export class WinnersDiceGame {
         }
 
         this.clearPendingWardrobeChecks();
+        this.clearWardrobeHelperState();
         this.releaseAllActiveLocks();
         this.releaseBondageFor(winner.memberNumber);
         // Session's over — fully free the loser too: everything's just been
@@ -3670,6 +3759,7 @@ export class WinnersDiceGame {
         }
 
         this.clearPendingWardrobeChecks();
+        this.clearWardrobeHelperState();
         this.clearEndGameState();
         this.releaseAllActiveLocks();
         this.releaseAllActiveBondage();
@@ -6782,6 +6872,496 @@ export class WinnersDiceGame {
     }
 
     // ============================================================
+    // WARDROBE HELPER (see design_wardrobe_helper.md)
+    // ============================================================
+    //
+    // Players often apply bondage BEFORE stripping, ending up bound (can't use
+    // their own hands in BC) while still dressed. This lets the bot act as
+    // their hands: !stuck takes a garment off, !redress puts a remembered one
+    // back. Both are whisper-only and self-target in v1, usable during a match.
+    // The bot acts directly when the target's item permissions allow it, and
+    // otherwise advises the other player (who may have permission the bot
+    // lacks). All of it is driven by passive appearance memory populated from
+    // the normal room syncs — see ingestAppearance.
+
+    // A group is "clothing-relevant" iff it isn't a bondage/restraint group
+    // (those start with "Item", handled by activeBondage/activeLocks) and isn't
+    // a body/cosmetic group in the denylist. See NON_CLOTHING_GROUPS.
+    private isClothingGroup(group: string): boolean {
+        if (!group) return false;
+        if (group.startsWith("Item")) return false;
+        return !NON_CLOTHING_GROUPS.has(group);
+    }
+
+    // Called for every character sync (before roomCharacters is overwritten, so
+    // it can diff the previous appearance against the fresh one). Only tracks
+    // the two match participants — that's the only time !stuck/!redress apply,
+    // and it bounds the memory to two players. Detects clothing coming off
+    // (records it for !redress) and going back on (drops it from the history),
+    // and keeps wardrobeItemCache as never-cleared last-known state for exact
+    // restoration later.
+    private ingestAppearance(memberNumber: number, char: BCCharacter): void {
+        if (!this.isMatchParticipant(memberNumber)) return;
+
+        const newAppearance = Array.isArray(char.Appearance) ? char.Appearance : [];
+        const prev = this.roomCharacters.get(memberNumber);
+        const prevAppearance = Array.isArray(prev?.Appearance) ? prev!.Appearance! : [];
+
+        const wornBefore = new Map<string, BCAppearanceItem>();
+        for (const it of prevAppearance) {
+            if (it?.Group && it?.Name) wornBefore.set(it.Group, it);
+        }
+        const wornNow = new Set<string>();
+        for (const it of newAppearance) {
+            if (it?.Group && it?.Name) wornNow.add(it.Group);
+        }
+
+        // Removed: clothing-relevant group worn before, gone now.
+        for (const [group, item] of wornBefore) {
+            if (!this.isClothingGroup(group)) continue;
+            if (!wornNow.has(group)) {
+                const record = this.wardrobeItemCache.get(`${memberNumber}:${group}`) ?? item;
+                this.recordClothingRemoval(memberNumber, group, record);
+            }
+        }
+        // Restored: clothing-relevant group worn now but not before — drop it
+        // from the removal history so a re-equipped item doesn't linger.
+        for (const group of wornNow) {
+            if (!wornBefore.has(group) && this.isClothingGroup(group)) {
+                this.dropFromRemovalHistory(memberNumber, group);
+            }
+        }
+
+        // Update never-cleared last-known cache from the fresh appearance.
+        for (const it of newAppearance) {
+            if (it?.Group && it?.Name) {
+                this.wardrobeItemCache.set(`${memberNumber}:${it.Group}`, it);
+            }
+        }
+    }
+
+    // Records a detected clothing removal, one entry per group (most-recent
+    // wins), most-recent-last.
+    private recordClothingRemoval(memberNumber: number, group: string, item: BCAppearanceItem): void {
+        const list = (this.removedClothingHistory.get(memberNumber) ?? []).filter(e => e.group !== group);
+        list.push({ group, item, removedAt: Date.now() });
+        this.removedClothingHistory.set(memberNumber, list);
+    }
+
+    private dropFromRemovalHistory(memberNumber: number, group: string): void {
+        const list = this.removedClothingHistory.get(memberNumber);
+        if (!list) return;
+        const filtered = list.filter(e => e.group !== group);
+        if (filtered.length) this.removedClothingHistory.set(memberNumber, filtered);
+        else this.removedClothingHistory.delete(memberNumber);
+    }
+
+    // Cleared on reset / safeword / match end (NOT on reconnect). Leaves
+    // wardrobeItemCache in place — it's harmless last-known memory that just
+    // re-populates from the next match's syncs.
+    private clearWardrobeHelperState(): void {
+        if (this.pendingWardrobeAction) {
+            clearTimeout(this.pendingWardrobeAction.timer);
+            this.pendingWardrobeAction = null;
+        }
+        this.clearPendingTestRedress();
+        this.removedClothingHistory.clear();
+    }
+
+    private clearPendingWardrobeActionFor(memberNumber: number): void {
+        if (this.pendingWardrobeAction?.memberNumber === memberNumber) {
+            clearTimeout(this.pendingWardrobeAction.timer);
+            this.pendingWardrobeAction = null;
+        }
+    }
+
+    // Whether the bot can directly applyItem/removeItem on this target right
+    // now. Mirrors the bondage-club-bot-hub posture: gate on ItemPermission
+    // rather than trying to force through a closed one. Level 0 = everyone;
+    // 1 = whitelist only (bot must be on it); 2+ = owner/lover/nobody tiers the
+    // bot can't satisfy. AllowItem === false is a hard global block.
+    private canActOnAppearance(targetMemberNumber: number): boolean {
+        const char = this.roomCharacters.get(targetMemberNumber);
+        if (!char) return false;
+        if (char.OnlineSharedSettings?.AllowItem === false) return false;
+        const level = char.ItemPermission ?? 0;
+        if (level === 0) return true;
+        if (level === 1) return (char.WhiteList ?? []).includes(this.bot.getMemberNumber());
+        return false;
+    }
+
+    // Clothing-relevant items currently worn (has a Name), from live appearance.
+    private wornClothingItems(memberNumber: number): Array<{ group: string; item: BCAppearanceItem }> {
+        const char = this.roomCharacters.get(memberNumber);
+        const appearance = Array.isArray(char?.Appearance) ? char!.Appearance! : [];
+        const out: Array<{ group: string; item: BCAppearanceItem }> = [];
+        for (const it of appearance) {
+            if (it?.Group && it?.Name && this.isClothingGroup(it.Group)) {
+                out.push({ group: it.Group, item: it });
+            }
+        }
+        return out;
+    }
+
+    // "Group: Pretty Name" — CamelCase split for ASCII names, non-ASCII (e.g.
+    // Chinese item names) passed through unchanged.
+    private formatItemLabel(group: string, item: BCAppearanceItem): string {
+        const name = item?.Name ?? "(unknown)";
+        const pretty = /[^\x00-\x7F]/.test(name) ? name : name.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+        return `${group}: ${pretty}`;
+    }
+
+    // Strips lock-related fields from a stored Property before re-applying an
+    // item (a garment that was ever locked shouldn't come back locked). Same
+    // lesson as the end-game collar bug — Property is load-bearing.
+    private stripPropertyLocks(property: any): any {
+        if (!property || typeof property !== "object") return {};
+        const {
+            LockedBy, LockMemberNumber, LockMemberName, LockSet, Password,
+            RemoveItem, RemoveTimer, ShowTimer, EnableRandomInput, MemberNumberList,
+            MemberNumberListKeys, CombinationNumber, LockPickSeed, ...rest
+        } = property;
+        if (Array.isArray(rest.Effect)) {
+            rest.Effect = rest.Effect.filter((e: string) => e !== "Lock");
+        }
+        return rest;
+    }
+
+    // Removes one clothing group, then verifies against the next sync and
+    // retries (same pattern as stripWinnerItem). Confirms or advises the
+    // invoker on the outcome.
+    // BC does NOT echo a character's appearance change back to the client that
+    // initiated it — a normal client updates its own local copy on send, but
+    // this headless bot has none, so our roomCharacters model would otherwise
+    // never see a change WE made (confirmed live 2026-07-23: after the bot's
+    // applyItem, zero sync events came back). We patch our own model here so
+    // the wardrobe cache/history and any read-back stay accurate. Player- and
+    // partner-initiated changes are still echoed to us normally and update
+    // roomCharacters through the usual sync handlers.
+    private patchLocalAppearance(target: number, group: string, item: BCAppearanceItem | null): void {
+        const char = this.roomCharacters.get(target);
+        if (!char) return;
+        const appearance = Array.isArray(char.Appearance) ? char.Appearance.slice() : [];
+        const idx = appearance.findIndex((it: any) => it?.Group === group);
+        if (item === null) {
+            if (idx >= 0) appearance.splice(idx, 1);
+        } else if (idx >= 0) {
+            appearance[idx] = item;
+        } else {
+            appearance.push(item);
+        }
+        this.roomCharacters.set(target, { ...char, Appearance: appearance });
+    }
+
+    // `subject` is the possessive used in the confirm whisper — "your" for a
+    // player helping themselves, "<name>'s" for an admin acting on someone else.
+    private actRemoveClothing(target: number, group: string, invoker: number, subject: string, label: string): void {
+        this.bot.removeItem(target, group);
+        this.patchLocalAppearance(target, group, null);
+        this.bot.whisper(invoker, `✅ Took ${subject} ${label} off.`);
+    }
+
+    // Re-applies a remembered clothing item (locks stripped from its property).
+    private actRestoreClothing(target: number, entry: RemovedClothingEntry, invoker: number, subject: string, label: string): void {
+        const property = this.stripPropertyLocks(entry.item.Property);
+        this.bot.applyItem(target, entry.group, entry.item.Name!, entry.item.Color ?? "Default", property);
+        this.patchLocalAppearance(target, entry.group, { ...entry.item, Property: property });
+        this.dropFromRemovalHistory(target, entry.group);
+        this.bot.whisper(invoker, `✅ Put ${subject} ${label} back on.`);
+    }
+
+    // Permission closed — ask the other player to do it by hand (they may have
+    // Owner/Lover-tier access the bot doesn't).
+    private adviseOtherPlayer(stuckPlayer: number, verb: string, group: string, item: BCAppearanceItem): void {
+        const other = this.getOtherPlayerMemberNumber(stuckPlayer);
+        const stuckName = this.playerName(stuckPlayer);
+        const label = this.formatItemLabel(group, item);
+        this.bot.whisper(stuckPlayer,
+            `Your item permissions won't let me change your clothes directly. ` +
+            (other !== null ? `I've asked ${this.playerName(other)} to help with your ${label}.` : `You'll need a hand from your partner.`));
+        if (other !== null) {
+            this.bot.whisper(other,
+                `🧥 ${stuckName} asked me to ${verb} their ${label}, but their item permissions block me. ` +
+                `If you can, please ${verb} their ${group} (${item.Name}) by hand.`);
+        }
+    }
+
+    private promptWardrobeChoice(sender: number, kind: "stuck" | "redress", options: Array<{ group: string; item: BCAppearanceItem }>): void {
+        const lines = options.map((o, i) => `${i + 1}. ${this.formatItemLabel(o.group, o.item)}`);
+        const verb = kind === "stuck" ? "take off" : "put back on";
+        const timer = setTimeout(() => {
+            if (this.pendingWardrobeAction?.memberNumber === sender) {
+                this.pendingWardrobeAction = null;
+                this.bot.whisper(sender, `(Wardrobe pick timed out — whisper !${kind} again if you still need it.)`);
+            }
+        }, WARDROBE_PICK_TIMEOUT_MS);
+        this.pendingWardrobeAction = { memberNumber: sender, kind, options, timer };
+        this.bot.whisper(sender,
+            `⚠️ Heads up: !${kind} is new and not well tested yet — check the result and let DW know if anything's off.\n` +
+            `Which one should I ${verb}? Reply with a number:\n${lines.join("\n")}`);
+    }
+
+    // Numeric reply to a pending !stuck/!redress pick. Routed from
+    // handleConversational. Returns true if it consumed the message.
+    private resolveWardrobeSelection(sender: number, msg: string): boolean {
+        const pending = this.pendingWardrobeAction;
+        if (!pending || pending.memberNumber !== sender) return false;
+        const trimmed = msg.trim();
+        if (!/^\d+$/.test(trimmed)) return false;
+        const idx = parseInt(trimmed, 10);
+        if (idx < 1 || idx > pending.options.length) {
+            this.bot.whisper(sender, `Reply with a number between 1 and ${pending.options.length}.`);
+            return true;
+        }
+        const choice = pending.options[idx - 1];
+        clearTimeout(pending.timer);
+        this.pendingWardrobeAction = null;
+        if (pending.kind === "stuck") this.resolveStuck(sender, choice);
+        else this.resolveRedress(sender, choice);
+        return true;
+    }
+
+    private resolveStuck(sender: number, choice: { group: string; item: BCAppearanceItem }): void {
+        const label = this.formatItemLabel(choice.group, choice.item);
+        if (this.canActOnAppearance(sender)) {
+            this.bot.whisper(sender, `Getting your ${label} off…`);
+            this.actRemoveClothing(sender, choice.group, sender, "your", label);
+        } else {
+            this.adviseOtherPlayer(sender, "take off", choice.group, choice.item);
+        }
+    }
+
+    private resolveRedress(sender: number, choice: { group: string; item: BCAppearanceItem }): void {
+        const label = this.formatItemLabel(choice.group, choice.item);
+        if (this.canActOnAppearance(sender)) {
+            this.bot.whisper(sender, `Putting your ${label} back on…`);
+            this.actRestoreClothing(sender, { group: choice.group, item: choice.item, removedAt: Date.now() }, sender, "your", label);
+        } else {
+            this.adviseOtherPlayer(sender, "put back on", choice.group, choice.item);
+        }
+    }
+
+    // !stuck [description] — take a garment off a bound/stuck player (self, v1).
+    private handleStuck(sender: number, args: string): void {
+        if (this.state.phase !== "playing" || !this.isMatchParticipant(sender)) {
+            this.bot.whisper(sender, "!stuck only works while you're in a match.");
+            return;
+        }
+        this.clearPendingWardrobeActionFor(sender);
+
+        let candidates = this.wornClothingItems(sender);
+        if (candidates.length === 0) {
+            this.bot.whisper(sender, "You're not wearing anything I can help you out of right now.");
+            return;
+        }
+
+        const arg = args.trim().toLowerCase();
+        if (arg) {
+            const needle = arg.replace(/\s+/g, "");
+            const filtered = candidates.filter(c =>
+                c.group.toLowerCase().includes(arg) ||
+                (c.item.Name ?? "").toLowerCase().includes(needle));
+            if (filtered.length) candidates = filtered;
+        }
+
+        this.promptWardrobeChoice(sender, "stuck", candidates);
+    }
+
+    // !redress [description] — put a remembered garment back on (self, v1).
+    private handleRedress(sender: number, args: string): void {
+        if (this.state.phase !== "playing" || !this.isMatchParticipant(sender)) {
+            this.bot.whisper(sender, "!redress only works while you're in a match.");
+            return;
+        }
+        this.clearPendingWardrobeActionFor(sender);
+
+        // Most-recent-first.
+        let history = (this.removedClothingHistory.get(sender) ?? []).slice().reverse();
+        if (history.length === 0) {
+            this.bot.whisper(sender, "I don't have anything on record to put back on you.");
+            return;
+        }
+
+        const arg = args.trim().toLowerCase();
+        if (arg) {
+            const needle = arg.replace(/\s+/g, "");
+            const filtered = history.filter(e =>
+                e.group.toLowerCase().includes(arg) ||
+                (e.item.Name ?? "").toLowerCase().includes(needle));
+            if (filtered.length) history = filtered;
+        }
+
+        const options = history.map(e => ({ group: e.group, item: e.item }));
+        this.promptWardrobeChoice(sender, "redress", options);
+    }
+
+    // !teststrip [@name] [group] — admin-only. Reports the act-or-advise
+    // verdict and worn clothing for a target, and (if a group is named) tries
+    // to remove it, so DW can confirm live whether the bot can strip clothing
+    // off a BOUND player before the rest of the feature is trusted. See
+    // design_wardrobe_helper.md §7.
+    private handleTestStrip(sender: number, args: string): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        const nameTok = tokens.find(t => t.startsWith("@"));
+        let target = sender;
+        if (nameTok) {
+            const matches = this.findPlayersByName(nameTok.replace(/^@/, ""), -1);
+            if (matches.length === 0) {
+                this.bot.whisper(sender, `No one named "${nameTok.replace(/^@/, "")}" found in the room.`);
+                return;
+            }
+            if (matches.length > 1) {
+                this.bot.whisper(sender, `Multiple people match "${nameTok.replace(/^@/, "")}" — be more specific.`);
+                return;
+            }
+            target = matches[0].memberNumber;
+        }
+        const groupTok = tokens.find(t => t !== nameTok);
+
+        const targetName = this.roomMembers.get(target)?.name ?? `Player #${target}`;
+        const char = this.roomCharacters.get(target);
+        const perm = char?.ItemPermission ?? 0;
+        const allowItem = char?.OnlineSharedSettings?.AllowItem;
+        const verdict = this.canActOnAppearance(target);
+        const candidates = this.wornClothingItems(target);
+
+        this.bot.whisper(sender,
+            `🔧 teststrip ${targetName}: canAct=${verdict} (ItemPermission=${perm}, AllowItem=${allowItem === false ? "false" : "true/unset"}).`);
+        this.bot.whisper(sender,
+            candidates.length > 0
+                ? `Worn clothing (${candidates.length}): ${candidates.map((c, i) => `${i + 1}. ${this.formatItemLabel(c.group, c.item)}`).join("  |  ")}`
+                : `No clothing-relevant groups currently worn.`);
+
+        if (groupTok) {
+            const match = candidates.find(c => c.group.toLowerCase() === groupTok.toLowerCase());
+            if (!match) {
+                this.bot.whisper(sender, `No worn clothing group "${groupTok}" on ${targetName}. Use an exact Group name from the list above.`);
+                return;
+            }
+            this.bot.whisper(sender, `Removing ${match.group} from ${targetName} — check their character to confirm.`);
+            // Remember what we took off so !testredress can put it back, even
+            // outside a match (ingestAppearance only records for participants).
+            this.recordClothingRemoval(target, match.group, match.item);
+            this.actRemoveClothing(target, match.group, sender, `${targetName}'s`, this.formatItemLabel(match.group, match.item));
+        }
+    }
+
+    // !testredress @name [number|group] — admin-only mirror of !teststrip for
+    // the restore path. With no selector it whispers the target's removed-
+    // clothing history as a numbered list and waits for the admin to reply with
+    // a number. A selector (a number, or a group/name fragment like "bra")
+    // restores that item straight away. Attempts the apply regardless of the
+    // target's permission — the point is to test whether restore works.
+    private handleTestRedress(sender: number, args: string): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        const nameTok = tokens.find(t => t.startsWith("@"));
+        let target = sender;
+        if (nameTok) {
+            const matches = this.findPlayersByName(nameTok.replace(/^@/, ""), -1);
+            if (matches.length === 0) {
+                this.bot.whisper(sender, `No one named "${nameTok.replace(/^@/, "")}" found in the room.`);
+                return;
+            }
+            if (matches.length > 1) {
+                this.bot.whisper(sender, `Multiple people match "${nameTok.replace(/^@/, "")}" — be more specific.`);
+                return;
+            }
+            target = matches[0].memberNumber;
+        }
+        const selector = tokens.filter(t => t !== nameTok).join(" ").trim();
+
+        const targetName = this.roomMembers.get(target)?.name ?? `Player #${target}`;
+        // Most-recent-first, matching !redress.
+        const options = (this.removedClothingHistory.get(target) ?? [])
+            .slice().reverse()
+            .map(e => ({ group: e.group, item: e.item }));
+        if (options.length === 0) {
+            this.bot.whisper(sender, `No removed-clothing history for ${targetName}. Take something off first (e.g. !teststrip @${targetName} <group>).`);
+            return;
+        }
+
+        if (selector) {
+            let choice: { group: string; item: BCAppearanceItem } | undefined;
+            if (/^\d+$/.test(selector)) {
+                const idx = parseInt(selector, 10);
+                if (idx < 1 || idx > options.length) {
+                    this.bot.whisper(sender, `Pick a number between 1 and ${options.length}.`);
+                    return;
+                }
+                choice = options[idx - 1];
+            } else {
+                const needle = selector.toLowerCase().replace(/\s+/g, "");
+                choice = options.find(o =>
+                    o.group.toLowerCase().includes(selector.toLowerCase()) ||
+                    (o.item.Name ?? "").toLowerCase().includes(needle));
+                if (!choice) {
+                    this.bot.whisper(sender, `Nothing in ${targetName}'s removed history matches "${selector}".`);
+                    return;
+                }
+            }
+            this.restoreTestRedressChoice(sender, target, targetName, choice);
+            return;
+        }
+
+        // No selector — show the numbered list and wait for a reply.
+        this.clearPendingTestRedress();
+        const lines = options.map((o, i) => `${i + 1}. ${this.formatItemLabel(o.group, o.item)}`);
+        const timer = setTimeout(() => {
+            if (this.pendingTestRedress?.adminNumber === sender) {
+                this.pendingTestRedress = null;
+                this.bot.whisper(sender, "(testredress pick timed out.)");
+            }
+        }, WARDROBE_PICK_TIMEOUT_MS);
+        this.pendingTestRedress = { adminNumber: sender, target, options, timer };
+        this.bot.whisper(sender,
+            `🔧 ${targetName}'s removed clothing — reply with a number (or re-run with the number/name):\n${lines.join("\n")}`);
+    }
+
+    // Resolves an admin's numeric reply to a pending !testredress list. Returns
+    // true if it consumed the message.
+    private resolveTestRedressSelection(sender: number, msg: string): boolean {
+        const pending = this.pendingTestRedress;
+        if (!pending || pending.adminNumber !== sender) return false;
+        const trimmed = msg.trim();
+        if (!/^\d+$/.test(trimmed)) return false;
+        const idx = parseInt(trimmed, 10);
+        if (idx < 1 || idx > pending.options.length) {
+            this.bot.whisper(sender, `Reply with a number between 1 and ${pending.options.length}.`);
+            return true;
+        }
+        const choice = pending.options[idx - 1];
+        const targetName = this.roomMembers.get(pending.target)?.name ?? `Player #${pending.target}`;
+        clearTimeout(pending.timer);
+        const target = pending.target;
+        this.pendingTestRedress = null;
+        this.restoreTestRedressChoice(sender, target, targetName, choice);
+        return true;
+    }
+
+    private restoreTestRedressChoice(admin: number, target: number, targetName: string, choice: { group: string; item: BCAppearanceItem }): void {
+        const label = this.formatItemLabel(choice.group, choice.item);
+        this.bot.whisper(admin, `Restoring ${choice.group} on ${targetName} — check their character to confirm.`);
+        this.actRestoreClothing(target, { group: choice.group, item: choice.item, removedAt: Date.now() }, admin, `${targetName}'s`, label);
+    }
+
+    private clearPendingTestRedress(): void {
+        if (this.pendingTestRedress) {
+            clearTimeout(this.pendingTestRedress.timer);
+            this.pendingTestRedress = null;
+        }
+    }
+
+    // ============================================================
     // LOCKS (spend menu)
     // ============================================================
 
@@ -7722,7 +8302,10 @@ export class WinnersDiceGame {
         const memberNumber = data?.Character?.MemberNumber;
         if (typeof memberNumber !== "number") return;
 
-        if (data.Character) this.roomCharacters.set(memberNumber, data.Character as BCCharacter);
+        if (data.Character) {
+            this.ingestAppearance(memberNumber, data.Character as BCCharacter);
+            this.roomCharacters.set(memberNumber, data.Character as BCCharacter);
+        }
 
         const pending = this.pendingWardrobeChecks.get(memberNumber);
         if (!pending) return;
@@ -7792,6 +8375,7 @@ export class WinnersDiceGame {
         this.clearMatchStartConfirm();
         this.clearDisconnectTimer();
         this.clearPendingWardrobeChecks();
+        this.clearWardrobeHelperState();
         // TODO: Save/resume end game state across sessions — design TBD.
         this.clearEndGameState();
         this.releaseAllActiveLocks();
@@ -7911,6 +8495,7 @@ export class WinnersDiceGame {
         this.clearMatchStartConfirm();
         this.clearDisconnectTimer();
         this.clearPendingWardrobeChecks();
+        this.clearWardrobeHelperState();
         this.clearEndGameState();
         this.releaseAllActiveLocks();
         this.releaseAllActiveBondage();
@@ -7998,6 +8583,7 @@ export class WinnersDiceGame {
         this.pendingChallengeDisambiguation = null;
         this.clearMatchStartConfirm();
         this.clearPendingWardrobeChecks();
+        this.clearWardrobeHelperState();
         // TODO: Save/resume end game state across sessions — design TBD.
         this.clearEndGameState();
         this.releaseAllActiveLocks();
@@ -8261,7 +8847,10 @@ export class WinnersDiceGame {
 
     public onMemberJoin(memberNumber: number, name: string, char?: BCCharacter): void {
         if (memberNumber === this.bot.getMemberNumber()) return;
-        if (char) this.roomCharacters.set(memberNumber, char);
+        if (char) {
+            this.ingestAppearance(memberNumber, char);
+            this.roomCharacters.set(memberNumber, char);
+        }
 
         // Reconnect during their own disconnect countdown (see
         // onMemberLeave) — cancel it and resume as normal.
@@ -8294,6 +8883,7 @@ export class WinnersDiceGame {
         for (const char of characters) {
             if (char.MemberNumber === undefined || char.MemberNumber === this.bot.getMemberNumber()) continue;
             const name = char.Nickname || char.Name || `Player #${char.MemberNumber}`;
+            this.ingestAppearance(char.MemberNumber, char);
             this.roomCharacters.set(char.MemberNumber, char);
             this.recordPlayerSeen(char.MemberNumber, name);
         }
