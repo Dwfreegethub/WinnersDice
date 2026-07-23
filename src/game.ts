@@ -264,6 +264,15 @@ const END_GAME_LOCK_SLOTS = ["ItemLegs", "ItemFeet", "ItemArms", "ItemHands", "I
 const END_GAME_LEASH_GROUP = "ItemNeckRestraints";
 const END_GAME_LEASH_ITEM = "CollarLeash";
 
+// When the loser has no collar for the leash to attach to, we add this one.
+// Deliberately a plain, un-typed collar (LeatherCollar has no style/type
+// record): a lock-only Property is a COMPLETE valid property for it, so the
+// lock sticks on a fresh apply — the same reason the leash locks fine. A
+// typed collar (e.g. a shock collar) would get rebuilt to unlocked defaults
+// by BC when applied with a property that omits its type record. See
+// ensureCollarForLeash.
+const END_GAME_FRESH_COLLAR_ITEM = "LeatherCollar";
+
 // Word bank for the end-game timer/password lock's password (see
 // buildTimerPasswordLockProperty). Deliberately letters-only — BC's
 // TimerPasswordPadlock appears to reject/silently fail to save a password
@@ -3762,6 +3771,12 @@ export class WinnersDiceGame {
             loserPointsCommitted: 0,
         };
 
+        // Announce to the room that the end-game menu is open. Previously the
+        // only sign the other player had was the balance whisper below, which
+        // was easy to miss — DW wants an explicit heads-up that a reward is
+        // being set up.
+        this.bot.sendChat(`⚔️ ${winner.name} is setting up an end-game offer for ${loser.name}...`);
+
         this.bot.whisper(winner.memberNumber, this.endGameBalanceLine(winner.memberNumber));
         this.bot.whisper(loser.memberNumber, this.endGameBalanceLine(loser.memberNumber));
 
@@ -5897,19 +5912,6 @@ export class WinnersDiceGame {
         return worn.map(b => `${b.slot} (${b.itemName})`).join(", ");
     }
 
-    // Single most popular collar (ItemNeck) from this bot's learned usage data,
-    // falling back to the first catalog entry. Null only if the catalog has no
-    // ItemNeck items at all.
-    private pickTopCollar(): string | null {
-        const catalogItems = this.itemCatalog.get("ItemNeck") ?? [];
-        if (catalogItems.length === 0) return null;
-        const usage = this.bondageUsage["ItemNeck"] ?? {};
-        const ranked = Object.entries(usage)
-            .filter(([name, count]) => count > 0 && catalogItems.includes(name))
-            .sort((a, b) => b[1] - a[1]);
-        return ranked.length > 0 ? ranked[0][0] : catalogItems[0];
-    }
-
     // A leash (ItemNeckRestraints/CollarLeash) needs a collar in the ItemNeck
     // slot to attach to — and that collar MUST be locked, or the loser could
     // just slip it off and the leash with it. Call this right before applying a
@@ -5925,22 +5927,29 @@ export class WinnersDiceGame {
             ?.find((item: any) => item?.Group === "ItemNeck" && item?.Name);
 
         if (!collar) {
-            const collarName = this.pickTopCollar();
-            if (!collarName) return { added: false, lockedExisting: false };
-            this.bot.applyItem(memberNumber, "ItemNeck", collarName, "Default", lockProperty);
+            // Pin to a plain un-typed collar so the lock-only Property is
+            // complete and actually sticks (see END_GAME_FRESH_COLLAR_ITEM).
+            this.bot.applyItem(memberNumber, "ItemNeck", END_GAME_FRESH_COLLAR_ITEM, "Default", lockProperty);
             return { added: true, lockedExisting: false };
         }
 
-        // If the collar is still showing as locked here, it's either a player-placed
-        // lock we can't remove (applyItem will be silently rejected by BC — same
-        // outcome as before) or a bot-placed lock that releaseLocksFor already
-        // cleared server-side but roomCharacters hasn't synced yet. In both cases
-        // we attempt the apply anyway: it works when BC has processed the unlock,
-        // and fails silently when it hasn't — which is no worse than the old early
-        // return. We strip the existing Property so stale lock fields don't
-        // interfere with the new lockProperty.
+        // Collar already locked (e.g. a player-placed lock) — leave it. It's
+        // already secure, and it isn't ours to replace or unlock at teardown.
+        if (collar.Property?.LockedBy) {
+            return { added: false, lockedExisting: false };
+        }
+
+        // Lock the existing collar in place. CRITICAL: merge the lock fields
+        // ON TOP OF the collar's current Property rather than replacing it.
+        // The lockProperty alone carries no asset/type fields (TypeRecord,
+        // ShockLevel, etc.), so applying it by itself makes BC re-validate the
+        // item, rebuild it to its unlocked defaults, and DROP the lock — which
+        // is exactly why typed collars (e.g. PetSuitShockCollar) were coming
+        // out unlocked while the leash locked fine (confirmed in the 2026-07-22
+        // room log). Merging preserves the item's type and adds the lock, the
+        // same way a normal BC client locks a worn item.
         this.bot.applyItem(memberNumber, "ItemNeck", collar.Name, collar.Color ?? "Default",
-            lockProperty);
+            { ...(collar.Property ?? {}), ...lockProperty });
         return { added: false, lockedExisting: true };
     }
 
