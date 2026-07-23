@@ -164,6 +164,23 @@ export interface NegotiationState {
     settingsCompareStage: "not_asked" | "awaiting" | "done";
     settingsCompareAnswers: Partial<Record<number, "accept" | "saved">>;
     settingsCompareTimer: NodeJS.Timeout | null;
+    // "Lock block" — checked right after the challenge is accepted, before any
+    // settings questions. If either player has blocked TimerPasswordPadlock
+    // (see game.ts hasPadlockBlocked), the end-game lock would silently fail
+    // for them, so the match can't start until it's resolved. Each blocked
+    // player is asked to either unblock it (then whisper !lockready) or request
+    // a High-Security lock instead — the latter needs BOTH players' consent.
+    // "not_asked" also covers the no-block case (skipped straight to "done").
+    lockBlockStage: "not_asked" | "awaiting_choice" | "awaiting_highsec_consent" | "done";
+    // Member numbers of players who currently have the padlock blocked and
+    // haven't yet resolved it (unblocked or agreed to High-Security).
+    lockBlockPending: number[];
+    // Each player's yes/no answer to the "use a High-Security lock?" consent
+    // question, once someone has requested it.
+    highSecConsentAnswers: Partial<Record<number, boolean>>;
+    // True once resolved to use a High-Security lock for this match's end game
+    // (both players consented). Carried into the match / handoff.
+    useHighSecurityLock: boolean;
 }
 
 // An item this player has sold to their opponent, available to buy back
@@ -379,6 +396,13 @@ export interface BondageDeal {
     slot: string | null;
     itemName: string | null;
     itemOptions: string[];
+    // Full sorted catalog for this slot (pinned → popular → random), generated
+    // once when the slot is chosen. itemOptions is a PICK_LIST_TOP_N-sized
+    // slice of this list; "M for more" advances itemOptionsPage to show the
+    // next page.
+    itemOptionsAll: string[];
+    // Current page index into itemOptionsAll (0-based).
+    itemOptionsPage: number;
     // The placer's (initiator's) most recent offer.
     price: number | null;
     // The wearer's (responder's) most recent counter.
@@ -431,6 +455,11 @@ export interface ToyDeal {
     // BondageDeal.itemOptions. Numbers the winner types resolve against this
     // list, not the full catalog.
     toyOptions: string[];
+    // Full sorted toy asset list (popular → random), generated once when the
+    // toy deal starts — mirrors BondageDeal.itemOptionsAll.
+    toyOptionsAll: string[];
+    // Current page index into toyOptionsAll (0-based).
+    toyOptionsPage: number;
     // The winner's (initiator's) most recent offer.
     price: number | null;
     // The loser's (responder's) most recent counter.
@@ -472,7 +501,12 @@ export interface ActiveToy {
 export interface EndGameProposal {
     winnerMemberNumber: number;
     loserMemberNumber: number;
-    proposalStage: "q1_time" | "q2_location" | "q3_privacy" | "q4_locks" | "q5_description" | "negotiating" | "executing";
+    // "awaiting_loser_move_consent": only for a High-Security match where the
+    // winner chose to move the loser out of the room — the loser is asked to
+    // confirm they're OK leaving (trusting the winner to unlock, since the bot
+    // can't reach them out-of-room) or to keep the session in this room. See
+    // closeEndGameDeal / handleLoserMoveConsent.
+    proposalStage: "q1_time" | "q2_location" | "q3_privacy" | "q4_locks" | "q5_description" | "negotiating" | "awaiting_loser_move_consent" | "executing";
     // Winner's answers
     proposedMinutes: number;
     location: "stay" | "move" | null;
@@ -495,7 +529,11 @@ export interface EndGameProposal {
     // True when Q2 = stay in this room; false when Q2 = move. Determines
     // whether the standby whisper and !done command are available after execution.
     inRoom: boolean;
-    // Points tracking — set once execution happens.
+    // Running totals of points already deducted from each side during
+    // negotiation. Winner pays at Q1 (1× the ask) and at each raise (3× or
+    // 5× per minute). Loser pays at each counter (1× first move, 5× later).
+    // Updated live throughout; executeEndGame uses these directly — no
+    // additional deduction happens at settlement.
     winnerPointsCommitted: number;
     loserPointsCommitted: number;
 }
@@ -519,8 +557,13 @@ export interface ActiveEndGame {
     activeStartTime: number;
     // True only when the bot added a collar to the loser's ItemNeck slot so
     // the leash had something to attach to (see ensureCollarForLeash). Teardown
-    // removes it along with the leash; an already-present collar is left alone.
+    // removes it along with the leash.
     collarAdded: boolean;
+    // True when the loser was already wearing an (unlocked) collar and the bot
+    // locked it in place — so the leash can't be slipped off by removing the
+    // collar. Teardown UNLOCKS it (rather than removing — it's the player's own
+    // collar). An already-locked collar sets neither flag (left untouched).
+    collarLockedExisting: boolean;
 }
 
 // The requester's !mercy concession request, walking through the winner's
@@ -604,6 +647,17 @@ export interface GameState {
     // Cleared on rejoin, on the remaining player safewording early, or once
     // the timer itself fires.
     disconnectTimer: { memberNumber: number; timer: NodeJS.Timeout } | null;
+    // Set when the loser blocks the end game or the winner declines — the
+    // named winner can still use the spend menu but cannot call !endgame
+    // again until they've played at least one more roll AND banked.
+    // Cleared in handleBank once endGameBlockRollDone is also true.
+    endGameBlockedFor: number | null;
+    // Flipped true once any roll completes while endGameBlockedFor is set.
+    // Guards the "at least one roll" requirement before the block clears.
+    endGameBlockRollDone: boolean;
+    // When true, the bot ignores all chat input from match participants
+    // except !pause and !resume (set by either player, cleared by either).
+    paused: boolean;
 }
 
 // A single player's d20 roll for a roll, including their streak/boost
@@ -723,6 +777,12 @@ export interface HandoffEntry {
     // the match with. Baked in here rather than left for the room bot to look
     // up, since pair_balances.json is lobby-bot-owned only (see design_multi_room.md).
     startingBalances: { challenger: number; opponent: number };
+    // True when negotiation resolved to use a High-Security lock for the loser
+    // at end game (because a player had TimerPasswordPadlock blocked and both
+    // agreed to the alternative). The room bot reads this at match start so it
+    // knows which lock type executeEndGame should apply. Optional/false for the
+    // normal timer-password case (see game.ts's lock-block resolve gate).
+    useHighSecurityLock?: boolean;
     // Set to the claiming bot's BOT_ROLE once claimed.
     claimedBy?: string;
     // The actual BC room name to join, resolved by the claiming room bot

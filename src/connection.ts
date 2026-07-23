@@ -1,6 +1,6 @@
 import { io, Socket } from "socket.io-client";
 import { log, logError, logEvent } from "./logger";
-import { secrets } from "./secrets";
+import { secrets, botRole } from "./secrets";
 
 const BC_SERVER = "https://bondage-club-server.herokuapp.com/";
 const HEARTBEAT_TIMEOUT = 3 * 60 * 1000; // 3 minutes without ServerInfo = assume void
@@ -162,7 +162,11 @@ export class BCConnection {
             Limit: secrets.roomLimit,
             BlockCategory: [],
             Language: "EN",
-            Visibility: ["Admin"],
+            // The lobby bot (main) needs a publicly-listed room so players can
+            // actually find and join it to challenge each other. Room bots
+            // (gamebot1+) create hidden rooms — theirs get reconfigured per
+            // match by configureRoomForMatch (spectator=public, private=hidden).
+            Visibility: botRole === "main" ? ["All"] : ["Admin"],
             Access: ["All"],
         });
     }

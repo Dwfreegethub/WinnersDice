@@ -113,7 +113,9 @@ async function main() {
 
         game.onRoomSync(data.Character ?? []);
 
-        if (data.Visibility?.includes("All")) {
+        // Room bots keep their room hidden between matches; the lobby bot
+        // (main) is meant to stay publicly listed so players can find it.
+        if (botRole !== "main" && data.Visibility?.includes("All")) {
             log("Room is publicly listed, updating room settings to make it private...");
             bot.makeRoomPrivate();
         }

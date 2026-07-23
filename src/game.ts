@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { BCConnection } from "./connection";
 import { log, logError, centralTimestamp } from "./logger";
-import { secrets, botRole } from "./secrets";
+import { secrets, botRole, mainRoomName } from "./secrets";
 import { readPendingUpdate, getSeenVersion, markVersionSeen } from "./pendingUpdate";
 import {
     ActiveBondage,
@@ -212,6 +212,13 @@ const CHALLENGE_ACCEPTANCE_TIMEOUT_MS = 30 * 1000;
 // their opponent disconnects mid-match before the game auto-ends — see
 // onMemberLeave/expireDisconnectTimer.
 const DISCONNECT_TIMEOUT_MS = 3 * 60 * 1000;
+// How long the room bot waits for the winner to confirm they're done before
+// it resets the room for the next match anyway (see pendingRoomReset).
+const ROOM_RESET_CONFIRM_TIMEOUT_MS = 3 * 60 * 1000;
+// How long the bot waits for both players to confirm the settings once they're
+// in the room before the first roll — the match is cancelled if they don't
+// (see pendingMatchStart / beginMatchStartConfirm).
+const MATCH_START_CONFIRM_TIMEOUT_MS = 2 * 60 * 1000;
 
 // If true, a placer who removes bondage they placed (!removebondage) can
 // re-apply that same item to the same slot for free (!reapplybondage),
@@ -599,6 +606,13 @@ export class WinnersDiceGame {
     // Cap on streak for the *next* match, admin-settable via !setstreak.
     private defaultMaxStreak: number = DEFAULT_MAX_STREAK;
 
+    // True for the current match when the loser's end-game lock must be a
+    // High-Security padlock instead of the default TimerPasswordPadlock —
+    // because a player had TimerPasswordPadlock blocked and both agreed to the
+    // alternative (see the lock-block resolve gate). Set fresh in launchMatch()
+    // from the negotiation/handoff, read in applyEndGameLocks().
+    private matchUsesHighSecurityLock: boolean = false;
+
     // Wardrobe-change checks awaiting a ChatRoomSyncSingle for the opponent
     // in a clothing deal, keyed by the opponent's member number.
     // baselineCount is their Appearance.length captured when the deal
@@ -631,8 +645,9 @@ export class WinnersDiceGame {
     // Empty (length 0) disables the toys menu option entirely.
     private readonly toyCatalog: ToyCatalogEntry[];
 
-    // Set while a !challenge's target name matches more than one room member;
-    // holds the challenger's numbered reply until they pick one.
+    // Set while a !challenge's target name matches more than one room member,
+    // OR while !challenge was used with no argument (listing all room members).
+    // Holds the challenger's numbered reply until they pick one.
     private pendingChallengeDisambiguation: { challengerNumber: number; candidates: Player[] } | null = null;
 
     // True while the end game proposal's Q4 is waiting for the winner's
@@ -645,6 +660,16 @@ export class WinnersDiceGame {
     // arrival for, or actively running the match for. Null while idle/polling.
     private activeHandoff: HandoffEntry | null = null;
     private handoffEntryTimer: NodeJS.Timeout | null = null;
+    // Room bot only: after a match's end-game session wraps up, the room reset
+    // (leave/recreate the room for the next match) is held until the winner
+    // confirms they're done — so the room isn't yanked out from under players
+    // who are still in it. activeHandoff stays set during this window, which
+    // keeps pollForHandoff from claiming a new match. Auto-resets on timeout.
+    private pendingRoomReset: { winnerMemberNumber: number; timer: NodeJS.Timeout } | null = null;
+    // Set between launchMatch and the first roll: both players must confirm the
+    // settings before rolling begins (see beginMatchStartConfirm). Tracks who's
+    // confirmed so far; the match is cancelled if both don't confirm in time.
+    private pendingMatchStart: { confirms: Set<number>; timer: NodeJS.Timeout } | null = null;
     // True once this room bot has checked handoffs/claimed/ for orphaned
     // claims left over from a previous run that was killed/crashed mid-match
     // without going through a normal end path — see reapOwnOrphanedClaims.
@@ -716,6 +741,9 @@ export class WinnersDiceGame {
             mercyRequest: null,
             mercyCooldowns: new Map(),
             disconnectTimer: null,
+            endGameBlockedFor: null,
+            endGameBlockRollDone: false,
+            paused: false,
         };
     }
 
@@ -726,6 +754,36 @@ export class WinnersDiceGame {
 
     private playerName(memberNumber: number): string {
         return this.state.players?.find(p => p.memberNumber === memberNumber)?.name ?? `Player #${memberNumber}`;
+    }
+
+    private isMatchParticipant(memberNumber: number): boolean {
+        return !!(this.state.players?.some(p => p.memberNumber === memberNumber));
+    }
+
+    private handlePause(sender: number): void {
+        if (!this.state.players?.some(p => p.memberNumber === sender)) return;
+        if (this.state.paused) {
+            this.bot.whisper(sender, "Already paused — type !resume when you're ready.");
+            return;
+        }
+        this.state.paused = true;
+        const name = this.playerName(sender);
+        this.bot.whisper(this.state.players!.find(p => p.memberNumber !== sender)!.memberNumber,
+            `⏸️ ${name} paused the bot — type !resume when you're done.`);
+        this.bot.whisper(sender, "⏸️ Paused — I'll stay out of your way. Type !resume when you're ready to continue.");
+    }
+
+    private handleResume(sender: number): void {
+        if (!this.state.players?.some(p => p.memberNumber === sender)) return;
+        if (!this.state.paused) {
+            this.bot.whisper(sender, "Not paused.");
+            return;
+        }
+        this.state.paused = false;
+        const name = this.playerName(sender);
+        this.bot.whisper(this.state.players!.find(p => p.memberNumber !== sender)!.memberNumber,
+            `▶️ ${name} resumed the bot.`);
+        this.bot.whisper(sender, "▶️ Resumed — pick up where you left off.");
     }
 
     public handleChatMessage(sender: number, content: string, isWhisper: boolean): void {
@@ -759,6 +817,10 @@ export class WinnersDiceGame {
         }
 
         if (!msg.startsWith("!")) {
+            // While paused, ignore all conversational input from match participants
+            // so players can RP freely. !pause / !resume are bang-commands so they
+            // bypass this check. Non-participants are never routed here.
+            if (this.state.paused && this.isMatchParticipant(sender)) return;
             this.handleConversational(sender, msg);
             return;
         }
@@ -768,6 +830,11 @@ export class WinnersDiceGame {
         const args = rest.join(" ");
 
         const helpArg = args.trim().toLowerCase();
+
+        // While paused, only !pause and !resume are processed. Everything else
+        // (including game commands like !bank and !press) is silently ignored so
+        // players can RP without the bot interrupting.
+        if (this.state.paused && cmd !== "!pause" && cmd !== "!resume") return;
 
         switch (cmd) {
             case "!help":
@@ -821,6 +888,8 @@ export class WinnersDiceGame {
                     this.handleConsentAllAnswer(sender, true);
                 } else if (this.isAwaitingLobbyFallback()) {
                     this.handleLobbyFallbackAnswer(sender, true);
+                } else if (this.isAwaitingHighSecConsent()) {
+                    this.handleHighSecConsent(sender, true);
                 } else {
                     this.handleYesNoAnswer(sender, true);
                 }
@@ -836,12 +905,17 @@ export class WinnersDiceGame {
                     this.handleConsentAllAnswer(sender, false);
                 } else if (this.isAwaitingLobbyFallback()) {
                     this.handleLobbyFallbackAnswer(sender, false);
+                } else if (this.isAwaitingHighSecConsent()) {
+                    this.handleHighSecConsent(sender, false);
                 } else {
                     this.handleYesNoAnswer(sender, false);
                 }
                 break;
             case "!cancel":
                 this.handleCancel(sender);
+                break;
+            case "!lockready":
+                this.handleLockBlockChoice(sender, "unblock");
                 break;
             case "!bondage":
                 this.handleBondageShortcut(sender);
@@ -882,6 +956,10 @@ export class WinnersDiceGame {
             case "!testlock":
                 this.handleTestLock(sender, args);
                 break;
+            // TEMP (blocked-lock investigation 2026-07-20) — remove after test.
+            case "!testcufflock":
+                this.handleTestCuffLock(sender, args);
+                break;
             case "!removed":
                 this.handleRemovedConfirmation(sender);
                 break;
@@ -890,6 +968,12 @@ export class WinnersDiceGame {
                 break;
             case "!time":
                 this.handleTime(sender);
+                break;
+            case "!pause":
+                this.handlePause(sender);
+                break;
+            case "!resume":
+                this.handleResume(sender);
                 break;
         }
     }
@@ -907,6 +991,29 @@ export class WinnersDiceGame {
         if (lower === "help" || lower === "h") {
             this.handleContextHelp(sender);
             return;
+        }
+
+        // Room bot, post-session: the winner confirming they're done so the
+        // room can reset (see beginRoomResetConfirm). Checked as a class field
+        // since the match state is already idle by now.
+        if (this.pendingRoomReset && sender === this.pendingRoomReset.winnerMemberNumber
+            && (lower === "ready" || lower === "done")) {
+            this.finalizeRoomReset();
+            return;
+        }
+
+        // Pre-roll: both players confirming the settings before the first roll
+        // (see beginMatchStartConfirm). Checked before the normal playing-phase
+        // handlers so a "ready"/"start" isn't swallowed as anything else.
+        if (this.pendingMatchStart) {
+            if (lower === "ready" || lower === "start" || lower === "yes" || lower === "y") {
+                this.handleMatchStartConfirm(sender);
+                return;
+            }
+            if (lower === "cancel") {
+                this.cancelMatchStart();
+                return;
+            }
         }
 
         // A !challenge matched more than one room member by name — the
@@ -1035,7 +1142,9 @@ export class WinnersDiceGame {
             negotiation.carryoverStage === "awaiting" ||
             negotiation.pairSettingsStage === "awaiting" ||
             negotiation.settingsCompareStage === "awaiting" ||
-            negotiation.consentAllStage === "awaiting"
+            negotiation.consentAllStage === "awaiting" ||
+            negotiation.lockBlockStage === "awaiting_choice" ||
+            negotiation.lockBlockStage === "awaiting_highsec_consent"
         );
         if (negotiation && this.state.phase === "negotiating" && !negotiation.pending && !preNegotiationStageActive) {
             const key = nextNegotiationKey(negotiation.config);
@@ -1102,6 +1211,10 @@ export class WinnersDiceGame {
                     this.handleLobbyFallbackAnswer(sender, true);
                     return;
                 }
+                if (negotiation.lockBlockStage === "awaiting_highsec_consent") {
+                    this.handleHighSecConsent(sender, true);
+                    return;
+                }
                 const key = nextNegotiationKey(negotiation.config);
                 if (key !== null && isYesNoKey(key)) {
                     this.handleYesNoAnswer(sender, true);
@@ -1128,12 +1241,31 @@ export class WinnersDiceGame {
                     this.handleLobbyFallbackAnswer(sender, false);
                     return;
                 }
+                if (negotiation.lockBlockStage === "awaiting_highsec_consent") {
+                    this.handleHighSecConsent(sender, false);
+                    return;
+                }
                 const key = nextNegotiationKey(negotiation.config);
                 if (key !== null && isYesNoKey(key)) {
                     this.handleYesNoAnswer(sender, false);
                 }
             }
             return;
+        }
+
+        // Blocked-padlock resolution words (see beginLockBlockCheck): a blocked
+        // player replies "unblock" (they've re-enabled it) or "highsec" (request
+        // the alternative lock).
+        if (negotiation && this.state.phase === "negotiating" && negotiation.lockBlockStage === "awaiting_choice"
+            && negotiation.lockBlockPending.includes(sender)) {
+            if (lower === "unblock" || lower === "unblocked" || lower === "ready" || lower === "done") {
+                this.handleLockBlockChoice(sender, "unblock");
+                return;
+            }
+            if (lower === "highsec" || lower === "high sec" || lower === "high-sec" || lower === "high security" || lower === "high-security") {
+                this.handleLockBlockChoice(sender, "highsec");
+                return;
+            }
         }
 
         const counterMatch = lower.match(/^counter(?:\s+(.+))?$/);
@@ -1147,7 +1279,7 @@ export class WinnersDiceGame {
         let text =
             `=== WinnersDice Commands ===\n` +
             `!readme - Read about this game\n` +
-            `!challenge @PlayerName - Challenge a player to a match\n` +
+            `!challenge - Challenge a player to a match\n` +
             `!help setup - Challenge and match setup\n` +
             `!help game - During the match\n` +
             `!help shop - The shop and spending\n`;
@@ -1170,8 +1302,8 @@ export class WinnersDiceGame {
     // notification" makes their client send a Hidden ChatRoomFriendRequestAdd
     // chat message, which index.ts routes here. The silent option sends
     // nothing at all, so !friend exists as the manual path to the same place.
-    // This room idles at Visibility ["Admin"], so friends see only that the
-    // bot is online — the server hides the room name for restricted rooms.
+    // The lobby room is publicly listed, so a friend sees the bot online plus
+    // the room name and player count and can jump straight in.
     public handleFriendRequest(memberNumber: number, name: string): void {
         if (this.bot.isFriend(memberNumber)) {
             this.bot.whisper(memberNumber,
@@ -1216,7 +1348,7 @@ export class WinnersDiceGame {
     private handleHelpSetup(sender: number): void {
         const text =
             `=== Match Setup ===\n` +
-            `!challenge @PlayerName - Start a challenge\n` +
+            `!challenge [name] - Start a challenge (no name = shows who's in the room)\n` +
             `yes / no - Answer yes/no questions\n` +
             `[number] - Enter a value when prompted\n` +
             `accept - Accept the current proposal\n` +
@@ -1234,7 +1366,8 @@ export class WinnersDiceGame {
             `!bank - Lock in your pot (spend / continue / endgame)\n` +
             `!press - Roll again, risking your current pot\n` +
             `!endgame - End the match early (after minimum rounds)\n` +
-            `!mercy - Concede early: forfeit half your points and owe a service\n\n` +
+            `!mercy - Concede early: forfeit half your points and owe a service\n` +
+            `!pause / !resume - Pause or resume the bot (either player — useful for RP)\n\n` +
             `=== Streaks, Boosts & Curses ===\n` +
             `Each win: dice + streak + boost → pot × round multiplier\n` +
             `Natural 20 always wins the roll outright (+2 streak). Natural 1 always loses it outright, plus -1 to your rolls until you win.\n` +
@@ -1461,14 +1594,21 @@ export class WinnersDiceGame {
         this.handleHelp(sender);
     }
 
+    // Case-insensitive name lookup with fuzzy fallback: exact → startsWith →
+    // includes. Returns exact matches if any; otherwise falls through to the
+    // next tier, so "sara" finds "Sahra" and "!challenge 3" from the list
+    // still resolves correctly.
     private findPlayersByName(name: string, excludeMemberNumber: number): Player[] {
         const lower = name.toLowerCase();
-        const matches: Player[] = [];
-        for (const player of this.roomMembers.values()) {
-            if (player.memberNumber === excludeMemberNumber) continue;
-            if (player.name.toLowerCase() === lower) matches.push(player);
-        }
-        return matches;
+        const candidates = [...this.roomMembers.values()].filter(p => p.memberNumber !== excludeMemberNumber);
+
+        const exact = candidates.filter(p => p.name.toLowerCase() === lower);
+        if (exact.length > 0) return exact;
+
+        const starts = candidates.filter(p => p.name.toLowerCase().startsWith(lower));
+        if (starts.length > 0) return starts;
+
+        return candidates.filter(p => p.name.toLowerCase().includes(lower));
     }
 
     private handleChallenge(sender: number, args: string): void {
@@ -1487,18 +1627,32 @@ export class WinnersDiceGame {
         // Multi-room mode: room bots never negotiate (see design_multi_room.md)
         // — they only run matches handed to them via the handoff queue.
         if (botRole !== "main") {
-            this.bot.whisper(sender, "This room is reserved for a specific match — challenges aren't handled here.");
+            this.bot.whisper(sender,
+                `This is a private game room — challenges start in the main WinnersDice room ("${mainRoomName}"). ` +
+                `Head there and type !challenge @PlayerName to set up a match.`
+            );
             return;
         }
 
         const targetName = args.replace(/^@/, "").trim();
-        if (!targetName) {
-            this.bot.sendChat("Usage: !challenge @PlayerName");
-            return;
-        }
-
         const challenger = this.roomMembers.get(sender);
         if (!challenger) return;
+
+        // No name given — whisper a numbered list of who's in the room.
+        if (!targetName) {
+            const others = [...this.roomMembers.values()].filter(p => p.memberNumber !== sender);
+            if (others.length === 0) {
+                this.bot.whisper(sender, "There's no one else in the room to challenge right now.");
+                return;
+            }
+            this.pendingChallengeDisambiguation = { challengerNumber: sender, candidates: others };
+            this.bot.whisper(sender,
+                `Who would you like to challenge?\n` +
+                others.map((p, i) => `${i + 1}. ${p.name}`).join("\n") +
+                `\nReply with a number or type their name.`
+            );
+            return;
+        }
 
         if (this.pendingChallengeDisambiguation?.challengerNumber === sender) {
             this.pendingChallengeDisambiguation = null;
@@ -1506,16 +1660,16 @@ export class WinnersDiceGame {
 
         const matches = this.findPlayersByName(targetName, sender);
         if (matches.length === 0) {
-            this.bot.sendChat(`Could not find a player named "${targetName}" in the room.`);
+            this.bot.whisper(sender, `Couldn't find "${targetName}" in the room.`);
             return;
         }
 
         if (matches.length > 1) {
             this.pendingChallengeDisambiguation = { challengerNumber: sender, candidates: matches };
             this.bot.whisper(sender,
-                `Multiple players match that name: ` +
-                matches.map((p, i) => `${i + 1}. ${p.name} (member #${p.memberNumber})`).join(", ") +
-                ` — reply with the number to choose.`
+                `Multiple players match that name:\n` +
+                matches.map((p, i) => `${i + 1}. ${p.name} (member #${p.memberNumber})`).join("\n") +
+                `\nReply with the number to choose.`
             );
             return;
         }
@@ -1584,6 +1738,10 @@ export class WinnersDiceGame {
             settingsCompareStage: "not_asked",
             settingsCompareAnswers: {},
             settingsCompareTimer: null,
+            lockBlockStage: "not_asked",
+            lockBlockPending: [],
+            highSecConsentAnswers: {},
+            useHighSecurityLock: false,
         };
 
         this.state = {
@@ -1615,6 +1773,9 @@ export class WinnersDiceGame {
             mercyRequest: null,
             mercyCooldowns: new Map(),
             disconnectTimer: null,
+            endGameBlockedFor: null,
+            endGameBlockRollDone: false,
+            paused: false,
         };
 
         this.bot.sendChat(`${challenger.name} has challenged ${opponent.name} to WinnersDice!`);
@@ -1682,7 +1843,111 @@ export class WinnersDiceGame {
 
         negotiation.acceptanceStage = "accepted";
         this.bot.sendChat(`${opponent.name} accepted!`);
-        this.promptCarryoverOrBeginSettings(negotiation);
+        this.beginLockBlockCheck(negotiation);
+    }
+
+    // ---- Lock-block preflight (blocked TimerPasswordPadlock) ----------------
+    // The end game locks the loser with a TimerPasswordPadlock. If a player has
+    // that item in their BlockItems the lock silently fails, so we resolve it
+    // up front — right after the challenge is accepted, before wasting time on
+    // the settings questions. BC only sends BlockItems at room-join, so this
+    // reflects the last sync; a mid-room unblock still works when the lock is
+    // actually applied (verified live 2026-07-20), we just can't re-detect it.
+
+    private hasPadlockBlocked(memberNumber: number): boolean {
+        const char = this.roomCharacters.get(memberNumber);
+        return !!char?.BlockItems?.ItemMisc?.TimerPasswordPadlock;
+    }
+
+    private beginLockBlockCheck(negotiation: NegotiationState): void {
+        const blocked = [negotiation.challenger, negotiation.opponent]
+            .filter(p => this.hasPadlockBlocked(p.memberNumber));
+        if (blocked.length === 0) {
+            negotiation.lockBlockStage = "done";
+            this.promptCarryoverOrBeginSettings(negotiation);
+            return;
+        }
+        negotiation.lockBlockStage = "awaiting_choice";
+        negotiation.lockBlockPending = blocked.map(p => p.memberNumber);
+        for (const p of blocked) {
+            this.bot.whisper(p.memberNumber,
+                `⚠️ You've blocked the Timer Password Padlock, which WinnersDice uses to lock the loser at the end of a match — with it blocked, the end game can't lock you in.\n` +
+                `Reply "unblock" once you've re-enabled it (Online Settings → Items — no need to leave the room), or "highsec" to use a High-Security lock instead: the winner gets a key to release you and I auto-release at time's up. Your opponent has to agree to the High-Security option.`
+            );
+        }
+        for (const p of [negotiation.challenger, negotiation.opponent]) {
+            if (!negotiation.lockBlockPending.includes(p.memberNumber)) {
+                this.bot.whisper(p.memberNumber,
+                    `Hang on — ${blocked.map(b => b.name).join(" and ")} ${blocked.length > 1 ? "have" : "has"} blocked the lock WinnersDice uses at match end. Sorting that out before we set up the game.`
+                );
+            }
+        }
+    }
+
+    private handleLockBlockChoice(sender: number, choice: "unblock" | "highsec"): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.lockBlockStage !== "awaiting_choice") return;
+        if (!negotiation.lockBlockPending.includes(sender)) return;
+
+        if (choice === "unblock") {
+            negotiation.lockBlockPending = negotiation.lockBlockPending.filter(n => n !== sender);
+            this.bot.whisper(sender, `Got it, thanks — I'll use the normal lock for you.`);
+            if (negotiation.lockBlockPending.length === 0) {
+                negotiation.lockBlockStage = "done";
+                this.promptCarryoverOrBeginSettings(negotiation);
+            }
+            return;
+        }
+
+        // highsec — needs both players to agree, since it changes how the loser
+        // gets released (winner holds a key, no self-release, no visible timer).
+        negotiation.lockBlockStage = "awaiting_highsec_consent";
+        negotiation.highSecConsentAnswers = {};
+        const requester = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+        this.bot.sendChat(
+            `${requester.name} has the end-game padlock blocked and would rather use a High-Security lock. ` +
+            `${negotiation.challenger.name} and ${negotiation.opponent.name}: use a High-Security lock for the loser this match? ` +
+            `The loser can't remove it themselves; the winner gets a key and I auto-release at time's up. (yes/no)`
+        );
+    }
+
+    private isAwaitingHighSecConsent(): boolean {
+        return this.state.phase === "negotiating" && this.state.negotiation?.lockBlockStage === "awaiting_highsec_consent";
+    }
+
+    private handleHighSecConsent(sender: number, value: boolean): void {
+        const negotiation = this.state.negotiation;
+        if (this.state.phase !== "negotiating" || !negotiation || negotiation.lockBlockStage !== "awaiting_highsec_consent") return;
+        if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) return;
+
+        negotiation.highSecConsentAnswers[sender] = value;
+        const cA = negotiation.highSecConsentAnswers[negotiation.challenger.memberNumber];
+        const oA = negotiation.highSecConsentAnswers[negotiation.opponent.memberNumber];
+
+        if (cA === undefined || oA === undefined) {
+            const responder = sender === negotiation.challenger.memberNumber ? negotiation.challenger : negotiation.opponent;
+            const other = responder === negotiation.challenger ? negotiation.opponent : negotiation.challenger;
+            this.bot.sendChat(`${responder.name} says ${value ? "yes" : "no"}. Waiting on ${other.name}...`);
+            return;
+        }
+
+        if (cA && oA) {
+            negotiation.useHighSecurityLock = true;
+            negotiation.lockBlockStage = "done";
+            this.bot.sendChat(`Both agreed — this match will use a High-Security lock at the end. Setting up the game.`);
+            this.promptCarryoverOrBeginSettings(negotiation);
+            return;
+        }
+
+        // Declined — the blocked player(s) must unblock instead.
+        negotiation.lockBlockStage = "awaiting_choice";
+        negotiation.highSecConsentAnswers = {};
+        this.bot.sendChat(`High-Security lock declined — the blocked player will need to unblock the padlock instead.`);
+        for (const n of negotiation.lockBlockPending) {
+            this.bot.whisper(n,
+                `High-Security was declined. Please unblock the Timer Password Padlock in your item settings, then whisper "unblock" — or !cancel to call off the match.`
+            );
+        }
     }
 
     // After the challenge is accepted, checks whether this pair has a saved
@@ -2111,6 +2376,12 @@ export class WinnersDiceGame {
     private handleCancel(sender: number): void {
         const state = this.state;
 
+        // Pre-roll settings confirmation — either player can call it off.
+        if (this.pendingMatchStart) {
+            this.cancelMatchStart();
+            return;
+        }
+
         if (state.phase === "negotiating" && state.negotiation) {
             const negotiation = state.negotiation;
             if (sender !== negotiation.challenger.memberNumber && sender !== negotiation.opponent.memberNumber) {
@@ -2347,7 +2618,8 @@ export class WinnersDiceGame {
             negotiation.challenger,
             negotiation.opponent,
             challengerStart,
-            opponentStart
+            opponentStart,
+            negotiation.useHighSecurityLock
         );
     }
 
@@ -2360,8 +2632,10 @@ export class WinnersDiceGame {
         challenger: { memberNumber: number; name: string },
         opponent: { memberNumber: number; name: string },
         challengerStart: number,
-        opponentStart: number
+        opponentStart: number,
+        useHighSecurityLock: boolean = false
     ): void {
+        this.matchUsesHighSecurityLock = useHighSecurityLock;
         const players: [PlayerState, PlayerState] = [
             { memberNumber: challenger.memberNumber, name: challenger.name, balance: challengerStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
             { memberNumber: opponent.memberNumber, name: opponent.name, balance: opponentStart, streak: 0, boost: 0, cursedPenalty: 0, pendingBalance: 0, soldItems: [] },
@@ -2396,6 +2670,9 @@ export class WinnersDiceGame {
             mercyRequest: null,
             mercyCooldowns: new Map(),
             disconnectTimer: null,
+            endGameBlockedFor: null,
+            endGameBlockRollDone: false,
+            paused: false,
         };
 
         const summary = [
@@ -2407,7 +2684,7 @@ export class WinnersDiceGame {
         ].join(", ");
 
         this.bot.sendChat(
-            `All settings agreed! ${summary}. The WinnersDice match between ${players[0].name} and ${players[1].name} is starting!`
+            `Here are the agreed settings for ${players[0].name} vs ${players[1].name} — ${summary}.`
         );
         if (challengerStart > 0 || opponentStart > 0) {
             this.bot.sendChat(
@@ -2415,7 +2692,76 @@ export class WinnersDiceGame {
             );
         }
 
+        this.beginMatchStartConfirm();
+    }
+
+    // Both players must confirm the settings shown above before the first roll.
+    // Whichever bot runs the match (room bot after arrival, or the lobby bot
+    // for a fallback match), the match doesn't begin until both reply — and is
+    // cancelled if they don't within MATCH_START_CONFIRM_TIMEOUT_MS.
+    private beginMatchStartConfirm(): void {
+        const state = this.state;
+        if (state.phase !== "playing" || !state.players) return;
+
+        const timer = setTimeout(() => this.cancelMatchStart(), MATCH_START_CONFIRM_TIMEOUT_MS);
+        this.pendingMatchStart = { confirms: new Set(), timer };
+
+        const minutes = Math.round(MATCH_START_CONFIRM_TIMEOUT_MS / 60000);
+        this.bot.sendChat(
+            `${state.players[0].name} and ${state.players[1].name}: both reply "ready" (or "start") to confirm and begin rolling. ` +
+            `Type !cancel if something's wrong. (Auto-cancels in ${minutes} min if you don't both confirm.)`
+        );
+    }
+
+    private handleMatchStartConfirm(sender: number): void {
+        const pending = this.pendingMatchStart;
+        const state = this.state;
+        if (!pending || state.phase !== "playing" || !state.players) return;
+        if (!state.players.some(p => p.memberNumber === sender)) return;
+        if (pending.confirms.has(sender)) {
+            this.bot.whisper(sender, `You're confirmed — waiting on the other player.`);
+            return;
+        }
+
+        pending.confirms.add(sender);
+        const other = state.players.find(p => p.memberNumber !== sender);
+        if (pending.confirms.size >= 2) {
+            this.finalizeMatchStart();
+        } else {
+            this.bot.sendChat(`${this.playerName(sender)} is ready — waiting on ${other ? other.name : "the other player"}.`);
+        }
+    }
+
+    private clearMatchStartConfirm(): void {
+        if (this.pendingMatchStart) {
+            clearTimeout(this.pendingMatchStart.timer);
+            this.pendingMatchStart = null;
+        }
+    }
+
+    private finalizeMatchStart(): void {
+        this.clearMatchStartConfirm();
         this.startMatch();
+    }
+
+    // Both players didn't confirm the settings in time (or one typed !cancel) —
+    // call the match off. Mirrors the abort teardown used by safeword/reset.
+    private cancelMatchStart(): void {
+        if (!this.pendingMatchStart) return;
+        this.clearMatchStartConfirm();
+
+        this.releaseAllActiveLocks();
+        this.releaseAllActiveBondage();
+        this.releaseActiveToy();
+
+        const names = this.state.players ? this.state.players.map(p => p.name).join(" and ") : "the players";
+        this.bot.sendChat(`Match cancelled — settings weren't confirmed by both players. ${names} can !challenge again.`);
+
+        if (this.activeHandoff) {
+            this.writeRoomBotResult(this.activeHandoff, "reset", null, null, 0, 0);
+            this.resetRoomBotForNextMatch();
+        }
+        this.state = this.createIdleState();
     }
 
     // Multi-room mode (BOT_ROLE=main): writes the agreed match to
@@ -2430,6 +2776,7 @@ export class WinnersDiceGame {
             config,
             roomType: negotiation.roomType ?? "private",
             startingBalances: { challenger: challengerStart, opponent: opponentStart },
+            useHighSecurityLock: negotiation.useHighSecurityLock,
         });
 
         this.bot.sendChat(
@@ -2564,7 +2911,7 @@ export class WinnersDiceGame {
         }
 
         this.bot.sendChat(`Both players are here — let's begin!`);
-        this.launchMatch(handoff.config, challenger, opponent, handoff.startingBalances.challenger, handoff.startingBalances.opponent);
+        this.launchMatch(handoff.config, challenger, opponent, handoff.startingBalances.challenger, handoff.startingBalances.opponent, handoff.useHighSecurityLock ?? false);
     }
 
     // One or both named players never showed up within the entry window.
@@ -2582,7 +2929,36 @@ export class WinnersDiceGame {
     // writeRoomBotResult's call sites). Unlocks/renames the room back to
     // its static default and clears activeHandoff so pollForHandoff can
     // pick up the next pending entry.
+    // Room bot: after the end-game session ends, ask the winner to confirm
+    // before resetting the room (see pendingRoomReset). Whispers them and arms
+    // an auto-reset timeout so the room can't hang forever if they wander off.
+    private beginRoomResetConfirm(winnerMemberNumber: number): void {
+        // Clear any prior pending confirm (shouldn't normally happen).
+        if (this.pendingRoomReset) clearTimeout(this.pendingRoomReset.timer);
+        const timer = setTimeout(() => {
+            log("[Handoff] Room-reset confirmation timed out — resetting the room anyway.");
+            this.resetRoomBotForNextMatch();
+        }, ROOM_RESET_CONFIRM_TIMEOUT_MS);
+        this.pendingRoomReset = { winnerMemberNumber, timer };
+        const minutes = Math.round(ROOM_RESET_CONFIRM_TIMEOUT_MS / 60000);
+        this.bot.whisper(winnerMemberNumber,
+            `That's a wrap on the match! Whisper "ready" when you're both done and I'll reset the room for the next game. ` +
+            `(If I don't hear back, I'll reset automatically in about ${minutes} minutes.)`
+        );
+    }
+
+    // The winner confirmed they're done (or the timeout fired) — do the actual
+    // room reset. Safe to call whether or not a confirm is pending.
+    private finalizeRoomReset(): void {
+        this.resetRoomBotForNextMatch();
+    }
+
     private resetRoomBotForNextMatch(): void {
+        if (this.pendingRoomReset) {
+            clearTimeout(this.pendingRoomReset.timer);
+            this.pendingRoomReset = null;
+        }
+        this.clearMatchStartConfirm();
         if (this.handoffEntryTimer) {
             clearTimeout(this.handoffEntryTimer);
             this.handoffEntryTimer = null;
@@ -2724,6 +3100,12 @@ export class WinnersDiceGame {
 
         state.awaitingDecision = winner.memberNumber;
 
+        // Once a roll completes while an end game block is pending, the
+        // blocked winner has met the "play at least one roll" requirement.
+        if (state.endGameBlockedFor !== null) {
+            state.endGameBlockRollDone = true;
+        }
+
         const result: RoundResult = {
             round: state.currentRound,
             rollNumber: state.rollNumber,
@@ -2757,13 +3139,12 @@ export class WinnersDiceGame {
         };
 
         const winnerPoints = winnerRoll.total * result.round;
-        const loserPoints = loserRoll.total * result.round;
 
+        // Only the winner's points go into the pot, so we don't spell out the
+        // loser's point math — just show their raw roll so the result is still
+        // clear at a glance, and fold the outcome + next-step into fewer lines.
         this.bot.sendChat(
-            `🎲 Roll ${result.rollNumber} — ${winner.name} rolls ${fmtBreakdown(winnerRoll)} = ${winnerRoll.total} × ${result.round} = ${winnerPoints} points → Pot: ${result.potTotal} points`
-        );
-        this.bot.sendChat(
-            `${loser.name} rolls ${fmtBreakdown(loserRoll)} = ${loserRoll.total} × ${result.round} = ${loserPoints} points → ${winner.name} wins this roll!`
+            `🎲 Roll ${result.rollNumber} — ${winner.name} wins with ${fmtBreakdown(winnerRoll)} = ${winnerRoll.total} × ${result.round} = ${winnerPoints} points (beat ${loser.name}'s ${loserRoll.total}) → Pot: ${result.potTotal} points`
         );
         this.bot.sendChat(`${winner.name} can bank ${result.potTotal} points or keep rolling to build the pot.`);
 
@@ -2796,6 +3177,14 @@ export class WinnersDiceGame {
         const banked = state.pot;
         state.pot = 0;
         state.spendingBalance = winner.balance;
+
+        // If this player was blocked from calling end game, clear the block
+        // now that they've played a roll and banked.
+        if (state.endGameBlockedFor === sender && state.endGameBlockRollDone) {
+            state.endGameBlockedFor = null;
+            state.endGameBlockRollDone = false;
+            this.bot.whisper(sender, "⚔️ End game is available to you again.");
+        }
 
         this.bot.sendChat(`${winner.name} banks the pot of ${banked} points! Balance: ${winner.balance}.`);
 
@@ -2842,6 +3231,15 @@ export class WinnersDiceGame {
         if (this.blockedByWardrobe(sender)) return;
         if (this.blockedByServiceDeal(sender)) return;
         if (this.blockedByMercy(sender)) return;
+
+        // If a shop deal is active (bondage/lock/toy/clothing), the other player
+        // hasn't responded yet. Don't show the bank menu or "I didn't catch that"
+        // — just remind the winner they're waiting. Also prevents a second offer
+        // from being placed before the first is answered.
+        if (state.bondageDeal || state.lockDeal || state.toyDeal || state.clothingDeal) {
+            this.bot.whisper(sender, "⏳ Waiting for the other player to respond to your offer.");
+            return;
+        }
 
         if (state.spendMenuOpen) {
             this.handleSpendMenuChoice(sender, lower, raw);
@@ -2947,6 +3345,15 @@ export class WinnersDiceGame {
         if (this.blockedByMercy(sender)) return;
         if (state.endGameProposal || state.activeEndGame) return;
 
+        // End game blocked after a block/decline — must play a roll then bank first.
+        if (state.endGameBlockedFor === sender) {
+            const hint = state.endGameBlockRollDone
+                ? "You've played a roll — bank to unlock end game."
+                : "Play at least one roll and then bank to unlock end game again.";
+            this.bot.whisper(sender, `⚔️ End game is locked for you right now. ${hint}`);
+            return;
+        }
+
         if (state.currentRound < state.config.minRounds) {
             if (state.awaitingPostBank === sender) {
                 this.bot.whisper(sender, `Not yet — minimum rounds not reached. Reply 1 (continue) or 2 (spend).`);
@@ -3006,7 +3413,11 @@ export class WinnersDiceGame {
             // players.json/pair_balances.json directly (lobby-bot-owned).
             const loser = finalWinnerMemberNumber === null ? null : (finalWinnerMemberNumber === p1.memberNumber ? p2.memberNumber : p1.memberNumber);
             this.writeRoomBotResult(this.activeHandoff, "normal", finalWinnerMemberNumber, loser, 0, 0);
-            this.resetRoomBotForNextMatch();
+            // Don't reset the room yet — hold it until the winner confirms
+            // they're done, so it isn't yanked out from under players still in
+            // it. activeHandoff stays set here, which keeps pollForHandoff from
+            // claiming a new match during the wait. Auto-resets on timeout.
+            this.beginRoomResetConfirm(winner.memberNumber);
         } else {
             this.recordGameCompletion(finalWinnerMemberNumber, [p1, p2]);
             this.savePairCarryover(p1, p2);
@@ -3014,7 +3425,15 @@ export class WinnersDiceGame {
 
         this.clearPendingWardrobeChecks();
         this.releaseAllActiveLocks();
-        this.releaseWinnerBondage(winner.memberNumber);
+        this.releaseBondageFor(winner.memberNumber);
+        // Session's over — fully free the loser too: everything's just been
+        // unlocked above, so remove all their remaining bondage. Only when
+        // they're still in the room for the bot to act on; a "move" session's
+        // players have already left (the winner frees them out there).
+        const loserPlayer = state.players.find(p => p.memberNumber !== winner.memberNumber);
+        if (loserPlayer && this.roomMembers.has(loserPlayer.memberNumber)) {
+            this.releaseBondageFor(loserPlayer.memberNumber);
+        }
         this.releaseActiveToy();
         this.state = this.createIdleState();
 
@@ -3306,6 +3725,16 @@ export class WinnersDiceGame {
         return Math.round(originalMinutes * 0.10);
     }
 
+    // Points cost multiplier for each negotiation step. Step 1 (loser's
+    // first counter) is 1×; step 2 (winner's raise) is 3×; steps 3 and 4
+    // (loser's second counter, winner's final raise) are 5×. Points are
+    // deducted immediately when each move is made, not at settlement.
+    private endGameMultiplier(negotiationStep: number): number {
+        if (negotiationStep === 1) return 1;
+        if (negotiationStep === 2) return 3;
+        return 5;
+    }
+
     private startEndGameProposal(sender: number): void {
         const state = this.state;
         if (!state.players) return;
@@ -3337,10 +3766,10 @@ export class WinnersDiceGame {
         this.bot.whisper(loser.memberNumber, this.endGameBalanceLine(loser.memberNumber));
 
         this.bot.whisper(winner.memberNumber,
-            `⚔️ End game initiated. Let's set the terms.\n\n` +
-            `Q1 of 5 — How many minutes do you want to claim? This is your real target, but expect ${loser.name} to spend points to cut it down — that's normal, not a rejection. ` +
-            `If they do, you can spend points to raise it back (at least 10% of whatever you answer here each time you do), but never past 90% of it — once it's been cut, you can't fully recover it. ` +
-            `Each point = 1 minute and will be spent from your balance (you have ${state.spendingBalance} pts available). Type a number.`
+            `⚔️ End game initiated.\n` +
+            `Q1 of 5 — How many minutes do you want with ${loser.name}?\n` +
+            `Your balance: ${state.spendingBalance} pts. The bid is spent immediately (1 pt = 1 min). ` +
+            `They can counter to cut it (escalating cost each round). Type a number.`
         );
     }
 
@@ -3348,9 +3777,18 @@ export class WinnersDiceGame {
         const proposal = this.state.endGameProposal;
         if (!proposal) return;
 
+        const preDelivery = proposal.proposalStage !== "negotiating" && proposal.proposalStage !== "executing";
+        let cancelMsg = "End game proposal cancelled.";
+
+        if (preDelivery && proposal.winnerPointsCommitted > 0) {
+            // Refund the Q1 bid — proposal was never delivered to the loser.
+            this.state.spendingBalance += proposal.winnerPointsCommitted;
+            cancelMsg = `End game proposal cancelled. ${proposal.winnerPointsCommitted} pts refunded (balance: ${this.state.spendingBalance} pts).`;
+        }
+
         this.state.endGameProposal = null;
         this.endGameAwaitingLockSlotsInput = false;
-        this.bot.whisper(sender, "End game proposal cancelled.");
+        this.bot.whisper(sender, cancelMsg);
         this.state.awaitingPostBank = sender;
         this.bot.whisper(sender, this.postBankPromptText(sender));
     }
@@ -3363,6 +3801,13 @@ export class WinnersDiceGame {
 
         if (proposal.proposalStage === "negotiating") {
             return this.handleEndGameNegotiation(proposal, sender, raw, lower);
+        }
+        if (proposal.proposalStage === "awaiting_loser_move_consent") {
+            if (sender !== proposal.loserMemberNumber) return false;
+            if (lower === "yes" || lower === "y") { this.handleLoserMoveConsent(sender, true); return true; }
+            if (lower === "no" || lower === "n") { this.handleLoserMoveConsent(sender, false); return true; }
+            this.bot.whisper(sender, `Reply "yes" to go with them, or "no" to keep the session in this room.`);
+            return true;
         }
         if (proposal.proposalStage === "executing") return false;
 
@@ -3394,9 +3839,13 @@ export class WinnersDiceGame {
         proposal.negotiationStep = 1;
         proposal.proposalStage = "q2_location";
 
+        // Deduct the Q1 bid immediately (1× rate).
+        state.spendingBalance -= n;
+        proposal.winnerPointsCommitted = n;
+
         this.bot.whisper(proposal.winnerMemberNumber,
-            `✅ ${n} minutes noted — that will cost you ${n} pts if agreed.\n\n` +
-            `Q2 of 5 — Where do you want to take this?\n1. Stay in this room\n2. Move to a different room (recommended for longer sessions)`
+            `✅ ${n} min — ${n} pts spent now. Balance: ${state.spendingBalance} pts.\n\n` +
+            `Q2 of 5 — Where do you want to take this?\n1. Stay in this room\n2. Move to a different room`
         );
         return true;
     }
@@ -3523,32 +3972,23 @@ export class WinnersDiceGame {
             : `Staying in this room (${proposal.privacy})`;
         const locksText = proposal.requestedLockSlots.length > 0 ? proposal.requestedLockSlots.join(", ") : "none";
 
-        const minimumMove = this.endGameMinimumMove(proposal.originalMinutes);
-
         this.sendLongWhisper(loser.memberNumber,
-            `⚔️ ${winner.name} has proposed an end game:\n\n` +
-            `• Time asked: ${proposal.proposedMinutes} minutes\n` +
-            `• Location: ${locationText}\n` +
-            `• Locks: ${locksText}\n` +
-            `• Their plans: ${proposal.description}\n` +
+            `⚔️ ${winner.name} claims end game:\n` +
+            `${proposal.proposedMinutes} min | ${locationText} | Locks: ${locksText}\n` +
+            `"${proposal.description}"\n` +
             `──────────────────────\n` +
-            `Balances — You: ${loser.balance} pts | ${winner.name}: ${winner.balance} pts\n\n` +
-            `HOW THIS WORKS:\n` +
-            `• You spend points to cut the time down — 1 pt per minute you cut. Say how much LOWER you want it, not a target number (e.g. "counter 15" cuts it by 15, it's not a new total).\n` +
-            `• You can cut it all the way to 0 on this first move if you want/can afford it — that's not an automatic block, it just goes to ${winner.name} to respond.\n` +
-            `• ${winner.name} can then accept wherever it lands, spend to raise it back — at least ${minimumMove} min each time they do, capped so they can never recover past 90% of their original ${proposal.proposedMinutes} min ask — or decline outright and block the whole deal.\n` +
-            `• If it comes back to you for a second move, you'll need to cut it by at least ${minimumMove} more min (10% of the original ask) — no tiny nibbles.\n` +
-            `• Up to 5 rounds total. Round 4 is binding — no more back-and-forth after that.\n` +
-            `• If ${winner.name} declines at any point, the deal's off — whatever's already been committed on both sides is burned, no refunds, and the match resumes.\n\n` +
-            `To ACCEPT: say "yes" — ${winner.name} pays for however many minutes it's currently at, you pay nothing.\n` +
-            `To CUT IT: reply "counter [amount to lower it by]".\n` +
-            `  ↳ You cannot decline outright — only accept or cut it further.`
+            `Your balance: ${loser.balance} pts | ${winner.name} spent ${proposal.winnerPointsCommitted} pts to make this ask.\n\n` +
+            `Countering costs points at an escalating rate — 1× now, 3× if it comes back to you, 5× after that. All spent points are burned regardless of outcome.\n\n` +
+            `"yes" — accept as-is\n` +
+            `"counter 15" — cut it by 15 min (1 pt per min this round)\n` +
+            `"block" — hard reject (costs ${proposal.originalMinutes * 2} pts — both sides lose everything spent)`
         );
 
-        // Parallel whisper to the winner: remind them of their ask and balance.
+        // Parallel whisper to the winner: remind them of their ask and remaining balance.
         this.bot.whisper(winner.memberNumber,
-            `⚔️ Proposal delivered to ${loser.name}. Waiting for their response.\n` +
-            `Your ask: ${proposal.originalMinutes} min. If they cut it, your best-case recovery is ${this.endGameWinnerCeiling(proposal.originalMinutes)} min (90% of your ask) — you'll never fully get back to ${proposal.originalMinutes}. Your balance: ${state.spendingBalance} pts.`
+            `⚔️ Proposal sent to ${loser.name}. Waiting for their response.\n` +
+            `Your ask: ${proposal.originalMinutes} min (${proposal.winnerPointsCommitted} pts spent). Balance: ${state.spendingBalance} pts.\n` +
+            `If they counter, you can raise it back at 3× cost (max ${this.endGameWinnerCeiling(proposal.originalMinutes)} min — 90% of your ask). They can also block outright.`
         );
 
         if (proposal.location === "stay" && proposal.privacy === "public") {
@@ -3591,26 +4031,42 @@ export class WinnersDiceGame {
             return true;
         }
 
+        // Full block — only available on the loser's first counter (step 1).
+        // Costs 2× the winner's original ask flat (no round multiplier).
+        if (trimmed === "block" && proposal.negotiationStep === 1) {
+            const blockCost = proposal.originalMinutes * 2;
+            const loser = this.state.players!.find(p => p.memberNumber === proposal.loserMemberNumber)!;
+            if (loser.balance < blockCost) {
+                this.bot.whisper(proposal.loserMemberNumber,
+                    `Full block costs ${blockCost} pts (2× the ${proposal.originalMinutes} min ask) — you only have ${loser.balance} pts. Counter or accept instead.`);
+                return true;
+            }
+            this.loserBlockEndGame(proposal, blockCost);
+            return true;
+        }
+
         if (trimmed.startsWith("counter")) {
             const n = extractNumber(raw);
             if (n === null) {
-                this.bot.whisper(proposal.loserMemberNumber, `How much do you want to lower it by? e.g. "counter 15" cuts 15 minutes off — not a new total.`);
+                this.bot.whisper(proposal.loserMemberNumber, `How much do you want to lower it by? e.g. "counter 15" cuts 15 min off — not a new total.`);
                 return true;
             }
             return this.applyEndGameLoserCounter(proposal, n);
         }
 
-        this.bot.whisper(proposal.loserMemberNumber, `You cannot decline — reply "yes" to accept, or "counter <amount to lower it by>" to cut it further.`);
+        const blockHint = proposal.negotiationStep === 1 ? `, "block" to reject outright (costs ${proposal.originalMinutes * 2} pts)` : "";
+        this.bot.whisper(proposal.loserMemberNumber, `Reply "yes" to accept, "counter <amount>" to cut it further${blockHint}.`);
         return true;
     }
 
-    // n here is the amount to cut OFF the current value, not a new target —
-    // see design note on EndGameProposal.currentMinutes. First move
-    // (negotiationStep 1) is unlimited, down to 0; second move (step 3) must
-    // cut by at least a flat 10% of originalMinutes.
+    // n here is the amount to cut OFF the current value, not a new target.
+    // Points are deducted immediately at the current round's multiplier.
+    // First move (step 1) is 1× and unlimited down to 0; second move
+    // (step 3) is 5× and must cut at least 10% of originalMinutes.
     private applyEndGameLoserCounter(proposal: EndGameProposal, n: number): boolean {
         const loser = this.state.players!.find(p => p.memberNumber === proposal.loserMemberNumber)!;
         const isFirstMove = proposal.negotiationStep === 1;
+        const multiplier = this.endGameMultiplier(proposal.negotiationStep);
 
         if (n <= 0) {
             this.bot.whisper(loser.memberNumber, `Give a positive number — how many minutes do you want to cut it by?`);
@@ -3624,26 +4080,34 @@ export class WinnersDiceGame {
 
         if (!isFirstMove) {
             // Must close by at least 10% of the original ask — unless
-            // there's less than that much room left before 0, in which case
-            // cutting the rest of the way is the only real move.
+            // there's less than that much room left before 0.
             const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), proposal.currentMinutes);
             if (n < minimumMove) {
                 const winnerName = this.playerName(proposal.winnerMemberNumber);
                 this.bot.whisper(loser.memberNumber,
-                    `You need to cut it by at least ${minimumMove} min this round (10% of ${winnerName}'s original ${proposal.originalMinutes} min ask) — you asked to cut ${n}.`);
+                    `You need to cut at least ${minimumMove} min this round (10% of ${winnerName}'s original ${proposal.originalMinutes} min ask). At ${multiplier}× that's ${minimumMove * multiplier} pts.`);
                 return true;
             }
         }
 
-        const newCurrent = proposal.currentMinutes - n;
-        const cost = proposal.originalMinutes - newCurrent;
+        const cost = n * multiplier;
         if (loser.balance < cost) {
+            const maxAffordable = Math.floor(loser.balance / multiplier);
+            if (maxAffordable <= 0 || (!isFirstMove && maxAffordable < this.endGameMinimumMove(proposal.originalMinutes))) {
+                this.bot.whisper(loser.memberNumber,
+                    `You can't afford to cut any minutes at ${multiplier}× rate — you only have ${loser.balance} pts.`);
+                return true;
+            }
             this.bot.whisper(loser.memberNumber,
-                `You don't have enough points to back that — cutting it to ${newCurrent} min would cost you ${cost} pts total, but you only have ${loser.balance}.`);
+                `Can't afford ${n} min at ${multiplier}× rate (costs ${cost} pts, you have ${loser.balance}). ` +
+                `Max you can cut is ${maxAffordable} min (${maxAffordable * multiplier} pts). Reply "counter ${maxAffordable}" or give a smaller number.`);
             return true;
         }
 
-        proposal.currentMinutes = newCurrent;
+        // Deduct immediately.
+        loser.balance -= cost;
+        proposal.loserPointsCommitted += cost;
+        proposal.currentMinutes -= n;
         proposal.negotiationStep = isFirstMove ? 2 : 4;
 
         this.sendEndGameStateWhisper(proposal);
@@ -3653,6 +4117,14 @@ export class WinnersDiceGame {
     private handleEndGameWinnerResponse(proposal: EndGameProposal, lower: string, raw: string): boolean {
         const trimmed = lower.trim();
         if (trimmed === "yes" || trimmed === "accept") {
+            // Can't settle a 0-minute claim (the loser cut it all the way down).
+            // Force a rebid: the winner must raise it back with "counter", or
+            // "decline" to end the deal — accepting nothing isn't allowed.
+            if (proposal.currentMinutes <= 0) {
+                this.bot.whisper(proposal.winnerMemberNumber,
+                    `You can't claim 0 minutes — put time back on with "counter <minutes>" to rebid, or "decline" to end the deal.`);
+                return true;
+            }
             this.closeEndGameDeal(proposal, proposal.currentMinutes);
             return true;
         }
@@ -3677,13 +4149,13 @@ export class WinnersDiceGame {
     }
 
     // n here is the amount to add BACK onto the current value, not a new
-    // target. Capped so the result never exceeds endGameWinnerCeiling —
-    // 90% of the original ask, no matter how many rounds happen — and must
-    // close by at least endGameMinimumMove each round, unless there's less
-    // than that much room left before the ceiling.
+    // target. Points are deducted immediately at this round's multiplier
+    // (3× for step 2, 5× for step 4). Capped at 90% of the original ask
+    // and must close by at least endGameMinimumMove each round.
     private applyEndGameWinnerCounter(proposal: EndGameProposal, n: number): boolean {
         const state = this.state;
         const isFinal = proposal.negotiationStep === 4;
+        const multiplier = this.endGameMultiplier(proposal.negotiationStep);
 
         if (n <= 0) {
             this.bot.whisper(proposal.winnerMemberNumber, `Give a positive number — how many minutes do you want to add back?`);
@@ -3701,7 +4173,7 @@ export class WinnersDiceGame {
         const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), roomToCeiling);
         if (n < minimumMove) {
             this.bot.whisper(proposal.winnerMemberNumber,
-                `You need to raise it by at least ${minimumMove} min this round (10% of your original ${proposal.originalMinutes} min ask) — you offered ${n}.`);
+                `You need to raise it by at least ${minimumMove} min this round. At ${multiplier}× that's ${minimumMove * multiplier} pts.`);
             return true;
         }
 
@@ -3712,12 +4184,23 @@ export class WinnersDiceGame {
             return true;
         }
 
-        if (state.spendingBalance < newCurrent) {
+        const cost = n * multiplier;
+        if (state.spendingBalance < cost) {
+            const maxAffordable = Math.min(Math.floor(state.spendingBalance / multiplier), roomToCeiling);
+            if (maxAffordable < minimumMove) {
+                this.bot.whisper(proposal.winnerMemberNumber,
+                    `You can't afford the minimum raise at ${multiplier}× rate — you only have ${state.spendingBalance} pts (min raise is ${minimumMove} min = ${minimumMove * multiplier} pts).`);
+                return true;
+            }
             this.bot.whisper(proposal.winnerMemberNumber,
-                `You can't afford that — ending up at ${newCurrent} min would cost ${newCurrent} pts, more than your ${state.spendingBalance} balance.`);
+                `Can't afford ${n} min at ${multiplier}× rate (costs ${cost} pts, you have ${state.spendingBalance}). ` +
+                `Max you can raise is ${maxAffordable} min (${maxAffordable * multiplier} pts). Reply "counter ${maxAffordable}" or give a smaller number.`);
             return true;
         }
 
+        // Deduct immediately.
+        state.spendingBalance -= cost;
+        proposal.winnerPointsCommitted += cost;
         proposal.currentMinutes = newCurrent;
 
         if (isFinal) {
@@ -3733,13 +4216,16 @@ export class WinnersDiceGame {
     private sendEndGameStateWhisper(proposal: EndGameProposal): void {
         const winner = this.playerName(proposal.winnerMemberNumber);
         const loser = this.playerName(proposal.loserMemberNumber);
-        const loserCostSoFar = proposal.originalMinutes - proposal.currentMinutes;
         const isWinnerTurn = proposal.negotiationStep === 2 || proposal.negotiationStep === 4;
         const isFinal = proposal.negotiationStep === 4;
+        const nextMultiplier = this.endGameMultiplier(proposal.negotiationStep);
 
+        const acceptNote = proposal.currentMinutes <= 0
+            ? `It's been cut to 0 — the winner can't claim 0, so it has to be rebid.`
+            : `Accepting now costs nothing more.`;
         const text =
-            `📊 Currently at ${proposal.currentMinutes} min — ${winner} would pay ${proposal.currentMinutes} pts, ${loser} would pay ${loserCostSoFar} pts if accepted as-is.\n` +
-            `${isWinnerTurn ? winner : loser}'s turn — step ${proposal.negotiationStep} of 5${isFinal ? " (final — no more back-and-forth after this)" : ""}.`;
+            `📊 ${proposal.currentMinutes} min on the table — ${winner} spent ${proposal.winnerPointsCommitted} pts, ${loser} spent ${proposal.loserPointsCommitted} pts. ${acceptNote}\n` +
+            `${isWinnerTurn ? winner : loser}'s turn — step ${proposal.negotiationStep} of 5${isFinal ? " (final — binding)" : ` | next move costs ${nextMultiplier}× per minute`}.`;
 
         this.bot.whisper(proposal.winnerMemberNumber, text);
         this.bot.whisper(proposal.loserMemberNumber, text);
@@ -3749,47 +4235,115 @@ export class WinnersDiceGame {
             const ceiling = this.endGameWinnerCeiling(proposal.originalMinutes);
             const roomToCeiling = Math.max(ceiling - proposal.currentMinutes, 0);
             const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), roomToCeiling);
-            this.bot.whisper(proposal.winnerMemberNumber,
-                `Reply "yes" to accept ${proposal.currentMinutes} min, "counter <amount>" to raise it back (at least ${minimumMove}, up to ${roomToCeiling} more — capped at ${ceiling} min total), or "decline" to block the whole deal.`
-            );
+            if (proposal.currentMinutes <= 0) {
+                // At 0, "accept" is disallowed (see handleEndGameWinnerResponse)
+                // — the winner must rebid a time or drop the deal.
+                this.bot.whisper(proposal.winnerMemberNumber,
+                    `It's been cut to 0 — you can't claim 0 minutes. "counter <amount>" to put time back on (${nextMultiplier}× rate, max ${roomToCeiling} min), or "decline" to end the deal (you lose what you've spent).`
+                );
+            } else {
+                this.bot.whisper(proposal.winnerMemberNumber,
+                    `"yes" to accept, "counter <amount>" to raise it (${nextMultiplier}× rate, min ${minimumMove} min = ${minimumMove * nextMultiplier} pts, max ${roomToCeiling} min), or "decline" to end the deal (you lose what you've spent).`
+                );
+            }
         } else {
             const minimumMove = Math.min(this.endGameMinimumMove(proposal.originalMinutes), proposal.currentMinutes);
             this.bot.whisper(proposal.loserMemberNumber,
-                `Reply "yes" to accept ${proposal.currentMinutes} min, or "counter <amount>" to cut it further (at least ${minimumMove} min this round).`
+                `"yes" to accept, or "counter <amount>" to cut it further (${nextMultiplier}× rate, min ${minimumMove} min = ${minimumMove * nextMultiplier} pts).`
             );
         }
     }
 
-    // The winner declined the deal outright — a new option (see
-    // applyEndGameLoserCounter's comment: cutting to 0 no longer
-    // auto-blocks, only this does). Whatever the current numbers imply is
-    // burned on both sides — no refunds, same principle as before — and the
-    // match resumes as if end game had never been called.
+    // Loser typed "block" on their first counter — spends 2× the original
+    // ask to hard-reject the end game. All committed points are burned.
+    // Winner is locked out of !endgame until they play a roll and bank.
+    private loserBlockEndGame(proposal: EndGameProposal, blockCost: number): void {
+        const state = this.state;
+        const winner = state.players!.find(p => p.memberNumber === proposal.winnerMemberNumber)!;
+        const loser = state.players!.find(p => p.memberNumber === proposal.loserMemberNumber)!;
+
+        loser.balance -= blockCost;
+        proposal.loserPointsCommitted += blockCost;
+
+        // Sync winner's balance from spendingBalance (Q1 already deducted).
+        winner.balance = state.spendingBalance;
+
+        state.endGameProposal = null;
+        this.endGameAwaitingLockSlotsInput = false;
+        state.endGameBlockedFor = proposal.winnerMemberNumber;
+        state.endGameBlockRollDone = false;
+
+        this.bot.sendChat(`⛔ ${loser.name} blocked the end game! All committed points are burned.`);
+        this.bot.whisper(proposal.winnerMemberNumber,
+            `End game blocked by ${loser.name} — you lost ${proposal.winnerPointsCommitted} pts. ` +
+            `You can still use the spend menu, but end game is locked until you play at least one roll and bank.`);
+        this.bot.whisper(proposal.loserMemberNumber,
+            `You blocked the end game — cost you ${blockCost} pts. ${winner.name} lost ${proposal.winnerPointsCommitted} pts.`);
+
+        state.awaitingPostBank = proposal.winnerMemberNumber;
+        this.bot.whisper(proposal.winnerMemberNumber, this.postBankPromptText(proposal.winnerMemberNumber));
+    }
+
+    // The winner declined the deal outright. All committed points are burned
+    // on both sides — no refunds. Winner is locked out of !endgame until
+    // they play a roll and bank. Match resumes.
     private blockEndGame(proposal: EndGameProposal): void {
         const state = this.state;
         const winner = state.players!.find(p => p.memberNumber === proposal.winnerMemberNumber)!;
         const loser = state.players!.find(p => p.memberNumber === proposal.loserMemberNumber)!;
 
-        const winnerCost = Math.min(proposal.currentMinutes, state.spendingBalance);
-        const loserCost = Math.min(Math.max(proposal.originalMinutes - proposal.currentMinutes, 0), loser.balance);
-
-        state.spendingBalance -= winnerCost;
+        // Points already deducted live — sync winner's balance and set block.
         winner.balance = state.spendingBalance;
-        loser.balance -= loserCost;
-
-        this.bot.sendChat("The end game was declined. The game continues.");
-        this.bot.whisper(winner.memberNumber, `You declined the negotiation — you lose the ${winnerCost} pts already implied by the current terms.`);
-        this.bot.whisper(loser.memberNumber, `${winner.name} declined the negotiation — you lose the ${loserCost} pts you'd already spent cutting the time.`);
-
         state.endGameProposal = null;
         this.endGameAwaitingLockSlotsInput = false;
+        state.endGameBlockedFor = proposal.winnerMemberNumber;
+        state.endGameBlockRollDone = false;
+
+        this.bot.sendChat("The end game was declined. The game continues.");
+        this.bot.whisper(winner.memberNumber,
+            `You declined — you lost ${proposal.winnerPointsCommitted} pts. ` +
+            `You can still shop, but end game is locked until you play at least one more roll and bank.`);
+        this.bot.whisper(loser.memberNumber,
+            `${winner.name} declined — you lost ${proposal.loserPointsCommitted} pts. The match continues.`);
+
         state.awaitingPostBank = winner.memberNumber;
         this.bot.whisper(winner.memberNumber, this.postBankPromptText(winner.memberNumber));
     }
 
     private closeEndGameDeal(proposal: EndGameProposal, finalMinutes: number): void {
+        // High-consent safeguard: a High-Security lock has no visible timer and
+        // the bot can't reach the loser to auto-release once they leave the
+        // room, so before letting the winner take them out we confirm the loser
+        // is OK with it (or would rather keep the session in this room). Only
+        // when both conditions hold; otherwise the deal closes as normal.
+        if (this.matchUsesHighSecurityLock && proposal.location === "move") {
+            proposal.currentMinutes = finalMinutes; // stash the agreed value
+            proposal.proposalStage = "awaiting_loser_move_consent";
+            this.bot.whisper(proposal.loserMemberNumber,
+                `⚠️ This match uses a High-Security lock — there's no visible countdown, and once you leave this room I can't auto-release you, so you'd be trusting ${this.playerName(proposal.winnerMemberNumber)} to unlock you. ` +
+                `Reply "yes" if you're OK going with them, or "no" to keep the session in this room so I release you when the ${finalMinutes}-minute timer is up.`
+            );
+            return;
+        }
         proposal.proposalStage = "executing";
         this.executeEndGame(proposal, finalMinutes);
+    }
+
+    // The loser's answer to the High-Security move-out consent (see
+    // closeEndGameDeal). "yes" proceeds with the move; "no" keeps the session
+    // in this room (location→stay, inRoom→true) so the bot auto-releases.
+    private handleLoserMoveConsent(sender: number, value: boolean): void {
+        const proposal = this.state.endGameProposal;
+        if (!proposal || proposal.proposalStage !== "awaiting_loser_move_consent") return;
+        if (sender !== proposal.loserMemberNumber) return;
+
+        if (!value) {
+            proposal.location = "stay";
+            proposal.inRoom = true;
+            this.bot.sendChat(`${this.playerName(sender)} would rather stay put — the session will run here in this room.`);
+        }
+        proposal.proposalStage = "executing";
+        this.executeEndGame(proposal, proposal.currentMinutes);
     }
 
     // Property for the timer/password lock applied to the loser's leash slot
@@ -3813,6 +4367,27 @@ export class WinnersDiceGame {
         };
     }
 
+    // Alternative end-game lock for a match flagged useHighSecurityLock (a
+    // player had TimerPasswordPadlock blocked — see the lock-block resolve
+    // gate). A HighSecurityPadlock can't be self-removed and has no built-in
+    // timer, so the winner is added to MemberNumberListKeys (they can release
+    // the loser any time) and the bot's own setTimeout still auto-removes it at
+    // the agreed time — matching how the winner's password works in the normal
+    // case. The bot (locker) is included in the key list too.
+    private buildHighSecurityLockProperty(winnerMemberNumber: number): any {
+        const bot = this.bot.getMemberNumber();
+        return {
+            Effect: ["Lock"],
+            Difficulty: 20,
+            LockedBy: "HighSecurityPadlock",
+            LockMemberNumber: bot,
+            LockMemberName: secrets.username,
+            LockSet: true,
+            RemoveItem: false,
+            MemberNumberListKeys: `${bot},${winnerMemberNumber}`,
+        };
+    }
+
     // Settles the agreed end game: deducts both sides' committed points and
     // burns them — by design, points spent settling an end-game deal are
     // gone for good, credited to neither player (unlike the match's leftover
@@ -3829,21 +4404,31 @@ export class WinnersDiceGame {
         const winner = state.players.find(p => p.memberNumber === proposal.winnerMemberNumber)!;
         const loser = state.players.find(p => p.memberNumber === proposal.loserMemberNumber)!;
 
-        const winnerCost = Math.min(finalMinutes, state.spendingBalance);
-        const loserCost = Math.min(Math.max(proposal.originalMinutes - finalMinutes, 0), loser.balance);
+        // Points were deducted live during negotiation — use committed totals.
+        const winnerCost = proposal.winnerPointsCommitted;
+        const loserCost = proposal.loserPointsCommitted;
 
-        state.spendingBalance -= winnerCost;
+        // Sync winner's balance from spendingBalance (already deducted).
         winner.balance = state.spendingBalance;
-        loser.balance -= loserCost;
-
-        proposal.winnerPointsCommitted = winnerCost;
-        proposal.loserPointsCommitted = loserCost;
+        // loser.balance already updated during negotiation.
 
         log(`End game settled: ${winner.name} spent ${winnerCost} pts, ${loser.name} spent ${loserCost} pts — burned by design, credited to neither player.`);
 
         // Terms are agreed — the winner shouldn't still be wearing whatever
-        // bondage they picked up earlier in the match.
-        this.releaseWinnerBondage(winner.memberNumber);
+        // bondage they picked up earlier in the match. Unlock any of the
+        // winner's locked items first (the loser may have paid to lock them),
+        // otherwise removeItem can't take a locked item off.
+        this.releaseLocksFor(winner.memberNumber);
+        this.releaseBondageFor(winner.memberNumber);
+
+        // Release any exclusive locks on the loser's items too. applyEndGameLocks
+        // will re-apply them with a timer password lock, but BC silently rejects
+        // applyItem on a locked item — so we have to clear the locks first.
+        // We delay applyEndGameLocks by 3 seconds to give BC time to process
+        // the unlock events and update the loser's appearance before we try to
+        // re-lock. Without the delay, roomCharacters still shows the old locked
+        // state and the timer password lock application silently fails.
+        this.releaseLocksFor(loser.memberNumber);
 
         const pointsSpentNote = `(${winner.name} spent ${proposal.winnerPointsCommitted} pts [${winner.balance} left], ${loser.name} spent ${proposal.loserPointsCommitted} pts [${loser.balance} left] settling the deal)`;
         if (proposal.location === "move") {
@@ -3857,7 +4442,13 @@ export class WinnersDiceGame {
         state.endGameProposal = null;
         this.endGameAwaitingLockSlotsInput = false;
 
-        this.applyEndGameLocks(winner.memberNumber, loser.memberNumber, winnerCost, loserCost, proposal.requestedLockSlots, finalMinutes, proposal.inRoom);
+        const winnerMemberNumber = winner.memberNumber;
+        const loserMemberNumber = loser.memberNumber;
+        const requestedLockSlots = proposal.requestedLockSlots;
+        const inRoom = proposal.inRoom;
+        setTimeout(() => {
+            this.applyEndGameLocks(winnerMemberNumber, loserMemberNumber, winnerCost, loserCost, requestedLockSlots, finalMinutes, inRoom);
+        }, 3000);
     }
 
     // Applies the timer/password lock to the loser's leash slot AND every
@@ -3876,12 +4467,16 @@ export class WinnersDiceGame {
     ): void {
         const state = this.state;
 
-        const password = END_GAME_LOCK_PASSWORD_WORDS[Math.floor(Math.random() * END_GAME_LOCK_PASSWORD_WORDS.length)];
-        const lockProperty = this.buildTimerPasswordLockProperty(password, lockMinutes);
+        const useHighSec = this.matchUsesHighSecurityLock;
+        const password = useHighSec ? null : END_GAME_LOCK_PASSWORD_WORDS[Math.floor(Math.random() * END_GAME_LOCK_PASSWORD_WORDS.length)];
+        const lockProperty = useHighSec
+            ? this.buildHighSecurityLockProperty(winnerMemberNumber)
+            : this.buildTimerPasswordLockProperty(password!, lockMinutes);
 
-        // A leash needs a collar to attach to — add one (locked to the same
-        // timer/password) if the loser isn't already wearing one.
-        const collarAdded = this.ensureCollarForLeash(loserMemberNumber, lockProperty);
+        // A leash needs a locked collar to attach to (locked the same way as
+        // everything else so it all releases together) — add one, or lock the
+        // loser's existing collar so the leash can't be slipped off.
+        const collar = this.ensureCollarForLeash(loserMemberNumber, lockProperty);
 
         this.bot.applyItem(loserMemberNumber, END_GAME_LEASH_GROUP, END_GAME_LEASH_ITEM, "Default", lockProperty);
 
@@ -3900,8 +4495,13 @@ export class WinnersDiceGame {
             this.bot.whisper(winnerMemberNumber, `Note: couldn't lock ${skipped.join(", ")} — nothing is worn there.`);
         }
 
-        this.bot.whisper(winnerMemberNumber,
-            `🔑 Lock password for ${this.playerName(loserMemberNumber)}'s leash${appliedLockSlots.length > 0 ? " and locks" : ""}: ${password} — this is only shown once.`);
+        if (useHighSec) {
+            this.bot.whisper(winnerMemberNumber,
+                `🔑 High-Security lock on ${this.playerName(loserMemberNumber)}'s leash${appliedLockSlots.length > 0 ? " and locks" : ""} — you hold a key, so you can release them any time. If you don't, I'll auto-release when the ${lockMinutes}-minute timer runs out.`);
+        } else {
+            this.bot.whisper(winnerMemberNumber,
+                `🔑 Lock password for ${this.playerName(loserMemberNumber)}'s leash${appliedLockSlots.length > 0 ? " and locks" : ""}: ${password} — this is only shown once.`);
+        }
 
         const timer = setTimeout(() => this.expireEndGame(), lockMinutes * 60 * 1000);
         state.activeEndGame = {
@@ -3914,7 +4514,8 @@ export class WinnersDiceGame {
             appliedLockSlots,
             inRoom,
             activeStartTime: Date.now(),
-            collarAdded,
+            collarAdded: collar.added,
+            collarLockedExisting: collar.lockedExisting,
         };
 
         // If the session is happening in this room, let the winner know the bot
@@ -3970,11 +4571,81 @@ export class WinnersDiceGame {
         );
     }
 
+    // TEMP (blocked-lock investigation, 2026-07-20) — remove after the test.
+    // Applies HighStyleSteelCuffs (ItemArms) to a target and locks them.
+    //   !testcufflock [@name]              → TimerPasswordPadlock (blocked-lock test)
+    //   !testcufflock [@name] <keyNumber>  → HighSecurityPadlock, key list = bot + <keyNumber>
+    // The High-Security form verifies the "winner holds a key" model: the
+    // listed member (e.g. MissyMissy) should be able to remove the cuffs while
+    // the wearer cannot. A numeric arg token is read as the key-holder number;
+    // the rest is the target name (self if omitted).
+    private handleTestCuffLock(sender: number, args: string): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        const keyToken = tokens.find(t => /^\d{4,}$/.test(t));
+        const keyHolder = keyToken ? Number(keyToken) : null;
+        const targetName = tokens.filter(t => t !== keyToken).join(" ").replace(/^@/, "").trim();
+
+        let targetMemberNumber = sender;
+        if (targetName) {
+            const matches = this.findPlayersByName(targetName, -1);
+            if (matches.length === 0) {
+                this.bot.whisper(sender, `No one named "${targetName}" found in the room.`);
+                return;
+            }
+            if (matches.length > 1) {
+                this.bot.whisper(sender, `Multiple people named "${targetName}" are in the room — be more specific.`);
+                return;
+            }
+            targetMemberNumber = matches[0].memberNumber;
+        }
+
+        const targetDisplayName = this.roomMembers.get(targetMemberNumber)?.name ?? `Player #${targetMemberNumber}`;
+
+        if (keyHolder !== null) {
+            const bot = this.bot.getMemberNumber();
+            const lockProperty = {
+                Effect: ["Lock"],
+                LockedBy: "HighSecurityPadlock",
+                LockMemberNumber: bot,
+                LockMemberName: secrets.username,
+                MemberNumberListKeys: `${bot},${keyHolder}`,
+                LockSet: true,
+                RemoveItem: false,
+            };
+            this.bot.applyItem(targetMemberNumber, "ItemArms", "HighStyleSteelCuffs", "Default", lockProperty);
+            this.bot.whisper(sender,
+                `🔧 High-Security cuff applied to ${targetDisplayName} (key holders: bot ${bot} + ${keyHolder}). ` +
+                `#${keyHolder} should be able to open it; ${targetDisplayName} should NOT.`
+            );
+            return;
+        }
+
+        const password = END_GAME_LOCK_PASSWORD_WORDS[Math.floor(Math.random() * END_GAME_LOCK_PASSWORD_WORDS.length)];
+        const testMinutes = 1;
+        const lockProperty = this.buildTimerPasswordLockProperty(password, testMinutes);
+        this.bot.applyItem(targetMemberNumber, "ItemArms", "HighStyleSteelCuffs", "Default", lockProperty);
+        this.bot.whisper(sender,
+            `🔧 Test cuff+lock applied to ${targetDisplayName} (HighStyleSteelCuffs, password "${password}", ${testMinutes} min). ` +
+            `Look at the cuff: a padlock icon + countdown = the lock took; a bare cuff you can remove = the lock was blocked.`
+        );
+    }
+
     // Allows the winner to end an active service deal or an in-room end game
     // early. For services, the winner is the buyer; for end games, the winner
     // is the match winner. If the loser types !done during a service, they get
     // a whisper explaining who can end it.
     private handleDone(sender: number): void {
+        // Post-session: winner using !done to release the room for reset.
+        if (this.pendingRoomReset && sender === this.pendingRoomReset.winnerMemberNumber) {
+            this.finalizeRoomReset();
+            return;
+        }
+
         // Active service deal takes priority.
         const deal = this.state.serviceDeal;
         if (deal && deal.stage === "active") {
@@ -4065,10 +4736,12 @@ export class WinnersDiceGame {
         if (!active) return;
 
         this.bot.removeItem(active.loserMemberNumber, END_GAME_LEASH_GROUP);
-        // Remove the collar too, but only if the bot added it for the leash —
-        // never strip a collar the player was already wearing.
+        // A bot-added collar is removed; a pre-existing collar the bot locked is
+        // just unlocked (it's the player's own).
         if (active.collarAdded) {
             this.bot.removeItem(active.loserMemberNumber, "ItemNeck");
+        } else if (active.collarLockedExisting) {
+            this.unlockExistingCollar(active.loserMemberNumber);
         }
         for (const group of active.appliedLockSlots) {
             const slotDisplay = PICK_SLOTS.find(s => s.group === group)?.display;
@@ -5238,59 +5911,93 @@ export class WinnersDiceGame {
     }
 
     // A leash (ItemNeckRestraints/CollarLeash) needs a collar in the ItemNeck
-    // slot to attach to. Call this right before applying a leash: if the target
-    // isn't already wearing a collar, apply the most popular one with the SAME
-    // lock property the leash is getting, so the two release together. Never
-    // overwrites an existing collar. Returns true only if a collar was added
-    // (so teardown knows to remove it — an already-present collar is left alone).
-    private ensureCollarForLeash(memberNumber: number, lockProperty: any): boolean {
-        const hasCollar = this.roomCharacters.get(memberNumber)?.Appearance
-            ?.some((item: any) => item?.Group === "ItemNeck" && item?.Name);
-        if (hasCollar) return false;
-        const collarName = this.pickTopCollar();
-        if (!collarName) return false;
-        this.bot.applyItem(memberNumber, "ItemNeck", collarName, "Default", lockProperty);
-        return true;
+    // slot to attach to — and that collar MUST be locked, or the loser could
+    // just slip it off and the leash with it. Call this right before applying a
+    // leash, with the same lockProperty the leash gets so everything releases
+    // together:
+    //   - no collar worn   → add the most popular one, locked (added=true)
+    //   - collar worn, unlocked → lock it in place, preserving the item
+    //     (lockedExisting=true) — teardown UNLOCKS rather than removes it
+    //   - collar worn, already locked → leave it (already secure; never
+    //     replace someone else's lock)
+    private ensureCollarForLeash(memberNumber: number, lockProperty: any): { added: boolean; lockedExisting: boolean } {
+        const collar = this.roomCharacters.get(memberNumber)?.Appearance
+            ?.find((item: any) => item?.Group === "ItemNeck" && item?.Name);
+
+        if (!collar) {
+            const collarName = this.pickTopCollar();
+            if (!collarName) return { added: false, lockedExisting: false };
+            this.bot.applyItem(memberNumber, "ItemNeck", collarName, "Default", lockProperty);
+            return { added: true, lockedExisting: false };
+        }
+
+        // If the collar is still showing as locked here, it's either a player-placed
+        // lock we can't remove (applyItem will be silently rejected by BC — same
+        // outcome as before) or a bot-placed lock that releaseLocksFor already
+        // cleared server-side but roomCharacters hasn't synced yet. In both cases
+        // we attempt the apply anyway: it works when BC has processed the unlock,
+        // and fails silently when it hasn't — which is no worse than the old early
+        // return. We strip the existing Property so stale lock fields don't
+        // interfere with the new lockProperty.
+        this.bot.applyItem(memberNumber, "ItemNeck", collar.Name, collar.Color ?? "Default",
+            lockProperty);
+        return { added: false, lockedExisting: true };
+    }
+
+    // Re-applies the loser's worn collar with no lock (preserving name/color),
+    // undoing a lock the bot added over a pre-existing collar at end game.
+    private unlockExistingCollar(memberNumber: number): void {
+        const collar = this.roomCharacters.get(memberNumber)?.Appearance
+            ?.find((item: any) => item?.Group === "ItemNeck" && item?.Name);
+        if (collar) {
+            this.bot.applyItem(memberNumber, "ItemNeck", collar.Name, collar.Color ?? "Default", {});
+        }
     }
 
     // Top-N most popular items for this slot (from this bot's own usage
     // data), filled out with random catalog items so the list is never
     // sparse on a cold start (StripDiceBot's shared picker instead falls
     // back to bootstrap preset outfits, which WD has none of).
-    private buildBondagePickList(group: string, excluded: string[]): { options: string[]; hasRandom: boolean } {
+    // Returns `all` — the full sorted catalog list for this slot (pinned new
+    // items → popular by usage → shuffled remainder) — and `options`, which is
+    // the first PICK_LIST_TOP_N entries of `all`. The full list is stored in
+    // the deal so "M for more" can page through it without re-randomising.
+    private buildBondagePickList(group: string, excluded: string[]): { options: string[]; all: string[] } {
         const catalogItems = this.itemCatalog.get(group) ?? [];
         const usage = this.bondageUsage[group] ?? {};
 
         // Pin any new items for this slot to the front (see NEW_ITEMS) so
         // players always see the latest gear regardless of usage history.
-        const options: string[] = [...NEW_ITEMS].filter(
+        const pinned: string[] = [...NEW_ITEMS].filter(
             n => catalogItems.includes(n) && !excluded.includes(n)
         );
-        for (const [name] of Object.entries(usage)
-            .filter(([name, count]) => count > 0 && !excluded.includes(name) && catalogItems.includes(name) && !options.includes(name))
+
+        // All items with recorded usage, sorted by popularity (descending).
+        const popularSorted: string[] = Object.entries(usage)
+            .filter(([name, count]) => count > 0 && !excluded.includes(name) && catalogItems.includes(name) && !pinned.includes(name))
             .sort((a, b) => b[1] - a[1])
-            .slice(0, PICK_LIST_TOP_N)) {
-            if (options.length >= PICK_LIST_TOP_N) break;
-            options.push(name);
-        }
-        const popularCount = options.length;
+            .map(([name]) => name);
 
-        const rest = catalogItems.filter(n => !options.includes(n) && !excluded.includes(n));
+        // Remaining catalog items not already above — shuffled once so the
+        // order is stable for the lifetime of this deal (M for more pages
+        // through the same shuffled list).
+        const rest = catalogItems.filter(n => !pinned.includes(n) && !popularSorted.includes(n) && !excluded.includes(n));
         const shuffled = [...rest].sort(() => Math.random() - 0.5);
-        while (options.length < PICK_LIST_TOP_N && shuffled.length > 0) {
-            options.push(shuffled.shift()!);
-        }
 
-        return { options, hasRandom: options.length > popularCount };
+        const all = [...pinned, ...popularSorted, ...shuffled];
+        const options = all.slice(0, PICK_LIST_TOP_N);
+
+        return { options, all };
     }
 
-    private formatBondagePickList(slotDisplay: string, wearerName: string, options: string[], hasRandom: boolean): string {
-        const lines = [`Slot: ${slotDisplay} — pick an item to apply to ${wearerName}:`];
+    private formatBondagePickList(slotDisplay: string, wearerName: string, options: string[], page: number, totalPages: number): string {
+        const pageNote = totalPages > 1 ? ` (page ${page + 1} of ${totalPages})` : "";
+        const lines = [`Slot: ${slotDisplay} — pick an item to apply to ${wearerName}:${pageNote}`];
         options.forEach((name, i) => {
             const newMarker = NEW_ITEMS.has(name) ? " 🆕 new!" : "";
-            const marker = hasRandom && i === options.length - 1 ? ` ← random pick (not in top ${PICK_LIST_TOP_N})` : "";
-            lines.push(`${i + 1}. ${name}${newMarker}${marker}`);
+            lines.push(`${i + 1}. ${name}${newMarker}`);
         });
+        if (page + 1 < totalPages) lines.push("M. More");
         lines.push("0. Back");
         lines.push("Or type any item name from this slot.");
         return lines.join("\n");
@@ -5344,6 +6051,8 @@ export class WinnersDiceGame {
             slot: null,
             itemName: null,
             itemOptions: [],
+            itemOptionsAll: [],
+            itemOptionsPage: 0,
             price: null,
             counterPrice: null,
             stage: "awaiting_slot",
@@ -5394,6 +6103,8 @@ export class WinnersDiceGame {
             slot: match.slot,
             itemName: match.itemName,
             itemOptions: [],
+            itemOptionsAll: [],
+            itemOptionsPage: 0,
             price: null,
             counterPrice: null,
             stage: "awaiting_price",
@@ -5433,6 +6144,8 @@ export class WinnersDiceGame {
             slot: null,
             itemName: null,
             itemOptions: [],
+            itemOptionsAll: [],
+            itemOptionsPage: 0,
             price: null,
             counterPrice: null,
             stage: "awaiting_removal_slot",
@@ -5606,7 +6319,7 @@ export class WinnersDiceGame {
             return true;
         }
 
-        const { options, hasRandom } = this.buildBondagePickList(match.group, []);
+        const { options, all } = this.buildBondagePickList(match.group, []);
         if (options.length === 0) {
             this.bot.whisper(deal.placer, "No items are available for that slot right now — pick a different one.");
             return true;
@@ -5614,8 +6327,11 @@ export class WinnersDiceGame {
 
         deal.slot = match.display;
         deal.itemOptions = options;
+        deal.itemOptionsAll = all;
+        deal.itemOptionsPage = 0;
         deal.stage = "awaiting_item";
-        this.sendLongWhisper(deal.placer, this.formatBondagePickList(match.display, wearerName, options, hasRandom));
+        const totalPages = Math.ceil(all.length / PICK_LIST_TOP_N);
+        this.sendLongWhisper(deal.placer, this.formatBondagePickList(match.display, wearerName, options, 0, totalPages));
         return true;
     }
 
@@ -5666,6 +6382,22 @@ export class WinnersDiceGame {
             return true;
         }
 
+        // "M" or "m" — advance to the next page of the item list.
+        if (trimmed.toLowerCase() === "m") {
+            const allOpts = deal.itemOptionsAll;
+            const totalPages = Math.ceil(allOpts.length / PICK_LIST_TOP_N);
+            if (totalPages <= 1) {
+                this.bot.whisper(deal.placer, "There are no more options for this slot.");
+                return true;
+            }
+            deal.itemOptionsPage = (deal.itemOptionsPage + 1) % totalPages;
+            const start = deal.itemOptionsPage * PICK_LIST_TOP_N;
+            deal.itemOptions = allOpts.slice(start, start + PICK_LIST_TOP_N);
+            const wearerName = this.playerName(deal.wearer);
+            this.sendLongWhisper(deal.placer, this.formatBondagePickList(deal.slot!, wearerName, deal.itemOptions, deal.itemOptionsPage, totalPages));
+            return true;
+        }
+
         if (/^\d+$/.test(trimmed)) {
             const idx = parseInt(trimmed, 10);
             if (idx >= 1 && idx <= deal.itemOptions.length) {
@@ -5689,20 +6421,9 @@ export class WinnersDiceGame {
                 this.bot.whisper(deal.placer, `Multiple matches: ${result.candidates.slice(0, 8).join(", ")} — be more specific.`);
                 return true;
             } else {
-                const alreadyShown = new Set(deal.itemOptions);
-                const rest = (this.itemCatalog.get(group) ?? []).filter(n => !alreadyShown.has(n));
-                if (rest.length === 0) {
-                    this.bot.whisper(deal.placer, `No item matching "${trimmed}" — and no more items left to list for this slot.`);
-                    return true;
-                }
-                const more = rest.slice(0, 10);
-                deal.itemOptions = more;
-                const remaining = rest.length - more.length;
-                this.sendLongWhisper(deal.placer,
-                    `No item matching "${trimmed}" in this slot. Here are ${more.length} more — reply with a number:\n` +
-                    more.map((name, i) => `${i + 1}. ${name}`).join("\n") +
-                    (remaining > 0 ? `\n...and ${remaining} more — type part of the name to search further.` : "")
-                );
+                const totalPages = Math.ceil(deal.itemOptionsAll.length / PICK_LIST_TOP_N);
+                const moreHint = totalPages > 1 ? " Type M to browse more options, or" : "";
+                this.bot.whisper(deal.placer, `No item matching "${trimmed}" for this slot.${moreHint} type more of the name to search.`);
                 return true;
             }
         }
@@ -5997,10 +6718,9 @@ export class WinnersDiceGame {
 
     // Physically releases every active bondage item via the BC socket and
     // clears the tracking arrays — used for a force-reset (!reset) or a
-    // safeword halt, where both players need to be freed immediately. A
-    // normal match end goes through releaseWinnerBondage() instead, since
-    // the loser's bondage is meant to stay on (the end-game timer lock
-    // handles stripping them later).
+    // safeword halt, where both players need to be freed immediately. A normal
+    // match end goes through releaseBondageFor() per player instead (winner at
+    // deal settlement, both at session end — see finishMatch).
     private releaseAllActiveBondage(): void {
         for (const entry of this.state.activeBondage) {
             this.bot.removeItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot));
@@ -6009,24 +6729,25 @@ export class WinnersDiceGame {
         this.state.removableBondage = [];
     }
 
-    // Strips only the winner's active bondage at the end of a match — the
-    // loser's stays on, since the end-game timer lock is responsible for
-    // freeing them. Removal is staggered one item at a time
-    // (END_GAME_STRIP_STAGGER_MS apart) rather than fired all at once, and
-    // each removal is verified against the winner's synced appearance,
-    // retrying up to END_GAME_STRIP_MAX_ATTEMPTS times before giving up and
-    // asking the winner to remove the item manually.
-    private releaseWinnerBondage(winnerMemberNumber: number): void {
-        const toRemove = this.state.activeBondage.filter(b => b.wearerMemberNumber === winnerMemberNumber);
+    // Strips one member's active bondage. Used for the winner the moment an
+    // end-game deal settles, and for BOTH players at the end of the session
+    // (see finishMatch). Removal is staggered one item at a time
+    // (END_GAME_STRIP_STAGGER_MS apart) rather than fired all at once, and each
+    // removal is verified against the member's synced appearance, retrying up
+    // to END_GAME_STRIP_MAX_ATTEMPTS times before giving up and asking them to
+    // remove the item manually. Callers should unlock the member's locks first
+    // (releaseLocksFor / releaseAllActiveLocks) — a locked item won't remove.
+    private releaseBondageFor(memberNumber: number): void {
+        const toRemove = this.state.activeBondage.filter(b => b.wearerMemberNumber === memberNumber);
 
         toRemove.forEach((entry, i) => {
             setTimeout(() => {
-                this.stripWinnerItem(winnerMemberNumber, entry.slot, this.groupForSlotDisplay(entry.slot), 1);
+                this.stripWinnerItem(memberNumber, entry.slot, this.groupForSlotDisplay(entry.slot), 1);
             }, i * END_GAME_STRIP_STAGGER_MS);
         });
 
-        this.state.activeBondage = this.state.activeBondage.filter(b => b.wearerMemberNumber !== winnerMemberNumber);
-        this.state.removableBondage = this.state.removableBondage.filter(b => b.wearerMemberNumber !== winnerMemberNumber);
+        this.state.activeBondage = this.state.activeBondage.filter(b => b.wearerMemberNumber !== memberNumber);
+        this.state.removableBondage = this.state.removableBondage.filter(b => b.wearerMemberNumber !== memberNumber);
     }
 
     // Removes one item from the winner and, after a short delay, checks
@@ -6448,6 +7169,30 @@ export class WinnersDiceGame {
         this.state.activeLocks = [];
     }
 
+    // Unlocks only one member's active locks (re-applying each item with no
+    // lock property, same mechanism as releaseAllActiveLocks), leaving everyone
+    // else's in place. Used at end-game settlement so the winner's bondage can
+    // actually be removed — BC won't removeItem a locked item, so the winner
+    // would otherwise stay bound whenever the loser had paid to lock them
+    // during the match. The loser's locks are untouched (the end-game leash
+    // lock is meant to keep them bound for the agreed time).
+    private releaseLocksFor(memberNumber: number): void {
+        const remaining: typeof this.state.activeLocks = [];
+        for (const entry of this.state.activeLocks) {
+            if (entry.wearerMemberNumber !== memberNumber) {
+                remaining.push(entry);
+                continue;
+            }
+            const item = this.state.activeBondage.find(
+                b => b.wearerMemberNumber === entry.wearerMemberNumber && b.slot === entry.slot
+            );
+            if (item) {
+                this.bot.applyItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), item.itemName, "Default", {});
+            }
+        }
+        this.state.activeLocks = remaining;
+    }
+
     // ============================================================
     // TOYS (spend menu)
     // ============================================================
@@ -6483,32 +7228,32 @@ export class WinnersDiceGame {
         return {};
     }
 
-    // Top-N curated popular toys, filled out with random catalog items so
-    // the list is never sparse — mirrors buildBondagePickList.
-    private buildToyPickList(): { options: ToyCatalogEntry[]; hasRandom: boolean } {
+    // Curated popular toys followed by shuffled remainder — mirrors
+    // buildBondagePickList's all/options pattern so "M for more" can page
+    // through the full catalog without re-randomising.
+    private buildToyPickList(): { options: ToyCatalogEntry[]; all: ToyCatalogEntry[] } {
         const popular = POPULAR_TOY_ASSET_NAMES
             .map(name => this.toyCatalog.find(t => t.assetName === name))
             .filter((t): t is ToyCatalogEntry => t !== undefined);
-        const popularCount = popular.length;
 
         const rest = this.toyCatalog.filter(t => !popular.includes(t));
         const shuffled = [...rest].sort(() => Math.random() - 0.5);
-        const options = [...popular];
-        while (options.length < PICK_LIST_TOP_N && shuffled.length > 0) {
-            options.push(shuffled.shift()!);
-        }
 
-        return { options, hasRandom: options.length > popularCount };
+        const all = [...popular, ...shuffled];
+        const options = all.slice(0, PICK_LIST_TOP_N);
+
+        return { options, all };
     }
 
-    private formatToyPickList(options: ToyCatalogEntry[], hasRandom: boolean): string {
-        const lines = [`Pick a toy:`];
+    private formatToyPickList(options: ToyCatalogEntry[], page: number, totalPages: number): string {
+        const pageNote = totalPages > 1 ? ` (page ${page + 1} of ${totalPages})` : "";
+        const lines = [`Pick a toy:${pageNote}`];
         options.forEach((t, i) => {
-            const marker = hasRandom && i === options.length - 1 ? ` ← random pick (not in top ${PICK_LIST_TOP_N})` : "";
-            lines.push(`${i + 1}. ${t.label}${marker}`);
+            lines.push(`${i + 1}. ${t.label}`);
         });
+        if (page + 1 < totalPages) lines.push("M. More");
         lines.push("0. Back");
-        lines.push(`Or type any toy name, or "list" to see the full catalog.`);
+        lines.push(`Or type any toy name.`);
         return lines.join("\n");
     }
 
@@ -6540,13 +7285,16 @@ export class WinnersDiceGame {
         }
 
         const loser = state.players.find(p => p.memberNumber !== winner)!;
-        const { options, hasRandom } = this.buildToyPickList();
+        const { options, all } = this.buildToyPickList();
+        const totalPages = Math.ceil(all.length / PICK_LIST_TOP_N);
         state.toyDeal = {
             winner,
             loser: loser.memberNumber,
             toyAssetName: null,
             toyLabel: null,
             toyOptions: options.map(t => t.assetName),
+            toyOptionsAll: all.map(t => t.assetName),
+            toyOptionsPage: 0,
             price: null,
             counterPrice: null,
             stage: "awaiting_toy",
@@ -6558,7 +7306,7 @@ export class WinnersDiceGame {
         };
 
         this.bot.sendChat(`🎲 ${this.playerName(winner)} has something devious in mind for ${this.playerName(loser.memberNumber)}...`);
-        this.sendLongWhisper(winner, this.formatToyPickList(options, hasRandom));
+        this.sendLongWhisper(winner, this.formatToyPickList(options, 0, totalPages));
     }
 
     // Dispatches a message to the in-progress toy deal, if any. Returns true
@@ -6617,6 +7365,25 @@ export class WinnersDiceGame {
             return true;
         }
 
+        // "M" or "m" — advance to the next page of the toy list.
+        if (trimmed.toLowerCase() === "m") {
+            const allAssets = deal.toyOptionsAll;
+            const totalPages = Math.ceil(allAssets.length / PICK_LIST_TOP_N);
+            if (totalPages <= 1) {
+                this.bot.whisper(deal.winner, "There are no more toys to browse.");
+                return true;
+            }
+            deal.toyOptionsPage = (deal.toyOptionsPage + 1) % totalPages;
+            const start = deal.toyOptionsPage * PICK_LIST_TOP_N;
+            const pageAssets = allAssets.slice(start, start + PICK_LIST_TOP_N);
+            deal.toyOptions = pageAssets;
+            const pageOptions = pageAssets
+                .map(a => this.toyCatalog.find(t => t.assetName === a))
+                .filter((t): t is ToyCatalogEntry => t !== undefined);
+            this.sendLongWhisper(deal.winner, this.formatToyPickList(pageOptions, deal.toyOptionsPage, totalPages));
+            return true;
+        }
+
         if (/^\d+$/.test(trimmed)) {
             const idx = parseInt(trimmed, 10);
             if (idx >= 1 && idx <= deal.toyOptions.length) {
@@ -6641,7 +7408,9 @@ export class WinnersDiceGame {
                 this.bot.whisper(deal.winner, `Multiple matches: ${result.candidates.slice(0, 8).map(c => c.label).join(", ")} — be more specific.`);
                 return true;
             } else {
-                this.bot.whisper(deal.winner, `No toy matching "${trimmed}" — pick a number from the list, type part of the name, or "list" for the full catalog.`);
+                const totalPages = Math.ceil(deal.toyOptionsAll.length / PICK_LIST_TOP_N);
+                const moreHint = totalPages > 1 ? " Type M to browse more options, or" : "";
+                this.bot.whisper(deal.winner, `No toy matching "${trimmed}".${moreHint} type more of the name.`);
                 return true;
             }
         }
@@ -7010,6 +7779,8 @@ export class WinnersDiceGame {
         const otherMemberNumber = this.getOtherPlayerMemberNumber(memberNumber);
 
         if (state.negotiation) this.clearChallengeAcceptanceTimer(state.negotiation);
+        this.pendingChallengeDisambiguation = null;
+        this.clearMatchStartConfirm();
         this.clearDisconnectTimer();
         this.clearPendingWardrobeChecks();
         // TODO: Save/resume end game state across sessions — design TBD.
@@ -7128,6 +7899,7 @@ export class WinnersDiceGame {
 
         log(`DISCONNECT: Ending match — ${playerName} (#${disconnectedMemberNumber}) did not return in time.`);
 
+        this.clearMatchStartConfirm();
         this.clearDisconnectTimer();
         this.clearPendingWardrobeChecks();
         this.clearEndGameState();
@@ -7214,6 +7986,8 @@ export class WinnersDiceGame {
         }
 
         if (this.state.negotiation) this.clearChallengeAcceptanceTimer(this.state.negotiation);
+        this.pendingChallengeDisambiguation = null;
+        this.clearMatchStartConfirm();
         this.clearPendingWardrobeChecks();
         // TODO: Save/resume end game state across sessions — design TBD.
         this.clearEndGameState();
@@ -7249,6 +8023,8 @@ export class WinnersDiceGame {
             this.bot.removeItem(state.activeEndGame.loserMemberNumber, END_GAME_LEASH_GROUP);
             if (state.activeEndGame.collarAdded) {
                 this.bot.removeItem(state.activeEndGame.loserMemberNumber, "ItemNeck");
+            } else if (state.activeEndGame.collarLockedExisting) {
+                this.unlockExistingCollar(state.activeEndGame.loserMemberNumber);
             }
             state.activeEndGame = null;
         }
@@ -7355,7 +8131,7 @@ export class WinnersDiceGame {
         const parts = args.trim().split(/\s+/);
         const playerId = parts[0];
         const status = (parts[1] ?? "").toLowerCase() as FeedbackItemStatus;
-        const validStatuses: FeedbackItemStatus[] = ["reviewing", "testing", "implemented", "partly_implemented"];
+        const validStatuses: FeedbackItemStatus[] = ["reviewing", "testing", "implemented", "partly_implemented", "declined"];
 
         if (!playerId || !/^\d+$/.test(playerId)) {
             this.bot.whisper(sender, "Usage: !setstatus <memberNumber> <status>");

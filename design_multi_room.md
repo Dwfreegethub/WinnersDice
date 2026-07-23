@@ -278,6 +278,19 @@ Adding a room bot = add a new entry here + a new BC account in secrets.ts.
 
 ---
 
+## Blocked-Lock Preflight + High-Security Fallback (2026-07-20)
+
+The end game locks the loser with a `TimerPasswordPadlock`. If a player has that item in their `BlockItems` (`char.BlockItems.ItemMisc.TimerPasswordPadlock`), the lock silently fails and the whole claimed-time payoff breaks with no error. BC only broadcasts `BlockItems` at room-join, so the bot can't detect a mid-room change — but a mid-room *unblock* does take effect when the lock is actually applied (verified live 2026-07-20 via `!testcufflock`).
+
+Flow:
+- **Detect** right after the challenge is accepted (`handleChallengeAcceptAnswer` → `beginLockBlockCheck`), before the settings questions, so a problem is caught before anyone wastes time on the full Q&A. `hasPadlockBlocked(n)` reads the cached character's `BlockItems`.
+- **Resolve gate** (`lockBlockStage`): each blocked player replies `unblock`/`!lockready` (they re-enabled it — trusted, since we can't re-detect and the apply just works) or `highsec` (request the alternative). High-Security needs **both** players' yes (`handleHighSecConsent`), per the game's consent rules.
+- **High-Security end game**: `applyEndGameLocks` uses `buildHighSecurityLockProperty` — `LockedBy: "HighSecurityPadlock"`, `MemberNumberListKeys: "<bot>,<winner>"` (winner holds a key, can release any time), no password/timer. The bot's own `setTimeout → expireEndGame` still auto-removes it, same as the timer-password case.
+- **Multi-room**: the decision happens on the lobby bot but the lock is applied on the room bot, so `useHighSecurityLock` rides in `HandoffEntry` (lobby sets it in `handOffMatch`, room bot reads it in `startClaimedMatch → launchMatch`).
+- **Loser move-out consent** (`awaiting_loser_move_consent`, High-Security only): a High-Security lock has no visible timer and the bot can't reach the loser once they leave the room, so if the winner chose "move", the loser is asked (`closeEndGameDeal` → `handleLoserMoveConsent`) to confirm they're OK leaving (trusting the winner to unlock) or to keep the session in-room so the bot auto-releases. "No" overrides `location→stay`, `inRoom→true`.
+
+Temp `!testcufflock [@name] [keyNumber]` admin command exists for verifying this — remove after live-testing the real feature.
+
 ## Deferred / Future
 
 - **Leash mechanic** — test whether BC leash-drag socket events interact with room transitions; could be used to "pull" a player into the game room instead of just whispering them. Not blocking anything.
