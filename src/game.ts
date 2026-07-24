@@ -6854,6 +6854,9 @@ export class WinnersDiceGame {
                 state.activeLocks = state.activeLocks.filter(l => l !== lock);
             }
 
+            // Preserve the original apply price before the entry is filtered
+            // out, so a free re-apply keeps the same buyback cost basis.
+            const removedEntry = state.activeBondage.find(b => b.wearerMemberNumber === deal.wearer && b.slot === deal.slot);
             this.bot.removeItem(deal.wearer, group);
             state.activeBondage = state.activeBondage.filter(b => !(b.wearerMemberNumber === deal.wearer && b.slot === deal.slot));
             if (ALLOW_FREE_REAPPLY) {
@@ -6863,6 +6866,7 @@ export class WinnersDiceGame {
                     assetName: itemName,
                     placerMemberNumber: deal.placer,
                     wearerMemberNumber: deal.wearer,
+                    applyPrice: removedEntry?.applyPrice ?? price,
                 });
             }
 
