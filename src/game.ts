@@ -1420,6 +1420,14 @@ export class WinnersDiceGame {
             text += `!help admin - Admin commands\n`;
         }
 
+        if (botRole === "main") {
+            text +=
+                `--- Matchmaking (find people to play) ---\n` +
+                `!wd register - Join the pool so registered players can beep you for a game\n` +
+                `!looking - In the lobby and want to play? Beep everyone who's online and registered\n` +
+                `!wd status - Your registration status (or !wd for all matchmaking commands)\n`;
+        }
+
         text +=
             `!feedback <text> - Send feedback (whisper only)\n` +
             `!friend - Add me to your friend list so you can see when I'm online (!unfriend to undo)\n` +
@@ -9210,7 +9218,12 @@ export class WinnersDiceGame {
             ? `Ready to play? Type !challenge @[playername] to get started!`
             : `There's a game in progress right now — feel free to watch!`;
 
-        this.sendLongWhisper(memberNumber, intro + closing);
+        // Only the lobby bot runs matchmaking.
+        const matchmaking = botRole === "main"
+            ? `\n\n🔔 New — matchmaking: whisper !wd register to join the pool. Then !looking beeps everyone who's registered and online when you want a game, and you'll get beeped when they do — so nobody has to sit in an empty room waiting. (You'll be asked to friend me back so it works.)`
+            : "";
+
+        this.sendLongWhisper(memberNumber, intro + closing + matchmaking);
     }
 
     // ---- changelog ---------------------------------------------------
