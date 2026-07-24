@@ -4977,6 +4977,14 @@ export class WinnersDiceGame {
     // STREAK BOOST PURCHASE
     // ============================================================
 
+    // Cumulative point cost to hold a total boost of `boost` (0 = free). Prices
+    // are per total level (see BOOST_PRICES), so a top-up charges the gap
+    // between levels — stacking cheap +1s can't dodge the higher tiers.
+    private boostPriceFor(boost: number): number {
+        if (boost <= 0) return 0;
+        return BOOST_PRICES[Math.min(boost, MAX_BOOST) - 1];
+    }
+
     private startBoostPurchase(sender: number): void {
         const state = this.state;
         if (!state.players) return;
@@ -4985,16 +4993,19 @@ export class WinnersDiceGame {
         state.awaitingBoostLevel = sender;
 
         this.bot.sendChat(`⚡ ${this.playerName(sender)} is picking up a power-up...`);
+        const room = MAX_BOOST - player.boost;
         this.bot.whisper(sender,
             `A boost adds straight to your roll total and persists across rounds — it only drains by 1 each time you lose, so a +3 boost survives 3 losses.\n\n` +
-            `Streak Boost prices:\n` +
-            `+1 Boost — 40 points\n` +
-            `+2 Boost — 100 points\n` +
-            `+3 Boost — 225 points\n` +
-            `+4 Boost — 500 points\n` +
-            `+5 Boost — 1,000 points\n` +
+            `Prices are for your TOTAL boost level (topping up only charges the difference):\n` +
+            `+1 total — 40 points\n` +
+            `+2 total — 100 points\n` +
+            `+3 total — 225 points\n` +
+            `+4 total — 500 points\n` +
+            `+5 total — 1,000 points\n` +
             `(your current boost: +${player.boost}, max total: +${MAX_BOOST})\n` +
-            `How many levels? (say 1-5, or 0 to go back)`
+            (room > 0
+                ? `How many more levels? (say 1-${room}, or 0 to go back)`
+                : `You're already at the max boost. (say 0 to go back)`)
         );
     }
 
@@ -5026,9 +5037,14 @@ export class WinnersDiceGame {
             level = room;
         }
 
-        const cost = BOOST_PRICES[level - 1];
+        // Prices are for the TOTAL boost level, not per-purchase, so topping up
+        // charges the difference between the new total's price and what the
+        // current level would have cost. Without this, buying +1 five times
+        // (5×40) would reach +5 for 200 instead of its real 1000 price.
+        const targetBoost = player.boost + level;
+        const cost = this.boostPriceFor(targetBoost) - this.boostPriceFor(player.boost);
         if (state.spendingBalance < cost) {
-            this.bot.whisper(sender, `You can't afford that — +${level} Boost costs ${cost} points and you have ${state.spendingBalance}. Type !cancel to exit the shop or choose a cheaper level.`);
+            this.bot.whisper(sender, `You can't afford that — going from +${player.boost} to +${targetBoost} costs ${cost} points and you have ${state.spendingBalance}. Type !cancel to exit the shop or choose a smaller boost.`);
             state.awaitingBoostLevel = null;
             this.returnToSpendMenu(sender);
             return;
@@ -5038,7 +5054,7 @@ export class WinnersDiceGame {
         player.boost += level;
         state.awaitingBoostLevel = null;
 
-        this.bot.whisper(sender, `Boost purchased! Your boost is now +${player.boost}. Each loss reduces it by 1.`);
+        this.bot.whisper(sender, `Boost purchased for ${cost} points! Your boost is now +${player.boost}. Each loss reduces it by 1.`);
         this.returnToSpendMenu(sender);
     }
 
