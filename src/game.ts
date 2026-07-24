@@ -1046,6 +1046,9 @@ export class WinnersDiceGame {
             case "!testonline":
                 this.handleTestOnline(sender, args);
                 break;
+            case "!testbeep":
+                this.handleTestBeep(sender, args);
+                break;
             case "!stuck":
                 this.handleStuck(sender, args);
                 break;
@@ -1523,7 +1526,8 @@ export class WinnersDiceGame {
             `!testlock [@name] - Instantly apply a test timer/password lock (self by default) - no match needed\n` +
             `!teststrip [@name] [group] - Report clothing act/advise verdict + worn items; if a group is named, try to remove it (wardrobe-helper live test)\n` +
             `!testredress @name [number|group] - List what you took off that player, numbered; reply a number (or pass one, e.g. "bra") to put it back on\n` +
-            `!testonline [@name|memberNumber] - Friend the target, then ask BC who's online and report if they show up (matchmaking presence probe)`;
+            `!testonline [@name|memberNumber] - Friend the target, then ask BC who's online and report if they show up (matchmaking presence probe)\n` +
+            `!testbeep <@name|memberNumber> [message] - Send a beep (with text) to the target; have them reply to test the incoming-beep path`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -7552,6 +7556,66 @@ export class WinnersDiceGame {
             isOnline
                 ? `✅ #${target} IS shown online — one-directional friending is enough for presence.`
                 : `❌ #${target} is NOT in the online list. Either they're offline, or BC needs them to friend the bot back (mutual). Full raw result is in the log (AccountQueryResult).`);
+    }
+
+    // Incoming beep handler (wired in index.ts). For now this is a probe: it
+    // logs the exact shape of every incoming beep — especially a reply to a
+    // bot-sent beep — so the matchmaking relay can rely on the right fields
+    // (sender, message, room). See design_matchmaking.md "Reply relay".
+    public onAccountBeep(data: any): void {
+        const from = data?.MemberNumber;
+        const name = data?.MemberName ?? "?";
+        const msg = data?.Message ?? "";
+        const room = data?.ChatRoomName ?? "";
+        log(`INCOMING BEEP from ${name} (#${from})${room ? ` [room: ${room}]` : ""}: "${msg}" — raw keys: ${Object.keys(data ?? {}).join(",")}`);
+
+        // If an admin is in the room, echo it so the probe can be watched live
+        // without tailing the log.
+        for (const mn of secrets.adminMemberNumbers) {
+            if (this.roomMembers.has(mn)) {
+                this.bot.whisper(mn, `🔔 Incoming beep from ${name} (#${from})${room ? ` in "${room}"` : ""}: "${msg || "(no message)"}"`);
+            }
+        }
+    }
+
+    // !testbeep <@name|memberNumber> [message] — admin-only. Sends a beep to
+    // the target (with a message) so we can confirm (a) beeps arrive and (b)
+    // the Message text rides along. Have the target REPLY to see the incoming
+    // shape via onAccountBeep. See design_matchmaking.md build notes.
+    private handleTestBeep(sender: number, args: string): void {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        if (tokens.length === 0) {
+            this.bot.whisper(sender, "Usage: !testbeep <@name|memberNumber> [message]");
+            return;
+        }
+
+        const first = tokens[0];
+        let target: number;
+        if (/^@?\d{3,}$/.test(first)) {
+            target = Number(first.replace(/^@/, ""));
+        } else {
+            const matches = this.findPlayersByName(first.replace(/^@/, ""), -1);
+            if (matches.length === 0) {
+                this.bot.whisper(sender, `No one named "${first.replace(/^@/, "")}" found in the room (or pass a member number).`);
+                return;
+            }
+            if (matches.length > 1) {
+                this.bot.whisper(sender, `Multiple people match "${first.replace(/^@/, "")}" — be more specific or pass a member number.`);
+                return;
+            }
+            target = matches[0].memberNumber;
+        }
+
+        const message = tokens.slice(1).join(" ") || "WinnersDice test beep — reply to this so we can check the reply path.";
+        this.bot.beep(target, message);
+        const targetName = this.roomMembers.get(target)?.name ?? `#${target}`;
+        this.bot.whisper(sender,
+            `🔧 Beeped ${targetName} (#${target}) with: "${message}". Check that it arrived WITH the text, then have them reply — I'll echo the incoming beep here and log its shape.`);
     }
 
     // ============================================================

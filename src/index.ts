@@ -163,6 +163,10 @@ async function main() {
         game.onSyncSingle(data);
     });
 
+    bot.onAccountBeep((data: any) => {
+        game.onAccountBeep(data);
+    });
+
     bot.onReconnect(() => {
         log("Reconnect complete. Re-announcing bot...");
         bot.sendChat("WinnersDice reconnected!");

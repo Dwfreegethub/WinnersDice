@@ -321,6 +321,25 @@ export class BCConnection {
         });
     }
 
+    // Sends a beep (optionally carrying a text message) to a member. BC
+    // delivers it as an AccountBeep to the target, wherever they are. Whether
+    // the Message text actually rides along is unverified for this bot — that's
+    // what !testbeep checks before the matchmaking pool relies on it.
+    public beep(memberNumber: number, message?: string): void {
+        this.socket.emit("AccountBeep", {
+            MemberNumber: memberNumber,
+            BeepType: "",
+            Message: message ?? "",
+        });
+        log(`Beeped #${memberNumber}${message ? `: "${message}"` : ""}.`);
+    }
+
+    // Incoming beeps (including replies to a beep we sent). listenAll already
+    // logs the raw event; this lets game logic act on it too.
+    public onAccountBeep(handler: (data: any) => void): void {
+        this.socket.on("AccountBeep", handler);
+    }
+
     public onMessage(handler: (data: any) => void): void {
         this.socket.on("ChatRoomMessage", handler);
     }

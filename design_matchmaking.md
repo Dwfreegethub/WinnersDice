@@ -167,11 +167,14 @@ This resolves the original open question of "what if no one is online" — the q
 3. ~~**Room requirement:**~~ **Resolved 2026-07-23.** `!looking` requires the caller to be in the WD lobby — the early-leave strike system depends on it, and whisper commands need in-room presence anyway. Registration is likewise in-room.
 4. ~~**Strike reset on good behavior:**~~ **Resolved 2026-07-23 — strikes decay.** A strike comes off when the player behaves well (see Strike System); admin `!wd clearstrikes` can still wipe them manually.
 
-### Verify during the build (first steps)
+### Beep behavior — VERIFIED 2026-07-23 (via `!testbeep`)
 - ~~**Friending collision**~~ — Resolved: friendship is decoupled from pool membership (see Friending). No per-friendship bookkeeping.
-- **`beep()` send shape** — the bot receives `AccountBeep` but has never sent one. First build step: add `beep()` + a temp `!testbeep @name msg` probe and confirm a beep actually arrives with the expected text.
-- **Incoming beep-reply parsing** — `AccountBeep` is only logged today; wire it into game logic and confirm the reply's sender + message fields so the relay (see Reply relay) can match it to an active call.
-- **Offline beep delivery** — not needed (we only beep online players), but note if observed during testing.
+- **Sending:** `connection.beep(memberNumber, message)` emits `AccountBeep { MemberNumber, BeepType: "", Message }`. Confirmed the beep arrives at the target **with the text**.
+- **Receiving:** incoming beeps arrive as `AccountBeep` with keys `MemberNumber` (sender), `MemberName`, `ChatRoomSpace`, `ChatRoomName`, `Private`, `BeepType`, `Message`.
+  - For a **human** beep, `Message` is a plain **string** (verified: `"test 3"`).
+  - For an **addon** beep (e.g. `BeepType: "GGC_BEEP"`), `Message` is a structured **object** (a protocol payload). The relay must **ignore these** — only act when `typeof Message === "string"`.
+- **Reply = a fresh beep to the sender.** A registered player replying to the bot's `!looking` beep produces a normal cross-account `AccountBeep` to the bot (same as a direct beep). So the relay reads `data.MemberNumber` + `data.Message` (string only).
+- **Offline beep delivery** — not needed (we only beep online players); untested.
 
 ---
 
