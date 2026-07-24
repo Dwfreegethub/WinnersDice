@@ -27,19 +27,19 @@
 
 - **Buyback: no wardrobe detection on re-equip** — BC's `ChatRoomSyncSingle` can't distinguish item added vs removed. Buyback flow skips wardrobe monitoring — player re-equips manually after payment. Revisit if BC ever exposes an "item equipped" event.
 
----
+- ~~**Buyback bondage: Should work like removing locks and clothing**~~ — Done 2026-07-23. Revamped to 2× fixed cost, no negotiation, mirrors clothing/lock buyback.
 
 ## Queued Features / Changes
 
-- **Standardize clothing/wardrobe-change detection between WD and BD** — WD's `startWardrobeCheck` treats any `ChatRoomSyncSingle` as proof of handoff. BD's baseline-diff pattern is meaningfully more robust. On hold — DW wants to field-test BD changes live first.
+- ~~**Standardize clothing/wardrobe-change detection between WD and BD**~~ — Done 2026-07-23. Both bots now use Appearance.length baseline-diff in `onSyncSingle`. BD additionally maintains a per-slot `itemStateCache` for lock verification, but that's BD-specific and not needed in WD.
 
-- **Banking + clothing menus whisper-only** — May be obsolete given the deliberate "early shop announcements" design (2026-07-09). Worth a quick DW call on whether to drop or scope down.
+- ~~**Banking + clothing menus whisper-only**~~ — Confirmed complete/obsolete 2026-07-23. Early shop announcements are the intended design.
 
 - **Multi-room: Locked room type doesn't actually lock** — `configureRoomForMatch({locked: true})` runs but BC silently ignores the field. Real fix needs traffic inspection. Leaving as-is for now — Private + Spectator is good enough.
 
 - **Maybe force higher shop prices in later rounds** — spend menu deals more expensive as match progresses, similar to end game 1×/3×/5× multipliers. Design TBD. (2026-07-21)
 
-- **Negotiation Deadlock — Forced Sale** — not implemented. After 2 rounds of no agreement, bot intervenes: forced price = highest offer × configurable multiplier (default 2×). Design concerns around abuse still unresolved — DW to revisit.
+- ~~**Negotiation Deadlock — Forced Sale**~~ — Resolved 2026-07-23. Winner always gets the last bid, so deadlock can't persist indefinitely.
 
 ### End Game — open items
 
@@ -64,8 +64,8 @@ _(add items here as they come up during playtesting)_
 
 ## Minor / Polish
 
-1. **`!help shop` bondage description is misleading** — says "you pay half goes to them," reads like payer only pays half. They pay full price; opponent receives half.
-2. **Service deal doesn't disclose the 50/50 split to the seller** — lock/toy/bondage all say "you'll receive X pts (half)" upfront. Service never mentions it — seller discovers it by checking their pending balance.
+1. ~~**`!help shop` bondage description is misleading**~~ — Fixed 2026-07-23. Now reads "you pay full price; they receive half — bot takes the rest."
+2. ~~**Service deal doesn't disclose the 50/50 split to the seller**~~ — Fixed 2026-07-23. Seller now sees "you'd receive X pts (half)" on initial offer, on each counter-whisper, and a settlement confirmation whisper on deal close.
 
 ---
 
@@ -77,7 +77,7 @@ _(add items here as they come up during playtesting)_
 
 ### Medium effort
 - [ ] Split `handleConversational()` by game phase
-- [ ] Add `gamesLost` field + `!leaderboard` command — `PlayerRecord` in `types.ts` has no `gamesLost`; BD's leaderboard is at `StripDiceBot/src/game.ts:2564-2590`
+- [~] Add `gamesLost` field + `!leaderboard` command — `gamesLost` added to `PlayerRecord`, `!leaderboard` / `!lb` implemented (top 5 winners + losers, your record). Backfill on load. Needs live test; polish (win rate, min games threshold) TBD later.
 
 ---
 

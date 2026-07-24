@@ -324,7 +324,7 @@ export interface ActiveBondage {
     assetName: string; // BC asset name for removal — same as itemName in this catalog
     placerMemberNumber: number;
     wearerMemberNumber: number;
-    removalPrice?: number; // set once the wearer's buyback negotiation lands on a price
+    applyPrice: number; // agreed price when the bondage was applied; buyback costs 2×
 }
 
 // An Exclusive lock the bot applied to a worn bondage item. The bot bypasses
@@ -651,8 +651,10 @@ export interface GameState {
     // Member number awaiting a 1-5 response to the boost-purchase menu.
     awaitingBoostLevel: number | null;
     // Member number awaiting a response (item choice / yes-no) to the
-    // buyback menu.
+    // clothing buyback menu.
     awaitingBuyback: number | null;
+    // Member number awaiting a numbered reply to the bondage buyback menu.
+    awaitingBondageBuyback: number | null;
     // Set after a clothing deal or buyback closes, while waiting for the
     // named member to update their wardrobe. Blocks all game commands.
     waitingForWardrobe: { memberNumber: number; item: string; timeoutAt: number } | null;
@@ -714,6 +716,7 @@ export interface PlayerRecord {
     lastSeen: string;
     gamesPlayed: number;
     gamesWon: number;
+    gamesLost: number;
     feedbackGiven: boolean;
     /** Newest changelog version this player has read via !changelog. */
     lastChangelogVersion?: string;
