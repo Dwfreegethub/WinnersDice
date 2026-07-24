@@ -1043,6 +1043,9 @@ export class WinnersDiceGame {
             case "!testredress":
                 this.handleTestRedress(sender, args);
                 break;
+            case "!testonline":
+                this.handleTestOnline(sender, args);
+                break;
             case "!stuck":
                 this.handleStuck(sender, args);
                 break;
@@ -1519,7 +1522,8 @@ export class WinnersDiceGame {
             `!feedback list - View all feedback\n` +
             `!testlock [@name] - Instantly apply a test timer/password lock (self by default) - no match needed\n` +
             `!teststrip [@name] [group] - Report clothing act/advise verdict + worn items; if a group is named, try to remove it (wardrobe-helper live test)\n` +
-            `!testredress @name [number|group] - List what you took off that player, numbered; reply a number (or pass one, e.g. "bra") to put it back on`;
+            `!testredress @name [number|group] - List what you took off that player, numbered; reply a number (or pass one, e.g. "bra") to put it back on\n` +
+            `!testonline [@name|memberNumber] - Friend the target, then ask BC who's online and report if they show up (matchmaking presence probe)`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -7499,6 +7503,55 @@ export class WinnersDiceGame {
             clearTimeout(this.pendingTestRedress.timer);
             this.pendingTestRedress = null;
         }
+    }
+
+    // !testonline [@name|memberNumber] — admin-only matchmaking probe (see
+    // design_matchmaking.md). Friends the target, then asks BC which friends
+    // are online (AccountQuery/OnlineFriends) and reports whether the target
+    // shows up. Answers two unknowns: does the query work at all, and is a
+    // one-directional friend (bot → player) enough for BC to report presence,
+    // or does the player have to friend the bot back?
+    private async handleTestOnline(sender: number, args: string): Promise<void> {
+        if (!this.isAdmin(sender)) {
+            this.bot.whisper(sender, "Only the admin can use this command.");
+            return;
+        }
+
+        // Resolve target: a raw member number, an @name, or default to sender.
+        let target = sender;
+        const tok = args.trim();
+        if (tok) {
+            if (/^\d{3,}$/.test(tok)) {
+                target = Number(tok);
+            } else {
+                const matches = this.findPlayersByName(tok.replace(/^@/, ""), -1);
+                if (matches.length === 0) {
+                    this.bot.whisper(sender, `No one named "${tok.replace(/^@/, "")}" found in the room (or pass a member number).`);
+                    return;
+                }
+                if (matches.length > 1) {
+                    this.bot.whisper(sender, `Multiple people match "${tok.replace(/^@/, "")}" — be more specific or pass a member number.`);
+                    return;
+                }
+                target = matches[0].memberNumber;
+            }
+        }
+
+        const alreadyFriend = this.bot.isFriend(target);
+        const added = this.bot.addFriend(target);
+        this.bot.whisper(sender,
+            `🔧 Friend step: ${added ? `friended #${target}` : (alreadyFriend ? `#${target} already a friend` : `couldn't friend #${target}`)}. Querying BC for online friends…`);
+
+        const online = await this.bot.queryOnlineFriends();
+        const isOnline = online.some((f: any) => f?.MemberNumber === target);
+        const list = online.map((f: any) =>
+            `${f?.MemberName ?? "?"} #${f?.MemberNumber}${f?.ChatRoomName ? ` in "${f.ChatRoomName}"` : ""}`);
+
+        this.bot.whisper(sender, `AccountQuery returned ${online.length} online friend(s): ${list.join(" | ") || "(none)"}.`);
+        this.bot.whisper(sender,
+            isOnline
+                ? `✅ #${target} IS shown online — one-directional friending is enough for presence.`
+                : `❌ #${target} is NOT in the online list. Either they're offline, or BC needs them to friend the bot back (mutual). Full raw result is in the log (AccountQueryResult).`);
     }
 
     // ============================================================

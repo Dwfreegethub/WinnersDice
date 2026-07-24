@@ -287,11 +287,37 @@ export class BCConnection {
             "ChatRoomSyncItem",
             "ChatRoomSyncSingle",
             "AccountBeep",
+            "AccountQueryResult",
         ];
         events.forEach(event => {
             this.socket.on(event, (data: any) => {
                 logEvent(event, data);
             });
+        });
+    }
+
+    // Asks the server which of this account's friends are currently online.
+    // BC has no passive presence push — you query and get one AccountQueryResult
+    // back with { Query: "OnlineFriends", Result: [...] }. Resolves with the
+    // Result array (member info objects), or [] on timeout. Used to probe
+    // whether presence tracking is viable for the matchmaking pool.
+    public queryOnlineFriends(timeoutMs = 8000): Promise<any[]> {
+        return new Promise((resolve) => {
+            let done = false;
+            const finish = (result: any[]) => {
+                if (done) return;
+                done = true;
+                this.socket.off("AccountQueryResult", handler);
+                clearTimeout(timer);
+                resolve(result);
+            };
+            const handler = (data: any) => {
+                if (data?.Query !== "OnlineFriends") return;
+                finish(Array.isArray(data.Result) ? data.Result : []);
+            };
+            const timer = setTimeout(() => finish([]), timeoutMs);
+            this.socket.on("AccountQueryResult", handler);
+            this.socket.emit("AccountQuery", { Query: "OnlineFriends" });
         });
     }
 
