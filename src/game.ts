@@ -12,6 +12,7 @@ import {
     BCCharacter,
     BCAppearanceItem,
     RemovedClothingEntry,
+    RegisteredPlayer,
     Player,
     BondageDeal,
     ClothingDeal,
@@ -298,6 +299,11 @@ const END_GAME_FRESH_COLLAR_ITEM = "LeatherCollar";
 // How long a !stuck / !redress numbered pick waits for the player's reply
 // before it's dropped.
 const WARDROBE_PICK_TIMEOUT_MS = 2 * 60 * 1000;
+
+// Matchmaking (see design_matchmaking.md).
+const LOOKING_COOLDOWN_MS = 30 * 60 * 1000;   // between !looking uses (admins exempt)
+const LOOKING_RELAY_WINDOW_MS = 10 * 60 * 1000; // relay beep-replies to the seeker for this long
+const LOOKING_STAY_MS = 3 * 60 * 1000;        // must stay this long after !looking or it's an early leave
 
 // Word bank for the end-game timer/password lock's password (see
 // buildTimerPasswordLockProperty). Deliberately letters-only — BC's
@@ -627,6 +633,18 @@ export class WinnersDiceGame {
     private readonly playerRecordsPath = path.join(__dirname, "..", "players.json");
     private readonly changelogPath = path.join(__dirname, "..", "changelog.json");
 
+    // Matchmaking pool (main/lobby bot only — see design_matchmaking.md),
+    // keyed by member number. Persisted separately from players.json so
+    // registration survives match resets.
+    private registeredPlayers: Record<string, RegisteredPlayer> = {};
+    private readonly registeredPlayersPath = path.join(__dirname, "..", "registered_players.json");
+
+    // In-flight !looking calls, keyed by seeker member number: who we beeped on
+    // their behalf and until when replies should be relayed back to them.
+    private activeLookingCalls: Map<number, { seeker: number; beeped: Set<number>; expiresAt: number }> = new Map();
+    // Pending 3-minute "stay" timers per seeker (early-leave detection).
+    private lookingStayTimers: Map<number, NodeJS.Timeout> = new Map();
+
     // Per-pair leftover point carryover — see PairBalanceEntry.
     private pairBalances: Record<string, PairBalanceEntry> = {};
     private readonly pairBalancesPath = path.join(__dirname, "..", "pair_balances.json");
@@ -766,6 +784,7 @@ export class WinnersDiceGame {
         this.loadBondageUsage();
         this.loadFeedbackStatus();
         this.loadPlayerRecords();
+        this.loadRegisteredPlayers();
         this.loadPairBalances();
         this.loadPlayerSettings();
         this.loadPairSettings();
@@ -939,6 +958,12 @@ export class WinnersDiceGame {
                 break;
             case "!friend":
                 this.handleFriendRequest(sender, this.roomMembers.get(sender)?.name ?? `Player #${sender}`);
+                break;
+            case "!wd":
+                this.handleWdCommand(sender, args);
+                break;
+            case "!looking":
+                this.handleLooking(sender);
                 break;
             case "!unfriend":
                 this.handleUnfriend(sender);
@@ -1527,7 +1552,10 @@ export class WinnersDiceGame {
             `!teststrip [@name] [group] - Report clothing act/advise verdict + worn items; if a group is named, try to remove it (wardrobe-helper live test)\n` +
             `!testredress @name [number|group] - List what you took off that player, numbered; reply a number (or pass one, e.g. "bra") to put it back on\n` +
             `!testonline [@name|memberNumber] - Friend the target, then ask BC who's online and report if they show up (matchmaking presence probe)\n` +
-            `!testbeep <@name|memberNumber> [message] - Send a beep (with text) to the target; have them reply to test the incoming-beep path`;
+            `!testbeep <@name|memberNumber> [message] - Send a beep (with text) to the target; have them reply to test the incoming-beep path\n` +
+            `!wd pool - List everyone in the matchmaking pool (online/offline, paused, strikes)\n` +
+            `!wd clearstrikes <@name|#> - Reset a player's early-leave strikes\n` +
+            `!wd unblock <@name|#> - Un-block a player and reset their strikes`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -7565,16 +7593,16 @@ export class WinnersDiceGame {
     public onAccountBeep(data: any): void {
         const from = data?.MemberNumber;
         const name = data?.MemberName ?? "?";
-        const msg = data?.Message ?? "";
+        const msg = data?.Message;
         const room = data?.ChatRoomName ?? "";
-        log(`INCOMING BEEP from ${name} (#${from})${room ? ` [room: ${room}]` : ""}: "${msg}" — raw keys: ${Object.keys(data ?? {}).join(",")}`);
+        const msgStr = typeof msg === "string" ? msg : `[${typeof msg}]`;
+        log(`INCOMING BEEP from ${name} (#${from})${room ? ` [room: ${room}]` : ""}: "${msgStr}"`);
 
-        // If an admin is in the room, echo it so the probe can be watched live
-        // without tailing the log.
-        for (const mn of secrets.adminMemberNumbers) {
-            if (this.roomMembers.has(mn)) {
-                this.bot.whisper(mn, `🔔 Incoming beep from ${name} (#${from})${room ? ` in "${room}"` : ""}: "${msg || "(no message)"}"`);
-            }
+        // Matchmaking reply relay: only human text beeps (string Message) from
+        // someone we beeped for an active !looking call. Addon beeps (object
+        // Message, e.g. GGC_BEEP) are ignored.
+        if (typeof from === "number" && typeof msg === "string") {
+            this.relayLookingReply(from, name, msg);
         }
     }
 
@@ -8688,6 +8716,10 @@ export class WinnersDiceGame {
     public onMemberLeave(memberNumber: number): void {
         const state = this.state;
 
+        // Matchmaking early-leave check runs regardless of game phase (the
+        // phase branches below can return early).
+        this.handleLookingLeave(memberNumber);
+
         if (state.phase === "negotiating" && state.negotiation &&
             (state.negotiation.challenger.memberNumber === memberNumber || state.negotiation.opponent.memberNumber === memberNumber)) {
             const playerName = this.roomMembers.get(memberNumber)?.name ?? `Player #${memberNumber}`;
@@ -9298,6 +9330,308 @@ export class WinnersDiceGame {
             fs.writeFileSync(this.playerRecordsPath, JSON.stringify(this.playerRecords, null, 2), "utf8");
         } catch (err) {
             logError(`[WD] Failed to write players.json: ${err}`);
+        }
+    }
+
+    // ============================================================
+    // MATCHMAKING POOL (main/lobby bot — see design_matchmaking.md)
+    // ============================================================
+
+    private loadRegisteredPlayers(): void {
+        try {
+            this.registeredPlayers = JSON.parse(fs.readFileSync(this.registeredPlayersPath, "utf8"));
+        } catch {
+            this.registeredPlayers = {};
+        }
+    }
+
+    private saveRegisteredPlayers(): void {
+        try {
+            fs.writeFileSync(this.registeredPlayersPath, JSON.stringify(this.registeredPlayers, null, 2), "utf8");
+        } catch (err) {
+            logError(`[WD] Failed to write registered_players.json: ${err}`);
+        }
+    }
+
+    // Router for all `!wd ...` subcommands. Matchmaking lives on the lobby bot;
+    // a game-room bot just points the player back to the main room.
+    private handleWdCommand(sender: number, args: string): void {
+        if (botRole !== "main") {
+            this.bot.whisper(sender, `Matchmaking is run from the main WinnersDice room ("${mainRoomName}") — head there and use !wd.`);
+            return;
+        }
+        const parts = args.trim().split(/\s+/).filter(Boolean);
+        const sub = (parts[0] ?? "").toLowerCase();
+        const rest = parts.slice(1).join(" ");
+        switch (sub) {
+            case "register": this.handleWdRegister(sender); break;
+            case "unregister": this.handleWdUnregister(sender); break;
+            case "pause": this.handleWdPause(sender); break;
+            case "resume": this.handleWdResume(sender); break;
+            case "status": this.handleWdStatus(sender); break;
+            case "pool": this.handleWdPool(sender); break;
+            case "clearstrikes": this.handleWdClearStrikes(sender, rest); break;
+            case "unblock": this.handleWdUnblock(sender, rest); break;
+            default:
+                this.bot.whisper(sender,
+                    `WinnersDice matchmaking — whisper me:\n` +
+                    `!wd register — join the pool so people can beep you for a game (you'll friend me too)\n` +
+                    `!wd unregister — leave the pool\n` +
+                    `!wd pause / !wd resume — stop / restart getting beeps (stays registered)\n` +
+                    `!wd status — your current status\n` +
+                    `!looking — beep online players that you're in the lobby for a game` +
+                    (this.isAdmin(sender)
+                        ? `\n(admin) !wd pool — list everyone registered\n(admin) !wd clearstrikes <@name|#> — reset strikes\n(admin) !wd unblock <@name|#> — un-block and reset`
+                        : ""));
+        }
+    }
+
+    // Resolves an admin target among registered players by member number or a
+    // unique name substring (they may not be in the room, so this searches the
+    // pool, not roomMembers).
+    private resolveRegisteredTarget(token: string): RegisteredPlayer | null {
+        const t = token.replace(/^@/, "").trim();
+        if (!t) return null;
+        if (/^\d{3,}$/.test(t)) return this.registeredPlayers[t] ?? null;
+        const lower = t.toLowerCase();
+        const matches = Object.values(this.registeredPlayers).filter(p => p.name.toLowerCase().includes(lower));
+        return matches.length === 1 ? matches[0] : null;
+    }
+
+    private async handleWdPool(sender: number): Promise<void> {
+        if (!this.isAdmin(sender)) { this.bot.whisper(sender, "Only the admin can use this command."); return; }
+        const all = Object.values(this.registeredPlayers);
+        if (all.length === 0) { this.bot.whisper(sender, "No one is registered."); return; }
+        const online = await this.bot.queryOnlineFriends();
+        const onlineNumbers = new Set<number>(online.map((f: any) => f?.MemberNumber).filter((n: any): n is number => typeof n === "number"));
+        const lines = all
+            .sort((a, b) => Number(onlineNumbers.has(b.memberNumber)) - Number(onlineNumbers.has(a.memberNumber)))
+            .map(p => {
+                const on = onlineNumbers.has(p.memberNumber) ? "🟢 online" : "⚪ offline";
+                const flags = [p.blocked ? "BLOCKED" : null, p.paused ? "paused" : null].filter(Boolean).join(", ");
+                return `${on} — ${p.name} #${p.memberNumber}${flags ? ` (${flags})` : ""}, strikes ${p.earlyLeaveCount}`;
+            });
+        this.sendLongWhisper(sender, `Matchmaking pool (${all.length}):\n` + lines.join("\n"));
+    }
+
+    private handleWdClearStrikes(sender: number, token: string): void {
+        if (!this.isAdmin(sender)) { this.bot.whisper(sender, "Only the admin can use this command."); return; }
+        const target = this.resolveRegisteredTarget(token);
+        if (!target) { this.bot.whisper(sender, `No single registered player matches "${token}" — pass a member number or a unique name.`); return; }
+        target.earlyLeaveCount = 0;
+        this.saveRegisteredPlayers();
+        this.bot.whisper(sender, `Cleared strikes for ${target.name} (#${target.memberNumber}).`);
+    }
+
+    private handleWdUnblock(sender: number, token: string): void {
+        if (!this.isAdmin(sender)) { this.bot.whisper(sender, "Only the admin can use this command."); return; }
+        const target = this.resolveRegisteredTarget(token);
+        if (!target) { this.bot.whisper(sender, `No single registered player matches "${token}" — pass a member number or a unique name.`); return; }
+        target.blocked = false;
+        target.earlyLeaveCount = 0;
+        this.saveRegisteredPlayers();
+        this.bot.whisper(sender, `Unblocked ${target.name} (#${target.memberNumber}) — back in the pool with a clean slate.`);
+    }
+
+    private handleWdRegister(sender: number): void {
+        const key = String(sender);
+        const name = this.roomMembers.get(sender)?.name ?? this.playerName(sender);
+
+        const existing = this.registeredPlayers[key];
+        if (existing?.blocked) {
+            this.bot.whisper(sender, "You've been removed from matchmaking. An admin has to !wd unblock you before you can rejoin.");
+            return;
+        }
+
+        if (existing) {
+            existing.name = name;
+            existing.paused = false; // re-registering un-pauses
+            this.saveRegisteredPlayers();
+            this.bot.whisper(sender, "You're already registered — welcome back (and un-paused, if you were).");
+        } else {
+            this.registeredPlayers[key] = {
+                memberNumber: sender,
+                name,
+                registeredAt: Date.now(),
+                paused: false,
+                earlyLeaveCount: 0,
+                blocked: false,
+                lastLookingAt: null,
+                lookingCooldownUntil: null,
+            };
+            this.saveRegisteredPlayers();
+            this.bot.whisper(sender, "✅ You're registered for WinnersDice matchmaking!");
+        }
+
+        // Friend them so presence queries can see them. Registration is only
+        // fully live once they friend the bot back (BC is mutual-gated).
+        this.bot.addFriend(sender);
+        this.bot.whisper(sender,
+            `One more step: please friend ${secrets.username} back (add me as a friend in BC). Friend status only works when it's mutual, so I need that to include you when someone whispers !looking. You can whisper !wd status anytime.`);
+    }
+
+    private handleWdUnregister(sender: number): void {
+        const key = String(sender);
+        if (!this.registeredPlayers[key]) {
+            this.bot.whisper(sender, "You're not registered.");
+            return;
+        }
+        delete this.registeredPlayers[key];
+        this.saveRegisteredPlayers();
+        // Deliberately NOT unfriending — friendship is decoupled from the pool
+        // (a stale friend is harmless; only registered+online players get beeped).
+        this.bot.whisper(sender, "You're out of WinnersDice matchmaking — no more game beeps. (I've kept the friend link; it's harmless.) Whisper !wd register to rejoin anytime.");
+    }
+
+    private handleWdPause(sender: number): void {
+        const p = this.registeredPlayers[String(sender)];
+        if (!p) { this.bot.whisper(sender, "You're not registered — whisper !wd register first."); return; }
+        if (p.paused) { this.bot.whisper(sender, "You're already paused."); return; }
+        p.paused = true;
+        this.saveRegisteredPlayers();
+        this.bot.whisper(sender, "⏸️ Paused — you stay registered but won't get game beeps. Whisper !wd resume when you're back.");
+    }
+
+    private handleWdResume(sender: number): void {
+        const p = this.registeredPlayers[String(sender)];
+        if (!p) { this.bot.whisper(sender, "You're not registered — whisper !wd register first."); return; }
+        if (!p.paused) { this.bot.whisper(sender, "You're already active (not paused)."); return; }
+        p.paused = false;
+        this.saveRegisteredPlayers();
+        this.bot.whisper(sender, "▶️ Back in the pool — you'll get game beeps again.");
+    }
+
+    private handleWdStatus(sender: number): void {
+        const p = this.registeredPlayers[String(sender)];
+        if (!p) {
+            this.bot.whisper(sender, "You're not registered. Whisper !wd register to join matchmaking.");
+            return;
+        }
+        const state = p.blocked ? "blocked" : (p.paused ? "paused" : "active");
+        const friended = this.bot.isFriend(sender);
+        this.bot.whisper(sender,
+            `Your matchmaking status: ${state}. Strikes: ${p.earlyLeaveCount}/4.\n` +
+            (friended
+                ? `I have you friended. If you haven't friended ${secrets.username} back yet, please do — presence only works when it's mutual.`
+                : `Heads up: I don't have you friended — whisper !wd register again.`));
+    }
+
+    // !looking — beep every online, registered, non-paused player that you'd
+    // like to play. Requires being in the lobby; 30-min cooldown (admins exempt).
+    private async handleLooking(sender: number): Promise<void> {
+        if (botRole !== "main") {
+            this.bot.whisper(sender, `!looking is used in the main WinnersDice room ("${mainRoomName}").`);
+            return;
+        }
+        const p = this.registeredPlayers[String(sender)];
+        if (!p || p.blocked) {
+            this.bot.whisper(sender, p?.blocked
+                ? "You've been removed from matchmaking — an admin needs to !wd unblock you."
+                : "You need to register first — whisper !wd register.");
+            return;
+        }
+        if (p.paused) {
+            this.bot.whisper(sender, "You're paused. Whisper !wd resume first, then !looking.");
+            return;
+        }
+        if (!this.roomMembers.has(sender)) {
+            this.bot.whisper(sender, "Use !looking from inside the WinnersDice room.");
+            return;
+        }
+
+        const now = Date.now();
+        const admin = this.isAdmin(sender);
+        if (!admin && p.lookingCooldownUntil && now < p.lookingCooldownUntil) {
+            const mins = Math.max(1, Math.ceil((p.lookingCooldownUntil - now) / 60000));
+            this.bot.whisper(sender, `You used !looking recently — try again in ~${mins} min.`);
+            return;
+        }
+
+        // Pending early-leave warning (delivered here, not at leave time).
+        if (p.earlyLeaveCount === 2) {
+            this.bot.whisper(sender, "⚠️ Please stay at least 3 minutes after !looking — people need time to see the beep and reach the room.");
+        } else if (p.earlyLeaveCount >= 3) {
+            this.bot.whisper(sender, "⚠️ Last warning: stay at least 3 minutes after !looking. One more early leave removes you from matchmaking.");
+        }
+
+        const onlineList = await this.bot.queryOnlineFriends();
+        const onlineNumbers = new Set<number>(
+            onlineList.map((f: any) => f?.MemberNumber).filter((n: any): n is number => typeof n === "number"));
+
+        const recipients = Object.values(this.registeredPlayers).filter(r =>
+            r.memberNumber !== sender && !r.paused && !r.blocked && onlineNumbers.has(r.memberNumber));
+
+        // Record the attempt + set cooldown regardless of who's online (anti-spam).
+        p.lastLookingAt = now;
+        if (!admin) p.lookingCooldownUntil = now + LOOKING_COOLDOWN_MS;
+        this.saveRegisteredPlayers();
+
+        if (recipients.length === 0) {
+            this.bot.whisper(sender, "No registered players are online right now — nobody to beep. Hang out in the room and try again later.");
+            return;
+        }
+
+        const seekerName = this.roomMembers.get(sender)?.name ?? this.playerName(sender);
+        const beepMsg = `${seekerName} is in the WinnersDice lobby looking for a game! Reply to this beep if you're heading over.`;
+        const beeped = new Set<number>();
+        for (const r of recipients) {
+            this.bot.beep(r.memberNumber, beepMsg);
+            beeped.add(r.memberNumber);
+        }
+        this.activeLookingCalls.set(sender, { seeker: sender, beeped, expiresAt: now + LOOKING_RELAY_WINDOW_MS });
+
+        if (!admin) this.startLookingStayTimer(sender);
+
+        this.bot.whisper(sender,
+            `📣 Beeped ${beeped.size} online player${beeped.size === 1 ? "" : "s"}. If anyone replies, I'll pass it along here. Please stick around a few minutes so they can join.`);
+    }
+
+    // 3-minute "stay" timer. Expiring without an early leave is good behavior
+    // and decays one strike; leaving early (see onMemberLeave) adds one.
+    private startLookingStayTimer(seeker: number): void {
+        this.clearLookingStayTimer(seeker);
+        const t = setTimeout(() => {
+            this.lookingStayTimers.delete(seeker);
+            const p = this.registeredPlayers[String(seeker)];
+            if (p && p.earlyLeaveCount > 0) {
+                p.earlyLeaveCount = Math.max(0, p.earlyLeaveCount - 1);
+                this.saveRegisteredPlayers();
+                log(`[WD] ${p.name} (#${seeker}) stayed after !looking — strike decayed to ${p.earlyLeaveCount}.`);
+            }
+        }, LOOKING_STAY_MS);
+        this.lookingStayTimers.set(seeker, t);
+    }
+
+    private clearLookingStayTimer(seeker: number): void {
+        const t = this.lookingStayTimers.get(seeker);
+        if (t) { clearTimeout(t); this.lookingStayTimers.delete(seeker); }
+    }
+
+    // Called from onMemberLeave: if someone leaves while their post-!looking
+    // stay timer is running, that's an early leave — add a strike (block at 4).
+    private handleLookingLeave(memberNumber: number): void {
+        if (!this.lookingStayTimers.has(memberNumber)) return;
+        this.clearLookingStayTimer(memberNumber);
+        this.activeLookingCalls.delete(memberNumber);
+        const p = this.registeredPlayers[String(memberNumber)];
+        if (!p) return;
+        p.earlyLeaveCount += 1;
+        if (p.earlyLeaveCount >= 4) p.blocked = true;
+        this.saveRegisteredPlayers();
+        log(`[WD] Early leave by ${p.name} (#${memberNumber}) after !looking — strikes now ${p.earlyLeaveCount}${p.blocked ? " (BLOCKED)" : ""}.`);
+    }
+
+    // Relays a registered player's beep-reply to the seeker who beeped them.
+    // Only string (human) messages from an active, unexpired !looking call.
+    private relayLookingReply(responder: number, responderName: string, message: string): void {
+        const now = Date.now();
+        for (const [seeker, call] of this.activeLookingCalls) {
+            if (call.expiresAt < now) { this.activeLookingCalls.delete(seeker); continue; }
+            if (!call.beeped.has(responder)) continue;
+            const text = `💬 ${responderName} replied to your game call: "${message}"`;
+            if (this.roomMembers.has(seeker)) this.bot.whisper(seeker, text);
+            else this.bot.beep(seeker, text);
+            return; // relay to the first matching call
         }
     }
 

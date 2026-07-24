@@ -28,6 +28,20 @@ export interface RemovedClothingEntry {
     removedAt: number;        // Date.now() at detection
 }
 
+// A player opted into the matchmaking pool (see design_matchmaking.md).
+// Persisted to registered_players.json (gitignored), keyed by member number.
+// Timestamps are epoch ms (Date.now()) for easy cooldown math.
+export interface RegisteredPlayer {
+    memberNumber: number;
+    name: string;
+    registeredAt: number;
+    paused: boolean;              // stays registered but receives no beeps
+    earlyLeaveCount: number;      // strikes (see Strike System)
+    blocked: boolean;             // removed from pool; can't re-register until admin unblock
+    lastLookingAt: number | null;
+    lookingCooldownUntil: number | null;
+}
+
 // Minimal shape of a Bondage Club character record, as seen in
 // ChatRoomSync / ChatRoomSyncMemberJoin payloads.
 export interface BCCharacter {
