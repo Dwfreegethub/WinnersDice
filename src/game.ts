@@ -682,6 +682,13 @@ export class WinnersDiceGame {
     // pendingWardrobeChecks.
     private removedClothingHistory: Map<number, RemovedClothingEntry[]> = new Map();
 
+    // Groups removed as part of the most recent completed clothing deal, per
+    // player. Set in completeWardrobeCheck once ingestAppearance has already
+    // diffed the sync. Used to float shop-deal items to the top of !stuck /
+    // !redress lists and to auto-apply for admins. Cleared with the rest of
+    // wardrobe helper state on reset / safeword / match end.
+    private lastShopRemovedGroups: Map<number, string[]> = new Map();
+
     // A !stuck / !redress numbered pick awaiting the invoker's reply. Self-only
     // in v1, so memberNumber is both the invoker and the target.
     private pendingWardrobeAction: {
@@ -806,6 +813,7 @@ export class WinnersDiceGame {
             spendingBalance: 0,
             awaitingBoostLevel: null,
             awaitingBuyback: null,
+            awaitingBondageBuyback: null,
             waitingForWardrobe: null,
             mercyRequest: null,
             mercyCooldowns: new Map(),
@@ -925,6 +933,10 @@ export class WinnersDiceGame {
             case "!changelog":
                 this.handleChangelog(sender);
                 break;
+            case "!leaderboard":
+            case "!lb":
+                this.handleLeaderboard(sender);
+                break;
             case "!friend":
                 this.handleFriendRequest(sender, this.roomMembers.get(sender)?.name ?? `Player #${sender}`);
                 break;
@@ -1024,10 +1036,6 @@ export class WinnersDiceGame {
                 break;
             case "!testlock":
                 this.handleTestLock(sender, args);
-                break;
-            // TEMP (blocked-lock investigation 2026-07-20) — remove after test.
-            case "!testcufflock":
-                this.handleTestCuffLock(sender, args);
                 break;
             case "!teststrip":
                 this.handleTestStrip(sender, args);
@@ -1482,7 +1490,7 @@ export class WinnersDiceGame {
             `=== Shop ===\n` +
             `boost - Buy a streak boost (+1–5, max +${MAX_BOOST})\n` +
             `clothing - Buy a clothing item from your opponent\n` +
-            `bondage - Apply bondage to your opponent (you pay half goes to them)\n` +
+            `bondage - Apply bondage to your opponent (you pay full price; they receive half — bot takes the rest)\n` +
             `locks - Lock your opponent's bondage; they can buy out anytime from their post-bank menu\n` +
             `buy back bondage - Pay to have your own bondage removed (opponent sets the price)\n` +
             `buyback - Buy back something you sold, at double the price\n` +
@@ -1697,7 +1705,8 @@ export class WinnersDiceGame {
     // still resolves correctly.
     private findPlayersByName(name: string, excludeMemberNumber: number): Player[] {
         const lower = name.toLowerCase();
-        const candidates = [...this.roomMembers.values()].filter(p => p.memberNumber !== excludeMemberNumber);
+        const botNumber = this.bot.getMemberNumber();
+        const candidates = [...this.roomMembers.values()].filter(p => p.memberNumber !== excludeMemberNumber && p.memberNumber !== botNumber);
 
         const exact = candidates.filter(p => p.name.toLowerCase() === lower);
         if (exact.length > 0) return exact;
@@ -1737,7 +1746,8 @@ export class WinnersDiceGame {
 
         // No name given — whisper a numbered list of who's in the room.
         if (!targetName) {
-            const others = [...this.roomMembers.values()].filter(p => p.memberNumber !== sender);
+            const botNumber = this.bot.getMemberNumber();
+            const others = [...this.roomMembers.values()].filter(p => p.memberNumber !== sender && p.memberNumber !== botNumber);
             if (others.length === 0) {
                 this.bot.whisper(sender, "There's no one else in the room to challenge right now.");
                 return;
@@ -1866,6 +1876,7 @@ export class WinnersDiceGame {
             spendingBalance: 0,
             awaitingBoostLevel: null,
             awaitingBuyback: null,
+            awaitingBondageBuyback: null,
             waitingForWardrobe: null,
             mercyRequest: null,
             mercyCooldowns: new Map(),
@@ -2633,6 +2644,13 @@ export class WinnersDiceGame {
             return;
         }
 
+        if (state.awaitingBondageBuyback === sender) {
+            state.awaitingBondageBuyback = null;
+            this.bot.whisper(sender, "Bondage buyback cancelled.");
+            this.returnToSpendMenu(sender);
+            return;
+        }
+
         if (state.spendMenuOpen) {
             state.spendMenuOpen = false;
             this.bot.whisper(sender, this.postBankPromptText(sender));
@@ -2763,6 +2781,7 @@ export class WinnersDiceGame {
             spendingBalance: 0,
             awaitingBoostLevel: null,
             awaitingBuyback: null,
+            awaitingBondageBuyback: null,
             waitingForWardrobe: null,
             mercyRequest: null,
             mercyCooldowns: new Map(),
@@ -4676,70 +4695,6 @@ export class WinnersDiceGame {
         );
     }
 
-    // TEMP (blocked-lock investigation, 2026-07-20) — remove after the test.
-    // Applies HighStyleSteelCuffs (ItemArms) to a target and locks them.
-    //   !testcufflock [@name]              → TimerPasswordPadlock (blocked-lock test)
-    //   !testcufflock [@name] <keyNumber>  → HighSecurityPadlock, key list = bot + <keyNumber>
-    // The High-Security form verifies the "winner holds a key" model: the
-    // listed member (e.g. MissyMissy) should be able to remove the cuffs while
-    // the wearer cannot. A numeric arg token is read as the key-holder number;
-    // the rest is the target name (self if omitted).
-    private handleTestCuffLock(sender: number, args: string): void {
-        if (!this.isAdmin(sender)) {
-            this.bot.whisper(sender, "Only the admin can use this command.");
-            return;
-        }
-
-        const tokens = args.trim().split(/\s+/).filter(Boolean);
-        const keyToken = tokens.find(t => /^\d{4,}$/.test(t));
-        const keyHolder = keyToken ? Number(keyToken) : null;
-        const targetName = tokens.filter(t => t !== keyToken).join(" ").replace(/^@/, "").trim();
-
-        let targetMemberNumber = sender;
-        if (targetName) {
-            const matches = this.findPlayersByName(targetName, -1);
-            if (matches.length === 0) {
-                this.bot.whisper(sender, `No one named "${targetName}" found in the room.`);
-                return;
-            }
-            if (matches.length > 1) {
-                this.bot.whisper(sender, `Multiple people named "${targetName}" are in the room — be more specific.`);
-                return;
-            }
-            targetMemberNumber = matches[0].memberNumber;
-        }
-
-        const targetDisplayName = this.roomMembers.get(targetMemberNumber)?.name ?? `Player #${targetMemberNumber}`;
-
-        if (keyHolder !== null) {
-            const bot = this.bot.getMemberNumber();
-            const lockProperty = {
-                Effect: ["Lock"],
-                LockedBy: "HighSecurityPadlock",
-                LockMemberNumber: bot,
-                LockMemberName: secrets.username,
-                MemberNumberListKeys: `${bot},${keyHolder}`,
-                LockSet: true,
-                RemoveItem: false,
-            };
-            this.bot.applyItem(targetMemberNumber, "ItemArms", "HighStyleSteelCuffs", "Default", lockProperty);
-            this.bot.whisper(sender,
-                `🔧 High-Security cuff applied to ${targetDisplayName} (key holders: bot ${bot} + ${keyHolder}). ` +
-                `#${keyHolder} should be able to open it; ${targetDisplayName} should NOT.`
-            );
-            return;
-        }
-
-        const password = END_GAME_LOCK_PASSWORD_WORDS[Math.floor(Math.random() * END_GAME_LOCK_PASSWORD_WORDS.length)];
-        const testMinutes = 1;
-        const lockProperty = this.buildTimerPasswordLockProperty(password, testMinutes);
-        this.bot.applyItem(targetMemberNumber, "ItemArms", "HighStyleSteelCuffs", "Default", lockProperty);
-        this.bot.whisper(sender,
-            `🔧 Test cuff+lock applied to ${targetDisplayName} (HighStyleSteelCuffs, password "${password}", ${testMinutes} min). ` +
-            `Look at the cuff: a padlock icon + countdown = the lock took; a bare cuff you can remove = the lock was blocked.`
-        );
-    }
-
     // Allows the winner to end an active service deal or an in-room end game
     // early. For services, the winner is the buyer; for end games, the winner
     // is the match winner. If the loser types !done during a service, they get
@@ -4886,7 +4841,7 @@ export class WinnersDiceGame {
             options.push({ key: "locks", label: `locks — pay to lock ${opponent.name}'s bondage; they can remove it later for 2× your price` });
         }
         if (state.config!.bondage && this.state.activeBondage.some(b => b.wearerMemberNumber === player.memberNumber)) {
-            options.push({ key: "bondagebuyback", label: `buy back bondage — pay to have your own bondage removed (${opponent.name} sets the price)` });
+            options.push({ key: "bondagebuyback", label: `buy back bondage — pay 2× the original price to have your bondage removed` });
         }
         if (state.config!.toys && this.toyCatalog.length > 0) {
             options.push({ key: "toys", label: `toys — pick a toy, agree a price with ${opponent.name}, then use it for a set time` });
@@ -4925,6 +4880,11 @@ export class WinnersDiceGame {
 
         if (state.awaitingBuyback === sender) {
             this.handleBuybackResponse(sender, lower, raw);
+            return;
+        }
+
+        if (state.awaitingBondageBuyback === sender) {
+            this.handleBondageBuybackResponse(sender, lower, raw);
             return;
         }
 
@@ -5502,6 +5462,24 @@ export class WinnersDiceGame {
 
         this.bot.sendChat(`👗 ${this.playerName(memberNumber)} has handed over their ${pending.item}! The game continues.`);
 
+        // Capture which groups were removed in this deal (ingestAppearance has
+        // already run against the same sync that triggered this). Any clothing
+        // entry added within the last 10 seconds is considered part of this deal.
+        const SHOP_REMOVAL_WINDOW_MS = 10_000;
+        const now = Date.now();
+        const shopGroups = (this.removedClothingHistory.get(memberNumber) ?? [])
+            .filter(e => now - e.removedAt < SHOP_REMOVAL_WINDOW_MS)
+            .map(e => e.group);
+        if (shopGroups.length > 0) {
+            this.lastShopRemovedGroups.set(memberNumber, shopGroups);
+        }
+
+        // If the player is already restrained, let them know !stuck is available.
+        if (this.state.activeBondage.some(b => b.wearerMemberNumber === memberNumber)) {
+            this.bot.whisper(memberNumber,
+                `You're restrained — if you need help undressing, whisper !stuck and I'll give you a hand, or ask your opponent directly.`);
+        }
+
         this.sendPostWardrobeMenu(pending.buyer);
     }
 
@@ -5692,7 +5670,8 @@ export class WinnersDiceGame {
 
         deal.stage = "awaiting_seller_response";
         this.bot.whisper(deal.seller,
-            `${this.playerName(deal.buyer)} wants to buy a service: "${deal.description}" for ${deal.price} pts. ` +
+            `${this.playerName(deal.buyer)} wants to buy a service: "${deal.description}" for ${deal.price} pts ` +
+            `(you'd receive ${Math.floor(deal.price! / 2)} pts — half the agreed price). ` +
             `Reply accept, decline, or counter <amount>.`
         );
         this.bot.whisper(deal.buyer,
@@ -5802,7 +5781,7 @@ export class WinnersDiceGame {
         }
 
         deal.stage = "awaiting_seller_response";
-        this.bot.whisper(deal.seller, `${this.playerName(deal.buyer)} counters: "${deal.description}" for ${deal.price} points. Accept, decline, or counter?`);
+        this.bot.whisper(deal.seller, `${this.playerName(deal.buyer)} counters: "${deal.description}" for ${deal.price} points (you'd receive ${Math.floor(deal.price! / 2)} pts). Accept, decline, or counter?`);
         return true;
     }
 
@@ -5831,6 +5810,8 @@ export class WinnersDiceGame {
         const half = Math.floor(price / 2);
         state.spendingBalance -= price;
         seller.pendingBalance += half;
+
+        this.bot.whisper(seller.memberNumber, `✅ Service agreed at ${price} pts — you'll receive ${half} pts (pending, available next Bank).`);
 
         const SERVICE_MINUTES = 5;
         this.bot.sendChat(
@@ -6234,31 +6215,113 @@ export class WinnersDiceGame {
             return;
         }
 
-        const placer = state.players.find(p => p.memberNumber !== sender)!;
+        state.awaitingBondageBuyback = sender;
 
-        state.bondageDeal = {
-            kind: "removal",
-            placer: placer.memberNumber,
-            wearer: sender,
-            slot: null,
-            itemName: null,
-            itemOptions: [],
-            itemOptionsAll: [],
-            itemOptionsPage: 0,
-            price: null,
-            counterPrice: null,
-            stage: "awaiting_removal_slot",
-            pendingFuzzyItem: null,
-            negotiationStep: 0,
-            initiatorFloor: null,
-            responderCeiling: null,
-        };
+        this.bot.sendChat(`💸 ${this.playerName(sender)} is trying to buy their way out of some bondage...`);
 
+        if (worn.length === 1) {
+            const b = worn[0];
+            const lock = state.activeLocks.find(l => l.wearerMemberNumber === sender && l.slot === b.slot);
+            const lockFee = lock ? this.lockRemovalCost(lock) : 0;
+            const cost = b.applyPrice * 2 + lockFee;
+            const lockNote = lockFee > 0 ? ` (includes ${lockFee} pt lock removal fee)` : "";
+            this.bot.whisper(sender,
+                `Buy back the ${b.itemName} on your ${b.slot}? Cost: ${cost} points${lockNote}. (yes / no)`);
+            return;
+        }
+
+        const lines = worn.map((b, i) => {
+            const lock = state.activeLocks.find(l => l.wearerMemberNumber === sender && l.slot === b.slot);
+            const lockFee = lock ? this.lockRemovalCost(lock) : 0;
+            const cost = b.applyPrice * 2 + lockFee;
+            const lockNote = lockFee > 0 ? ` (+${lockFee} lock fee)` : "";
+            return `${i + 1}. ${b.slot} — ${b.itemName} — ${cost} pts${lockNote}`;
+        });
         this.bot.whisper(sender,
-            `Which of your items would you like to buy back?\n` +
-            worn.map((b, i) => `${i + 1}. ${b.slot} — ${b.itemName}`).join("\n") +
+            `Which bondage would you like to buy back?\n` +
+            lines.join("\n") +
             `\n0. Back`
         );
+    }
+
+    // Handles the wearer's numbered (or yes/no) reply to the bondage buyback
+    // menu. Deducts 2× applyPrice (+ lock fee if any) from spendingBalance,
+    // credits the placer, and removes the item immediately — no negotiation.
+    private handleBondageBuybackResponse(sender: number, lower: string, raw: string): void {
+        const state = this.state;
+        if (!state.players) return;
+
+        const worn = state.activeBondage.filter(b => b.wearerMemberNumber === sender);
+
+        let chosen: typeof worn[0] | null = null;
+
+        if (worn.length === 1) {
+            if (lower === "yes" || lower === "y") {
+                chosen = worn[0];
+            } else if (lower === "no" || lower === "n") {
+                state.awaitingBondageBuyback = null;
+                this.bot.whisper(sender, "Okay, maybe next time.");
+                this.returnToSpendMenu(sender);
+                return;
+            } else {
+                this.bot.whisper(sender, "Please say 'yes' or 'no'.");
+                return;
+            }
+        } else {
+            if (raw.trim() === "0") {
+                this.handleShopCancel(sender);
+                return;
+            }
+            const num = extractNumber(raw);
+            if (num !== null && num >= 1 && num <= worn.length) {
+                chosen = worn[num - 1];
+            }
+            if (!chosen) {
+                this.bot.whisper(sender, "Please reply with the number of the item to buy back, or 0 to go back.");
+                return;
+            }
+        }
+
+        const lock = state.activeLocks.find(l => l.wearerMemberNumber === sender && l.slot === chosen!.slot);
+        const lockFee = lock ? this.lockRemovalCost(lock) : 0;
+        const cost = chosen.applyPrice * 2 + lockFee;
+
+        if (state.spendingBalance < cost) {
+            this.bot.whisper(sender,
+                `You can't afford that — buying back the ${chosen.itemName} costs ${cost} points and you have ${state.spendingBalance}. Type !cancel to exit the shop.`);
+            state.awaitingBondageBuyback = null;
+            this.returnToSpendMenu(sender);
+            return;
+        }
+
+        const placer = state.players.find(p => p.memberNumber === chosen!.placerMemberNumber);
+        const half = Math.floor(chosen.applyPrice);
+
+        state.spendingBalance -= cost;
+        if (placer) placer.pendingBalance += half;
+
+        if (lock) {
+            const lockHalf = Math.floor(lockFee / 2);
+            const lockPlacer = state.players.find(p => p.memberNumber === lock.placerMemberNumber);
+            if (lockPlacer) lockPlacer.pendingBalance += lockHalf;
+            state.activeLocks = state.activeLocks.filter(l => l !== lock);
+        }
+
+        const group = this.groupForSlotDisplay(chosen.slot);
+        this.bot.removeItem(sender, group);
+        state.activeBondage = state.activeBondage.filter(b => b !== chosen);
+        if (ALLOW_FREE_REAPPLY && placer) {
+            state.removableBondage.push({ ...chosen });
+        }
+        state.awaitingBondageBuyback = null;
+
+        let msg = `🔓 ${this.playerName(sender)} bought back the ${chosen.itemName} from their ${chosen.slot} for ${cost} points.`;
+        if (placer) msg += ` ${placer.name} receives ${half} points (pending — available next Bank).`;
+        if (lock) msg += ` Lock removed.`;
+        msg += ` (${this.playerName(sender)} has ${state.spendingBalance} points left.)`;
+        this.bot.sendChat(msg);
+
+        this.returnToSpendMenu(sender);
     }
 
     // !removebondage <slot> — free, instant, placer-only.
@@ -6747,7 +6810,7 @@ export class WinnersDiceGame {
                 this.bot.whisper(deal.wearer, `You can't afford that — total cost is ${totalPrice} points${breakdown} and you have ${wearer.balance}. The deal is off.`);
                 this.bot.whisper(deal.placer, `${wearer.name} can't cover ${totalPrice} points — the deal is off.`);
                 state.bondageDeal = null;
-                this.returnToSpendMenu(deal.placer);
+                this.returnToSpendMenu(deal.wearer);
                 return;
             }
         }
@@ -6767,6 +6830,7 @@ export class WinnersDiceGame {
                 assetName: itemName,
                 placerMemberNumber: deal.placer,
                 wearerMemberNumber: deal.wearer,
+                applyPrice: price,
             });
             this.incrementBondageUsage(group, itemName);
             state.removableBondage = state.removableBondage.filter(
@@ -6812,7 +6876,10 @@ export class WinnersDiceGame {
         }
 
         state.bondageDeal = null;
-        this.returnToSpendMenu(deal.placer);
+        // For apply deals the placer is the buyer (they spent from spendingBalance).
+        // For removal deals the wearer is the buyer (they paid from their own balance
+        // to get bondage removed). Return the menu to whoever was in the shop.
+        this.returnToSpendMenu(deal.kind === "removal" ? deal.wearer : deal.placer);
     }
 
     // Physically releases every active bondage item via the BC socket and
@@ -6966,6 +7033,7 @@ export class WinnersDiceGame {
         }
         this.clearPendingTestRedress();
         this.removedClothingHistory.clear();
+        this.lastShopRemovedGroups.clear();
     }
 
     private clearPendingWardrobeActionFor(memberNumber: number): void {
@@ -7097,27 +7165,41 @@ export class WinnersDiceGame {
         }, WARDROBE_PICK_TIMEOUT_MS);
         this.pendingWardrobeAction = { memberNumber: sender, kind, options, timer };
         this.bot.whisper(sender,
-            `⚠️ Heads up: !${kind} is new and not well tested yet — check the result and let DW know if anything's off.\n` +
-            `Which one should I ${verb}? Reply with a number:\n${lines.join("\n")}`);
+            `⚠️ Heads up: !${kind} is new and not well tested yet — if anything looks off, whisper !feedback to me or let Missy know if she's around.\n` +
+            `Which should I ${verb}? Reply with one or more numbers (e.g. 1 or 1 3):\n${lines.join("\n")}`);
     }
 
-    // Numeric reply to a pending !stuck/!redress pick. Routed from
+    // Numeric reply to a pending !stuck/!redress pick. Accepts one or more
+    // space-separated numbers (e.g. "1" or "1 3"). Routed from
     // handleConversational. Returns true if it consumed the message.
     private resolveWardrobeSelection(sender: number, msg: string): boolean {
         const pending = this.pendingWardrobeAction;
         if (!pending || pending.memberNumber !== sender) return false;
         const trimmed = msg.trim();
-        if (!/^\d+$/.test(trimmed)) return false;
-        const idx = parseInt(trimmed, 10);
-        if (idx < 1 || idx > pending.options.length) {
-            this.bot.whisper(sender, `Reply with a number between 1 and ${pending.options.length}.`);
+        // Must be one or more digit tokens (no other words).
+        const tokens = trimmed.split(/[\s,]+/).filter(Boolean);
+        if (!tokens.length || !tokens.every(t => /^\d+$/.test(t))) return false;
+
+        const indices = tokens.map(t => parseInt(t, 10));
+        const invalid = indices.filter(i => i < 1 || i > pending.options.length);
+        if (invalid.length > 0) {
+            this.bot.whisper(sender, `Reply with numbers between 1 and ${pending.options.length}.`);
             return true;
         }
-        const choice = pending.options[idx - 1];
+
         clearTimeout(pending.timer);
         this.pendingWardrobeAction = null;
-        if (pending.kind === "stuck") this.resolveStuck(sender, choice);
-        else this.resolveRedress(sender, choice);
+
+        // Deduplicate by group so "1 1" doesn't double-remove the same slot.
+        const seen = new Set<string>();
+        const choices = indices
+            .map(i => pending.options[i - 1])
+            .filter(c => { if (seen.has(c.group)) return false; seen.add(c.group); return true; });
+
+        for (const choice of choices) {
+            if (pending.kind === "stuck") this.resolveStuck(sender, choice);
+            else this.resolveRedress(sender, choice);
+        }
         return true;
     }
 
@@ -7164,6 +7246,16 @@ export class WinnersDiceGame {
             if (filtered.length) candidates = filtered;
         }
 
+        // Float shop-deal groups to the top so the most likely picks are option 1/2.
+        const shopGroups = this.lastShopRemovedGroups.get(sender);
+        if (shopGroups && shopGroups.length > 0) {
+            candidates.sort((a, b) => {
+                const aShop = shopGroups.includes(a.group) ? 0 : 1;
+                const bShop = shopGroups.includes(b.group) ? 0 : 1;
+                return aShop - bShop;
+            });
+        }
+
         this.promptWardrobeChoice(sender, "stuck", candidates);
     }
 
@@ -7189,6 +7281,34 @@ export class WinnersDiceGame {
                 e.group.toLowerCase().includes(arg) ||
                 (e.item.Name ?? "").toLowerCase().includes(needle));
             if (filtered.length) history = filtered;
+        }
+
+        const shopGroups = this.lastShopRemovedGroups.get(sender);
+
+        // Admin shortcut: if we have shop-deal context, auto-apply those items
+        // without a menu (this is the "put back what the shop took" fast path).
+        if (this.isAdmin(sender) && shopGroups && shopGroups.length > 0) {
+            const shopMatches = history.filter(e => shopGroups.includes(e.group));
+            if (shopMatches.length > 0) {
+                for (const entry of shopMatches) {
+                    const label = this.formatItemLabel(entry.group, entry.item);
+                    if (this.canActOnAppearance(sender)) {
+                        this.actRestoreClothing(sender, entry, sender, "your", label);
+                    } else {
+                        this.adviseOtherPlayer(sender, "put back on", entry.group, entry.item);
+                    }
+                }
+                return;
+            }
+        }
+
+        // Float shop-deal groups to the top so the most likely picks are option 1/2.
+        if (shopGroups && shopGroups.length > 0) {
+            history.sort((a, b) => {
+                const aShop = shopGroups.includes(a.group) ? 0 : 1;
+                const bShop = shopGroups.includes(b.group) ? 0 : 1;
+                return aShop - bShop;
+            });
         }
 
         const options = history.map(e => ({ group: e.group, item: e.item }));
@@ -9001,6 +9121,39 @@ export class WinnersDiceGame {
             const record = this.playerRecords[String(memberNumber)];
             if (record) record.feedbackGiven = true;
         }
+
+        // Backfill gamesLost for records saved before the field existed.
+        for (const record of Object.values(this.playerRecords)) {
+            record.gamesLost ??= 0;
+        }
+    }
+
+    private handleLeaderboard(memberNumber: number): void {
+        const records = Object.values(this.playerRecords);
+        const me = this.playerRecords[String(memberNumber)];
+        const myWins = me?.gamesWon ?? 0;
+        const myLosses = me?.gamesLost ?? 0;
+
+        const topWinners = records.filter(r => r.gamesWon > 0).sort((a, b) => b.gamesWon - a.gamesWon).slice(0, 5);
+        const topLosers = records.filter(r => r.gamesLost > 0).sort((a, b) => b.gamesLost - a.gamesLost).slice(0, 5);
+
+        const lines: string[] = [`Your record: ${myWins}W / ${myLosses}L`];
+
+        lines.push("─ Top 5 Winners ─");
+        if (topWinners.length === 0) {
+            lines.push("No wins recorded yet.");
+        } else {
+            topWinners.forEach((r, i) => lines.push(`${i + 1}. ${r.name} — ${r.gamesWon} wins`));
+        }
+
+        lines.push("─ Top 5 Losers ─");
+        if (topLosers.length === 0) {
+            lines.push("No losses recorded yet.");
+        } else {
+            topLosers.forEach((r, i) => lines.push(`${i + 1}. ${r.name} — ${r.gamesLost} losses`));
+        }
+
+        this.sendLongWhisper(memberNumber, lines.join("\n"));
     }
 
     private savePlayerRecords(): void {
@@ -9399,6 +9552,7 @@ export class WinnersDiceGame {
                 lastSeen: now,
                 gamesPlayed: 0,
                 gamesWon: 0,
+                gamesLost: 0,
                 feedbackGiven: this.loadFeedbackMemberNumbers().has(memberNumber),
             };
         }
@@ -9406,7 +9560,7 @@ export class WinnersDiceGame {
     }
 
     // Called once a match concludes, crediting both participants with a
-    // completed game and the winner (if any) with a win.
+    // completed game, the winner with a win, and the loser with a loss.
     private recordGameCompletion(winnerMemberNumber: number | null, participants: PlayerState[]): void {
         for (const participant of participants) {
             const record = this.playerRecords[String(participant.memberNumber)];
@@ -9414,6 +9568,8 @@ export class WinnersDiceGame {
             record.gamesPlayed++;
             if (winnerMemberNumber !== null && participant.memberNumber === winnerMemberNumber) {
                 record.gamesWon++;
+            } else if (winnerMemberNumber !== null) {
+                record.gamesLost++;
             }
         }
         this.savePlayerRecords();
