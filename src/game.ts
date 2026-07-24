@@ -7108,9 +7108,22 @@ export class WinnersDiceGame {
         const char = this.roomCharacters.get(targetMemberNumber);
         if (!char) return false;
         if (char.OnlineSharedSettings?.AllowItem === false) return false;
+        const bot = this.bot.getMemberNumber();
+        // BC ItemPermission levels (higher = more restrictive):
+        //   0 = everyone, no exceptions
+        //   1 = everyone, EXCEPT blacklist  ← permissive; the common "restricted" setting
+        //   2 = owner, lovers, whitelist & dominants
+        //   3 = owner, lovers and whitelist
+        //   4 = owner and lovers only
+        //   5 = owner only
+        // The bot can only ever qualify as a plain member, so: allowed at 0
+        // always, at 1 unless blacklisted, at 2/3 only if whitelisted, never at
+        // 4/5. (BlackList/WhiteList may be absent from a room sync, in which
+        // case the safe defaults are "not blacklisted" / "not whitelisted".)
         const level = char.ItemPermission ?? 0;
         if (level === 0) return true;
-        if (level === 1) return (char.WhiteList ?? []).includes(this.bot.getMemberNumber());
+        if (level === 1) return !((char.BlackList ?? []) as number[]).includes(bot);
+        if (level === 2 || level === 3) return ((char.WhiteList ?? []) as number[]).includes(bot);
         return false;
     }
 

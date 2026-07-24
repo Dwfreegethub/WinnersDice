@@ -205,12 +205,24 @@ private canActOnAppearance(targetMemberNumber: number): boolean {
     const char = this.roomCharacters.get(targetMemberNumber);
     if (!char) return false;
     if (char.OnlineSharedSettings?.AllowItem === false) return false;
+    const bot = this.bot.getMemberNumber();
+    // BC ItemPermission (higher = more restrictive):
+    //   0 everyone · 1 everyone EXCEPT blacklist · 2 owner/lovers/whitelist/dominants
+    //   3 owner/lovers/whitelist · 4 owner/lovers · 5 owner only
     const level = char.ItemPermission ?? 0;
     if (level === 0) return true;
-    if (level === 1) return (char.WhiteList ?? []).includes(this.bot.getMemberNumber());
-    return false; // levels 2+ : owner/lover/nobody tiers the bot can't realistically satisfy
+    if (level === 1) return !((char.BlackList ?? []) as number[]).includes(bot); // permissive!
+    if (level === 2 || level === 3) return ((char.WhiteList ?? []) as number[]).includes(bot);
+    return false; // 4/5: owner/lovers only
 }
 ```
+
+> **Corrected 2026-07-23 (found live via Ayato #245388 at level 1):** level 1 is
+> "everyone EXCEPT blacklist" — permissive — NOT whitelist-gated. The original
+> version here (and the first shipped code) wrongly required the bot to be
+> whitelisted at level 1, so `!stuck`/`!redress` refused to act on every
+> level-1 player. `ItemPermission` is a single-axis "higher = more restrictive"
+> scale; only 2/3 are whitelist tiers, and the bot can never satisfy 4/5.
 
 Used by both the `!stuck` and `!redress` flows (§5.6, §5.7) to decide: act directly, or fall back to
 telling the *other* player exactly what to do by hand (a human partner may have Owner/Lover-tier
