@@ -2,8 +2,7 @@
 
 ## HIGH PRIORITY
 
-1. **Decide what to do about clothing** — clarify role of clothing in the shop (buy/sell mechanic, pricing, etc.)
-   - **Superseded by a full design** — see [`design_wardrobe_helper.md`](design_wardrobe_helper.md) (2026-07-14). Covers `!stuck`/`!redress`, remembers exact worn items, acts-or-advises depending on permissions. DW holding off on implementation — doc is self-contained for a dispatched session.
+1. **Wardrobe helper (`!stuck`/`!redress`)** — implemented, in testing. May need tweaks. See [`design_wardrobe_helper.md`](design_wardrobe_helper.md) for full design.
 
 ---
 
@@ -15,7 +14,11 @@
 
 ## LOW PRIORITY
 
-1. **Price tracking** — track what prices items actually sold for during shop negotiations. Design TBD (per-session log, persistent file, or `!prices` command). Downgraded — not sure yet whether this will actually get used.
+---
+
+## Watch / Monitor
+
+- **Late-game disconnects** — players occasionally drop mid end-game (seen 2026-07-24: Vinoxa/Rias bailed after 10 rounds, right as end-game negotiation started). The 3-minute countdown handles it cleanly, but if it becomes a pattern (deliberate bail to avoid losing end-game terms), may need a rule or a penalty mechanic. Keep an eye on frequency.
 
 ---
 
@@ -37,13 +40,13 @@
 
 - **Multi-room: Locked room type doesn't actually lock** — `configureRoomForMatch({locked: true})` runs but BC silently ignores the field. Real fix needs traffic inspection. Leaving as-is for now — Private + Spectator is good enough.
 
-- **Maybe force higher shop prices in later rounds** — spend menu deals more expensive as match progresses, similar to end game 1×/3×/5× multipliers. Design TBD. (2026-07-21)
+- **Price scaling in later rounds** — two open questions to consider together: (1) raise shop minimums as the match progresses (e.g. +$100 per round floor on all negotiated deals), similar to the end-game 1×/3×/5× multipliers; (2) raise boost prices in later rounds OR based on how many boosts a player has already bought (to prevent cheap early stacking). Design TBD — both ideas affect the same spend-menu session so they should be designed as one system. (2026-07-21)
 
 - ~~**Negotiation Deadlock — Forced Sale**~~ — Resolved 2026-07-23. Winner always gets the last bid, so deadlock can't persist indefinitely.
 
 ### End Game — open items
 
-- **`!points` command** — not implemented. Should show current banked balance + current pot on demand, not just at end-game.
+- ~~**`!points` command**~~ — Done 2026-07-24. Whispers banked balance, pending balance (if any), and current pot. Available during a match; out-of-match gives a "no active match" message. Listed in `!help game`.
 - **End game save/resume** — when safeword or reset fires during active end game, consider saving agreed terms for resumption. Design TBD.
 - **End game timer/password lock slot** — `executeEndGame()`/`expireEndGame()` use `ItemNeckRestraints` + `CollarLeash` as a stand-in. Revisit once there's a clearer idea of the right BC asset.
 - **End game locks: exclusive locks not replaced by timer lock** — fixed 2026-07-22 (`releaseLocksFor(loser)` + 3-second delay before `applyEndGameLocks`). Needs live test to confirm items that had shop-deal locks during the match now get timer password locks correctly.

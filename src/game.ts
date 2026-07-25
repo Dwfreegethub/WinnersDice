@@ -195,7 +195,7 @@ const CHANGELOG_MAX_ENTRIES = 40;
 const CHANGELOG_ENTRIES_SHOWN = 5;
 
 // Cost in points to purchase +1 through +5 boost (index 0 = level 1).
-const BOOST_PRICES = [40, 100, 225, 500, 1000];
+const BOOST_PRICES = [40, 100, 225, 450, 750];
 
 // Maximum total boost a player can hold at once.
 const MAX_BOOST = 5;
@@ -301,9 +301,10 @@ const END_GAME_FRESH_COLLAR_ITEM = "LeatherCollar";
 const WARDROBE_PICK_TIMEOUT_MS = 2 * 60 * 1000;
 
 // Matchmaking (see design_matchmaking.md).
-const LOOKING_COOLDOWN_MS = 30 * 60 * 1000;   // between !looking uses (admins exempt)
-const LOOKING_RELAY_WINDOW_MS = 10 * 60 * 1000; // relay beep-replies to the seeker for this long
-const LOOKING_STAY_MS = 3 * 60 * 1000;        // must stay this long after !looking or it's an early leave
+const LOOKING_COOLDOWN_MS = 30 * 60 * 1000;        // between !looking uses (admins exempt)
+const LOOKING_RELAY_WINDOW_MS = 10 * 60 * 1000;    // relay beep-replies to the seeker for this long
+const LOOKING_STAY_MS = 3 * 60 * 1000;             // must stay this long after !looking or it's an early leave
+const LOOKING_NO_RESPONSE_MS = 3.5 * 60 * 1000;    // whisper seeker if still unmatched after this long
 
 // Word bank for the end-game timer/password lock's password (see
 // buildTimerPasswordLockProperty). Deliberately letters-only — BC's
@@ -644,6 +645,8 @@ export class WinnersDiceGame {
     private activeLookingCalls: Map<number, { seeker: number; beeped: Set<number>; expiresAt: number }> = new Map();
     // Pending 3-minute "stay" timers per seeker (early-leave detection).
     private lookingStayTimers: Map<number, NodeJS.Timeout> = new Map();
+    // Pending 3.5-minute "no response" timers per seeker — whisper them if still unmatched.
+    private lookingNoResponseTimers: Map<number, NodeJS.Timeout> = new Map();
 
     // Per-pair leftover point carryover — see PairBalanceEntry.
     private pairBalances: Record<string, PairBalanceEntry> = {};
@@ -955,6 +958,9 @@ export class WinnersDiceGame {
             case "!leaderboard":
             case "!lb":
                 this.handleLeaderboard(sender);
+                break;
+            case "!points":
+                this.handlePoints(sender);
                 break;
             case "!friend":
                 this.handleFriendRequest(sender, this.roomMembers.get(sender)?.name ?? `Player #${sender}`);
@@ -1508,6 +1514,7 @@ export class WinnersDiceGame {
             `!endgame - End the match early (after minimum rounds)\n` +
             `!mercy - Concede early: forfeit half your points and owe a service\n` +
             `!pause / !resume - Pause or resume the bot (either player — useful for RP)\n` +
+            `!points - Check your current balance, pending points, and pot\n` +
             `!stuck [item] - Bound and can't reach your clothes? I'll take a garment off for you\n` +
             `!redress [item] - Put a garment I took off back on\n\n` +
             `=== Streaks, Boosts & Curses ===\n` +
@@ -5038,17 +5045,18 @@ export class WinnersDiceGame {
 
         this.bot.sendChat(`⚡ ${this.playerName(sender)} is picking up a power-up...`);
         const room = MAX_BOOST - player.boost;
+        const minChoice = player.boost + 1;
         this.bot.whisper(sender,
             `A boost adds straight to your roll total and persists across rounds — it only drains by 1 each time you lose, so a +3 boost survives 3 losses.\n\n` +
-            `Prices are for your TOTAL boost level (topping up only charges the difference):\n` +
+            `Prices are for your total boost level (topping up only charges the difference):\n` +
             `+1 total — 40 points\n` +
             `+2 total — 100 points\n` +
             `+3 total — 225 points\n` +
-            `+4 total — 500 points\n` +
-            `+5 total — 1,000 points\n` +
+            `+4 total — 450 points\n` +
+            `+5 total — 750 points\n` +
             `(your current boost: +${player.boost}, max total: +${MAX_BOOST})\n` +
             (room > 0
-                ? `How many more levels? (say 1-${room}, or 0 to go back)`
+                ? `What total boost do you want? (say ${minChoice === MAX_BOOST ? MAX_BOOST : `${minChoice}-${MAX_BOOST}`}, or 0 to go back)`
                 : `You're already at the max boost. (say 0 to go back)`)
         );
     }
@@ -5063,12 +5071,7 @@ export class WinnersDiceGame {
             this.handleShopCancel(sender);
             return;
         }
-        if (n === null || n < 1 || n > 5) {
-            this.bot.whisper(sender, "Please say a number from 1 to 5.");
-            return;
-        }
 
-        let level = n;
         const room = MAX_BOOST - player.boost;
         if (room <= 0) {
             this.bot.whisper(sender, `Your boost is already at the max (+${MAX_BOOST}).`);
@@ -5076,29 +5079,31 @@ export class WinnersDiceGame {
             this.returnToSpendMenu(sender);
             return;
         }
-        if (level > room) {
-            this.bot.whisper(sender, `Max total boost is +${MAX_BOOST} — you have +${player.boost}, so I'll cap this at +${room}.`);
-            level = room;
+
+        // Input is the desired TOTAL boost, not a delta.
+        const minChoice = player.boost + 1;
+        if (n === null || n < minChoice || n > MAX_BOOST) {
+            this.bot.whisper(sender, `Please say a total boost level between ${minChoice} and ${MAX_BOOST} (or 0 to go back).`);
+            return;
         }
 
-        // Prices are for the TOTAL boost level, not per-purchase, so topping up
-        // charges the difference between the new total's price and what the
-        // current level would have cost. Without this, buying +1 five times
-        // (5×40) would reach +5 for 200 instead of its real 1000 price.
-        const targetBoost = player.boost + level;
+        // Prices are per total level; topping up charges the gap between the
+        // new total's price and what the current level already cost.
+        const targetBoost = n;
         const cost = this.boostPriceFor(targetBoost) - this.boostPriceFor(player.boost);
         if (state.spendingBalance < cost) {
-            this.bot.whisper(sender, `You can't afford that — going from +${player.boost} to +${targetBoost} costs ${cost} points and you have ${state.spendingBalance}. Type !cancel to exit the shop or choose a smaller boost.`);
+            this.bot.whisper(sender, `You can't afford +${targetBoost} total — that costs ${cost} points and you have ${state.spendingBalance}. Type !cancel to exit or choose a smaller total.`);
             state.awaitingBoostLevel = null;
             this.returnToSpendMenu(sender);
             return;
         }
 
+        const delta = targetBoost - player.boost;
         state.spendingBalance -= cost;
-        player.boost += level;
+        player.boost = targetBoost;
         state.awaitingBoostLevel = null;
 
-        this.bot.whisper(sender, `Boost purchased for ${cost} points! Your boost is now +${player.boost}. Each loss reduces it by 1.`);
+        this.bot.whisper(sender, `Boost purchased for ${cost} points! Your boost is now +${player.boost} (+${delta} added). Each loss reduces it by 1.`);
         this.returnToSpendMenu(sender);
     }
 
@@ -9323,6 +9328,27 @@ export class WinnersDiceGame {
         }
     }
 
+    private handlePoints(memberNumber: number): void {
+        if (this.state.phase === "idle" || this.state.phase === "negotiating") {
+            this.bot.whisper(memberNumber, "No active match — !points shows your balance during a game.");
+            return;
+        }
+        const player = this.state.players?.find(p => p.memberNumber === memberNumber);
+        if (!player) {
+            this.bot.whisper(memberNumber, "You're not in the current match.");
+            return;
+        }
+        const lines: string[] = ["💰 Your points:"];
+        lines.push(`  Banked: ${player.balance} pts`);
+        if (player.pendingBalance > 0) {
+            lines.push(`  Pending: ${player.pendingBalance} pts (added to balance at next bank)`);
+        }
+        if (this.state.pot > 0) {
+            lines.push(`  Current pot: ${this.state.pot} pts`);
+        }
+        this.bot.whisper(memberNumber, lines.join("\n"));
+    }
+
     private handleLeaderboard(memberNumber: number): void {
         const records = Object.values(this.playerRecords);
         const me = this.playerRecords[String(memberNumber)];
@@ -9606,10 +9632,13 @@ export class WinnersDiceGame {
         }
         this.activeLookingCalls.set(sender, { seeker: sender, beeped, expiresAt: now + LOOKING_RELAY_WINDOW_MS });
 
-        if (!admin) this.startLookingStayTimer(sender);
+        if (!admin) {
+            this.startLookingStayTimer(sender);
+            this.startLookingNoResponseTimer(sender);
+        }
 
         this.bot.whisper(sender,
-            `📣 Beeped ${beeped.size} online player${beeped.size === 1 ? "" : "s"}. If anyone replies, I'll pass it along here. Please stick around a few minutes so they can join.`);
+            `📣 Beeped ${beeped.size} online player${beeped.size === 1 ? "" : "s"}. If anyone replies, I'll pass it along. Hang tight — I'll check back in 3 minutes if nobody's shown up yet.`);
     }
 
     // 3-minute "stay" timer. Expiring without an early leave is good behavior
@@ -9633,11 +9662,31 @@ export class WinnersDiceGame {
         if (t) { clearTimeout(t); this.lookingStayTimers.delete(seeker); }
     }
 
+    private startLookingNoResponseTimer(seeker: number): void {
+        this.clearLookingNoResponseTimer(seeker);
+        const t = setTimeout(() => {
+            this.lookingNoResponseTimers.delete(seeker);
+            // Skip if they're already in a match or negotiating.
+            const inMatch = this.state.players?.some(p => p.memberNumber === seeker);
+            if (!inMatch) {
+                this.bot.whisper(seeker,
+                    `Looks like nobody made it over — no worries. You can try !looking again in about 30 minutes.`);
+            }
+        }, LOOKING_NO_RESPONSE_MS);
+        this.lookingNoResponseTimers.set(seeker, t);
+    }
+
+    private clearLookingNoResponseTimer(seeker: number): void {
+        const t = this.lookingNoResponseTimers.get(seeker);
+        if (t) { clearTimeout(t); this.lookingNoResponseTimers.delete(seeker); }
+    }
+
     // Called from onMemberLeave: if someone leaves while their post-!looking
     // stay timer is running, that's an early leave — add a strike (block at 4).
     private handleLookingLeave(memberNumber: number): void {
         if (!this.lookingStayTimers.has(memberNumber)) return;
         this.clearLookingStayTimer(memberNumber);
+        this.clearLookingNoResponseTimer(memberNumber);
         this.activeLookingCalls.delete(memberNumber);
         const p = this.registeredPlayers[String(memberNumber)];
         if (!p) return;
