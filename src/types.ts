@@ -613,8 +613,10 @@ export interface MercyRequest {
     requesterId: number;
     stage: "awaiting_details" | "awaiting_winner_response" | "awaiting_duration" | "awaiting_conceder_response" | "awaiting_winner_counter_response";
     serviceText: string | null;
-    winnerDuration: string | null;
-    concederCounter: string | null;
+    // Service duration in MINUTES — the conceder is kept bound and locked for
+    // this long (enforced via the end-game timer/password lock machinery).
+    winnerDuration: number | null;
+    concederCounter: number | null;
 }
 
 export interface GameState {

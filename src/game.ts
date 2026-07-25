@@ -135,6 +135,19 @@ function extractNumber(text: string): number | null {
     return parseInt(match[0], 10);
 }
 
+// Parses a free-form duration into whole minutes: "30" / "30 min" / "30 minutes"
+// → 30; "1 hour" / "1 hr" → 60; "1.5 hours" → 90. Returns null if no positive
+// number is found. Used by the mercy service timer.
+function parseDurationMinutes(text: string): number | null {
+    const m = text.match(/-?\d+(?:\.\d+)?/);
+    if (!m) return null;
+    const value = parseFloat(m[0]);
+    if (!(value > 0)) return null;
+    const isHours = /\b(h|hr|hrs|hour|hours)\b/i.test(text);
+    const minutes = Math.round(isHours ? value * 60 : value);
+    return minutes > 0 ? minutes : null;
+}
+
 // Settings that are simple yes/no toggles, asked directly to both players.
 // Anything not in this set is settled via the !propose/!accept/!counter/!decline flow.
 const YES_NO_KEYS = new Set<NegotiationKey>(["stripping", "bondage", "toys", "services", "clearBondageAtEndgame"]);
@@ -1524,7 +1537,7 @@ export class WinnersDiceGame {
             `!bank - Lock in your pot (spend / continue / endgame)\n` +
             `!press - Roll again, risking your current pot\n` +
             `!endgame - End the match early (after minimum rounds)\n` +
-            `!mercy - Concede early: forfeit half your points and owe a service\n` +
+            `!mercy - Give up: forfeit ALL your points and stay bound, serving the other player for an agreed time\n` +
             `!pause / !resume - Pause or resume the bot (either player — useful for RP)\n` +
             `!points - Check your current balance, pending points, and pot\n` +
             `!stuck [item] - Bound and can't reach your clothes? I'll take a garment off for you\n` +
@@ -3659,11 +3672,12 @@ export class WinnersDiceGame {
     // ============================================================
     //
     // Either player can whisper !mercy (or just "mercy") once minRounds is
-    // reached to offer to end the game early: they forfeit 50% of their
-    // points and owe the other player a service of their choosing. The
-    // other player ("winner" below, i.e. whoever mercy is being requested
-    // from) can reject (the requester gets a one-round cooldown) or accept
-    // and negotiate the service's duration through a single counter-offer.
+    // reached to give up: they forfeit ALL their points to the other player and
+    // are kept bound and locked to serve for an agreed number of minutes,
+    // enforced by the same timer/password lock as end-game. The other player
+    // ("winner" below, i.e. whoever mercy is being requested from) can reject
+    // (the requester gets a one-round cooldown) or accept and negotiate the
+    // service duration (in minutes) through a single counter-offer.
     // ============================================================
 
     private handleMercyCommand(sender: number): void {
@@ -3703,10 +3717,10 @@ export class WinnersDiceGame {
         };
 
         this.bot.whisper(sender,
-            "⚠️ **Mercy request** — You're asking to end the game early. If accepted, you'll forfeit **50% of your current points** " +
-            "and owe your opponent a service or punishment of their choosing. This is the fastest way to exit a game if you have a " +
-            "reason to stop without calling safeword. To proceed, whisper me your reason for ending and what you're offering as a " +
-            "service. If you've changed your mind, whisper **cancel** to withdraw the request."
+            "⚠️ **Mercy request** — You're asking to give up and end the game early. If accepted, you'll forfeit **ALL of your current points** " +
+            "to your opponent, and you'll **stay bound and locked** while you serve them for an agreed number of minutes (I enforce the timer and " +
+            "release you when it's up — they can also release you early). This is the way to bow out without calling safeword. To proceed, whisper me " +
+            "your reason for ending and what you're offering as a service. If you've changed your mind, whisper **cancel** to withdraw the request."
         );
     }
 
@@ -3740,10 +3754,9 @@ export class WinnersDiceGame {
                 req.serviceText = text;
                 req.stage = "awaiting_winner_response";
                 this.bot.whisper(winner.memberNumber,
-                    `🏳️ **${conceder.name} is requesting mercy** and wants to end the game early. They've offered: "${text}" ` +
-                    `If you accept, they lose 50% of their points and you bank everything. You'll then name a duration for the ` +
-                    `service. Please keep it reasonable — this is someone choosing accountability over safeword. Reply **accept** ` +
-                    `or **reject**.`
+                    `🏳️ **${conceder.name} is requesting mercy** and wants to give up. They've offered: "${text}" ` +
+                    `If you accept, they forfeit **all** their points to you and stay **bound and locked** while they serve — you'll then name how many minutes. ` +
+                    `Please keep it reasonable — this is someone choosing accountability over safeword. Reply **accept** or **reject**.`
                 );
                 return true;
             }
@@ -3754,7 +3767,7 @@ export class WinnersDiceGame {
 
                 if (trimmed === "accept" || trimmed === "yes" || trimmed === "y") {
                     req.stage = "awaiting_duration";
-                    this.bot.whisper(winner.memberNumber, `Name a duration for the service (e.g. '30 minutes', '1 hour').`);
+                    this.bot.whisper(winner.memberNumber, `How long should they stay bound and serve? Whisper a number of minutes (e.g. '30' or '1 hour').`);
                     return true;
                 }
                 if (trimmed === "reject" || trimmed === "no" || trimmed === "n" || trimmed === "decline") {
@@ -3774,11 +3787,17 @@ export class WinnersDiceGame {
                 const text = raw.trim();
                 if (!text) return true;
 
-                req.winnerDuration = text;
+                const minutes = parseDurationMinutes(text);
+                if (minutes === null) {
+                    this.bot.whisper(winner.memberNumber, `I need a number of minutes — try '30' or '1 hour'.`);
+                    return true;
+                }
+
+                req.winnerDuration = minutes;
                 req.stage = "awaiting_conceder_response";
                 this.bot.whisper(conceder.memberNumber,
-                    `${winner.name} proposes a duration of **${text}** for your service. You may **accept** or make a ` +
-                    `**counter** offer once. If your counter is rejected, the original time stands.`
+                    `${winner.name} proposes **${minutes} minutes** bound and serving. You may **accept** or make a ` +
+                    `**counter** offer once (whisper "counter <minutes>"). If your counter is rejected, the original time stands.`
                 );
                 return true;
             }
@@ -3796,19 +3815,24 @@ export class WinnersDiceGame {
                 if (counterMatch) {
                     const valueText = raw.trim().replace(/^counter\s*/i, "").trim();
                     if (!valueText) {
-                        this.bot.whisper(conceder.memberNumber, `What duration would you like to counter with?`);
+                        this.bot.whisper(conceder.memberNumber, `How many minutes would you like to counter with?`);
                         return true;
                     }
-                    req.concederCounter = valueText;
+                    const counterMinutes = parseDurationMinutes(valueText);
+                    if (counterMinutes === null) {
+                        this.bot.whisper(conceder.memberNumber, `I need a number of minutes — try "counter 20".`);
+                        return true;
+                    }
+                    req.concederCounter = counterMinutes;
                     req.stage = "awaiting_winner_counter_response";
                     this.bot.whisper(winner.memberNumber,
-                        `${conceder.name} counters with a duration of **${valueText}**. Reply **accept** or **reject** — ` +
-                        `if rejected, the original time of ${req.winnerDuration} stands.`
+                        `${conceder.name} counters with **${counterMinutes} minutes**. Reply **accept** or **reject** — ` +
+                        `if rejected, the original time of ${req.winnerDuration} minutes stands.`
                     );
                     return true;
                 }
 
-                this.bot.whisper(conceder.memberNumber, `Please reply **accept** or **counter <duration>**.`);
+                this.bot.whisper(conceder.memberNumber, `Please reply **accept** or **counter <minutes>**.`);
                 return true;
             }
 
@@ -3832,58 +3856,60 @@ export class WinnersDiceGame {
         return false;
     }
 
-    // Settles an accepted mercy request: the conceder forfeits 50% of their
-    // current points (rounded down) to the winner, who also banks any
-    // unclaimed pot as part of the concession, then the match ends — same
-    // teardown as a normal bank/end (finishMatch).
-    private resolveMercy(req: MercyRequest, finalDuration: string): void {
+    // Settles an accepted mercy request: the conceder forfeits ALL their points
+    // to the winner and is kept bound and locked to serve for the agreed
+    // minutes, enforced by the same timer/password lock machinery as end-game.
+    // The match doesn't fully end here — it enters the active-end-game state and
+    // wraps up (records the completion, frees everyone, resets) when the timer
+    // runs out or the winner ends early with !done (expireEndGame → finishMatch).
+    private resolveMercy(req: MercyRequest, finalMinutes: number): void {
         const state = this.state;
         if (!state.players) return;
 
         const conceder = state.players.find(p => p.memberNumber === req.requesterId)!;
         const winner = state.players.find(p => p.memberNumber !== req.requesterId)!;
 
-        // Commit any balance still sitting in an active spend session before
-        // computing the forfeiture, so nothing already spent is double-counted.
+        // Commit any balance still sitting in an active spend session first.
         if (state.awaitingPostBank === conceder.memberNumber) conceder.balance = state.spendingBalance;
         if (state.awaitingPostBank === winner.memberNumber) winner.balance = state.spendingBalance;
+        state.awaitingPostBank = null;
+        state.awaitingDecision = null;
+        state.spendMenuOpen = false;
 
-        let banked = 0;
-        if (state.pot > 0) {
-            banked += state.pot;
-            state.pot = 0;
-        }
-
-        const forfeited = Math.floor(conceder.balance * 0.5);
-        conceder.balance -= forfeited;
+        // Bank the pot to the winner, then the conceder forfeits ALL their points.
+        const banked = state.pot;
+        state.pot = 0;
+        const forfeited = conceder.balance;
+        conceder.balance = 0;
         winner.balance += forfeited + banked;
-        const totalBanked = forfeited + banked;
-
-        this.bot.sendChat(
-            `🏳️ ${conceder.name} conceded the game. ${winner.name} banks ${totalBanked} points. ` +
-            `${conceder.name} owes: "${req.serviceText}" for ${finalDuration}.`
-        );
 
         this.state.mercyRequest = null;
 
-        if (this.activeHandoff) {
-            this.writeRoomBotResult(this.activeHandoff, "mercy", winner.memberNumber, conceder.memberNumber, 0, 0);
-            this.resetRoomBotForNextMatch();
-        } else {
-            this.recordGameCompletion(winner.memberNumber, state.players);
-            this.savePairCarryover(conceder, winner);
-        }
+        this.bot.sendChat(
+            `🏳️ ${conceder.name} concedes! They forfeit all ${forfeited} points${banked > 0 ? ` (plus the ${banked}-pt pot)` : ""} to ${winner.name}, ` +
+            `and stay bound to serve for ${finalMinutes} minute${finalMinutes === 1 ? "" : "s"} — "${req.serviceText}".`
+        );
+        this.bot.whisper(conceder.memberNumber,
+            `You've conceded. You're locked and serving ${winner.name} for ${finalMinutes} minute${finalMinutes === 1 ? "" : "s"} — I'll release you when the timer's up (they can also let you go early).`);
 
-        this.clearPendingWardrobeChecks();
-        this.clearWardrobeHelperState();
-        this.clearEndGameState();
-        this.releaseAllActiveLocks();
-        this.releaseAllActiveBondage();
-        this.releaseActiveToy();
-        this.clearServiceDeal();
-        this.state = this.createIdleState();
+        // The winner won — free their own bondage/locks so they aren't left bound.
+        this.releaseLocksFor(winner.memberNumber);
+        this.releaseBondageFor(winner.memberNumber);
 
-        this.checkPendingUpdate();
+        // Keep the conceder bound and enforce the service timer with the same
+        // machinery as end-game: clear any existing locks on them, then (after a
+        // short delay for BC to process the unlocks) lock all their bondage
+        // slots plus a leash for finalMinutes. expireEndGame() → finishMatch()
+        // then handles the real match-end teardown.
+        this.releaseLocksFor(conceder.memberNumber);
+        const concederGroups = state.activeBondage
+            .filter(b => b.wearerMemberNumber === conceder.memberNumber)
+            .map(b => this.groupForSlotDisplay(b.slot));
+        const winnerNum = winner.memberNumber;
+        const concederNum = conceder.memberNumber;
+        setTimeout(() => {
+            this.applyEndGameLocks(winnerNum, concederNum, 0, forfeited, concederGroups, finalMinutes, true);
+        }, 3000);
     }
 
     // ============================================================
