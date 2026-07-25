@@ -3321,12 +3321,22 @@ export class WinnersDiceGame {
 
         const winnerPoints = winnerRoll.total * result.round;
 
-        // Only the winner's points go into the pot, so we don't spell out the
-        // loser's point math — just show their raw roll so the result is still
-        // clear at a glance, and fold the outcome + next-step into fewer lines.
-        this.bot.sendChat(
-            `🎲 Roll ${result.rollNumber} — ${winner.name} wins with ${fmtBreakdown(winnerRoll)} = ${winnerRoll.total} × ${result.round} = ${winnerPoints} points (beat ${loser.name}'s ${loserRoll.total}) → Pot: ${result.potTotal} points`
-        );
+        // When either player has a boost in play, show both players' full roll
+        // math on their own lines so each boost level is visible; otherwise keep
+        // it to the concise one-liner (only the winner's points go into the pot,
+        // so the loser's total is enough there).
+        const anyBoost = winnerRoll.boost > 0 || loserRoll.boost > 0;
+        if (anyBoost) {
+            this.bot.sendChat(
+                `🎲 Roll ${result.rollNumber} — ${winner.name} wins! (× ${result.round} → Pot: ${result.potTotal})\n` +
+                `   ${winner.name}: ${fmtBreakdown(winnerRoll)} = ${winnerRoll.total} → ${winnerPoints} pts\n` +
+                `   ${loser.name}: ${fmtBreakdown(loserRoll)} = ${loserRoll.total}`
+            );
+        } else {
+            this.bot.sendChat(
+                `🎲 Roll ${result.rollNumber} — ${winner.name} wins with ${fmtBreakdown(winnerRoll)} = ${winnerRoll.total} × ${result.round} = ${winnerPoints} points (beat ${loser.name}'s ${loserRoll.total}) → Pot: ${result.potTotal} points`
+            );
+        }
         this.bot.sendChat(`${winner.name} can bank ${result.potTotal} points or keep rolling to build the pot.`);
 
         // Whisper every active player in the match — not just the winner —
