@@ -4709,7 +4709,7 @@ export class WinnersDiceGame {
                 ? state.activeBondage.find(b => b.wearerMemberNumber === loserMemberNumber && b.slot === slotDisplay)
                 : undefined;
             if (!entry) continue; // nothing worn there — nothing to lock
-            this.bot.applyItem(loserMemberNumber, group, entry.itemName, "Default", lockProperty);
+            this.applyLockPreservingItem(loserMemberNumber, group, entry.itemName, lockProperty);
             appliedLockSlots.push(group);
         }
         if (appliedLockSlots.length < requestedLockSlots.length) {
@@ -4907,7 +4907,7 @@ export class WinnersDiceGame {
                 ? this.state.activeBondage.find(b => b.wearerMemberNumber === active.loserMemberNumber && b.slot === slotDisplay)
                 : undefined;
             if (entry) {
-                this.bot.applyItem(active.loserMemberNumber, group, entry.itemName, "Default", {});
+                this.unlockPreservingItem(active.loserMemberNumber, group, entry.itemName);
             }
         }
 
@@ -6136,14 +6136,11 @@ export class WinnersDiceGame {
         return { added: false, lockedExisting: true };
     }
 
-    // Re-applies the loser's worn collar with no lock (preserving name/color),
-    // undoing a lock the bot added over a pre-existing collar at end game.
+    // Re-applies the loser's worn collar with no lock (preserving name/color
+    // and its non-lock settings), undoing a lock the bot added over a
+    // pre-existing collar at end game.
     private unlockExistingCollar(memberNumber: number): void {
-        const collar = this.roomCharacters.get(memberNumber)?.Appearance
-            ?.find((item: any) => item?.Group === "ItemNeck" && item?.Name);
-        if (collar) {
-            this.bot.applyItem(memberNumber, "ItemNeck", collar.Name, collar.Color ?? "Default", {});
-        }
+        this.unlockPreservingItem(memberNumber, "ItemNeck", "");
     }
 
     // Top-N most popular items for this slot (from this bot's own usage
@@ -7743,6 +7740,45 @@ export class WinnersDiceGame {
         };
     }
 
+    // The item currently worn in `group` on a member — from live sync data,
+    // falling back to the never-cleared wardrobe cache. Lets lock add/remove
+    // preserve the item's real color and settings instead of resetting them to
+    // defaults (mirrors BD's itemStateCache use — see StripDiceBot's
+    // buildLockedItemProperty / cleanDecodedProperty).
+    private currentWornItem(memberNumber: number, group: string): { name: string; color: any; property: any } | null {
+        const live = this.roomCharacters.get(memberNumber)?.Appearance
+            ?.find((it: any) => it?.Group === group && it?.Name);
+        const src: any = live?.Name ? live : this.wardrobeItemCache.get(`${memberNumber}:${group}`);
+        if (!src?.Name) return null;
+        return { name: src.Name, color: src.Color ?? "Default", property: src.Property ?? {} };
+    }
+
+    // Applies a lock to whatever is currently in `group`, keeping the item's
+    // color and non-lock property intact (BD's buildLockedItemProperty approach)
+    // so locking never resets the outfit. `lockProperty` supplies the lock
+    // fields; existing item effects are preserved and "Lock" appended. Falls
+    // back to `fallbackItemName`/Default if the worn item can't be read.
+    private applyLockPreservingItem(memberNumber: number, group: string, fallbackItemName: string, lockProperty: any): void {
+        const worn = this.currentWornItem(memberNumber, group);
+        const name = worn?.name ?? fallbackItemName;
+        const color = worn?.color ?? "Default";
+        const base = this.stripPropertyLocks(worn?.property ?? {}); // drop any stale lock fields first
+        const merged: any = { ...base, ...lockProperty };
+        const baseEffects = Array.isArray(base.Effect) ? base.Effect : [];
+        const lockEffects = Array.isArray(lockProperty.Effect) ? lockProperty.Effect : [];
+        merged.Effect = [...new Set([...baseEffects, ...lockEffects])];
+        this.bot.applyItem(memberNumber, group, name, color, merged);
+    }
+
+    // Re-applies whatever is currently in `group` with its lock fields stripped
+    // — unlocks the item while preserving its color and settings.
+    private unlockPreservingItem(memberNumber: number, group: string, fallbackItemName: string): void {
+        const worn = this.currentWornItem(memberNumber, group);
+        const name = worn?.name ?? fallbackItemName;
+        const color = worn?.color ?? "Default";
+        this.bot.applyItem(memberNumber, group, name, color, this.stripPropertyLocks(worn?.property ?? {}));
+    }
+
     // This wearer's active bondage slots that aren't already locked —
     // what a placer can choose from when starting a lock purchase.
     private lockableBondageSlotsFor(wearerMemberNumber: number): ActiveBondage[] {
@@ -8042,7 +8078,7 @@ export class WinnersDiceGame {
             const entry = state.activeBondage.find(b => b.wearerMemberNumber === deal.wearer && b.slot === slotDisplay);
             if (!entry) continue; // slot changed since it was picked — skip it
 
-            this.bot.applyItem(deal.wearer, this.groupForSlotDisplay(slotDisplay), entry.itemName, "Default", lockProperty);
+            this.applyLockPreservingItem(deal.wearer, this.groupForSlotDisplay(slotDisplay), entry.itemName, lockProperty);
             state.activeLocks.push({
                 slot: slotDisplay,
                 placerMemberNumber: deal.placer,
@@ -8087,7 +8123,7 @@ export class WinnersDiceGame {
 
             const entry = state.activeBondage.find(b => b.wearerMemberNumber === sender && b.slot === lock.slot);
             if (entry) {
-                this.bot.applyItem(sender, this.groupForSlotDisplay(lock.slot), entry.itemName, "Default", {});
+                this.unlockPreservingItem(sender, this.groupForSlotDisplay(lock.slot), entry.itemName);
             }
         }
 
@@ -8110,7 +8146,7 @@ export class WinnersDiceGame {
                 b => b.wearerMemberNumber === entry.wearerMemberNumber && b.slot === entry.slot
             );
             if (item) {
-                this.bot.applyItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), item.itemName, "Default", {});
+                this.unlockPreservingItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), item.itemName);
             }
         }
         this.state.activeLocks = [];
@@ -8134,7 +8170,7 @@ export class WinnersDiceGame {
                 b => b.wearerMemberNumber === entry.wearerMemberNumber && b.slot === entry.slot
             );
             if (item) {
-                this.bot.applyItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), item.itemName, "Default", {});
+                this.unlockPreservingItem(entry.wearerMemberNumber, this.groupForSlotDisplay(entry.slot), item.itemName);
             }
         }
         this.state.activeLocks = remaining;
