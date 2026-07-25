@@ -1,56 +1,56 @@
 [
   {
     "version": "2026-07-12T12:00:00-05:00",
-    "headline": "Carryover points between matches, a grace period for disconnects, and readable lock passwords.",
-    "detail": "Leftover points no longer vanish at the end of a match. If you play the same opponent again and you both opt in when the challenge is accepted, whatever you had left carries into the new match.\nIf someone drops out mid-match the game no longer ends instantly — there's a countdown giving them a chance to reconnect and pick up where you left off.\nLock passwords are now built from a word list instead of random characters, so they're far easier to read out and type back correctly.",
+    "headline": "Points carry between matches, disconnects get a grace period, readable lock passwords.",
+    "detail": "• Leftover points carry into your next match vs the same opponent (both opt in).\n• Mid-match disconnects get a reconnect countdown instead of ending instantly.\n• Lock passwords are real words now, not random characters.",
     "major": true
   },
   {
     "version": "2026-07-15T12:00:00-05:00",
-    "headline": "The bot now notices what you actually took off.",
-    "detail": "Clothing removal is detected from your wardrobe directly, the same way the Strip Dice bot has done it for a while, rather than relying entirely on you confirming each item by hand. Fewer mismatches between what the bot thinks you're wearing and what you actually are.",
+    "headline": "The bot detects what you actually took off.",
+    "detail": "• Clothing removal is read from your wardrobe, not just hand-confirmed — fewer mismatches.",
     "major": true
   },
   {
     "version": "2026-07-19T20:01:44-05:00",
-    "headline": "R130's new restraints are in, and brand-new gear is flagged so it doesn't get buried.",
-    "detail": "Checked the R130 release against BC's actual asset file and added the genuinely-new restraints: the Cybertech gas mask (head/hood) and the Chastity Tunnel Piercings.\nBoth show up in the player-pick flow and in the shop's buy-bondage menu. New items get pinned to the top of their slot's list with a 🆕 marker, so fresh gear isn't buried underneath whatever everyone has been picking for months.",
+    "headline": "R130 restraints added; new gear flagged 🆕.",
+    "detail": "• Added the Cybertech gas mask and Chastity Tunnel Piercings.\n• New items sit at the top of their slot list with a 🆕 marker.",
     "major": true
   },
   {
     "version": "2026-07-20T12:00:00-05:00",
-    "headline": "You can now friend the bot to see when it's online, and !changelog shows what's new.",
-    "detail": "Friending: BC only shows two people to each other on their friend lists when both have added the other, so adding the bot on its own never did anything. Now, if you use BC's \"Add friend with notification\" option on the bot, it adds you back automatically — after that the bot appears in your friend list whenever it's online, so you can tell the table is open without hunting for it. Once the lobby is publicly listed you'll see the room name and player count there too. The \"add without notifying\" option sends the bot no signal at all, so if you used that one (or added the bot a while ago), whisper !friend and it'll add you back. !unfriend removes you again at any time. No beeps are sent — this is display only.\nChangelog: room chat no longer gets a wall of text after every update. Restarts announce a single headline for the big changes only, and if something shipped while you were away you'll get a one-line nudge on your way in. Whisper !changelog any time for the last few updates in full.",
+    "headline": "Friend the bot to see when it's online; !changelog shows what's new.",
+    "detail": "• \"Add friend with notification\" auto-adds you back — the bot shows in your friends list when online. Whisper !friend if it didn't; !unfriend to undo. Display only, no beeps.\n• Update announcements are one headline now, not a wall of text — whisper !changelog for full history.",
     "major": true
   },
   {
     "version": "2026-07-21T07:17:24-05:00",
-    "headline": "If you've blocked the padlock WinnersDice uses to lock the loser, I'll now catch it right after a challenge and help you sort it out before the game starts.",
-    "detail": "Previously, if a player had the Timer Password Padlock blocked in their item settings, the end-game lock just silently failed. Now, as soon as a challenge is accepted, I check both players. If yours is blocked I'll whisper you two options: reply \"unblock\" once you've re-enabled it (no need to leave the room), or reply \"highsec\" to use a High-Security lock instead — the winner gets a key to release you and I auto-release when the timer's up. High-Security needs BOTH players to agree. If the winner later wants to take a High-Security-locked loser out of the room, the loser gets asked first whether they're OK leaving (trusting the winner to unlock) or would rather keep the session in the room so I release them automatically. (Admins: a temporary !testcufflock command is in for verifying this — it'll be removed after testing.)",
+    "headline": "Blocked padlocks are caught right after a challenge.",
+    "detail": "• If you've blocked the Timer Password Padlock, I flag it at challenge time — reply \"unblock\", or \"highsec\" for a High-Security lock (needs both players).",
     "major": true
   },
   {
     "version": "2026-07-21T21:27:02-05:00",
-    "headline": "End-game fixes: winner is fully freed when a deal settles, no more accidental 0-minute claims, the room waits for the winner before resetting, and blocked padlocks are handled up front.",
-    "detail": "Four things in this update:\n(1) Winner unbinding — when an end-game deal is settled, the winner is now unlocked AND unbound right away. Before, if the loser had paid to LOCK the winner's bondage during the match, that locked item stayed on (the bot couldn't remove a locked item). Now the bot unlocks the winner's items first, then removes them.\n(2) No more 0-minute claims — if the loser cuts the claimed time all the way down to 0, the winner can no longer accidentally \"accept\" 0 minutes. The bot won't let a 0 be accepted; the winner has to rebid a time (\"counter <minutes>\") or decline the deal.\n(3) Room ready-check — after a match wraps up, the game-room bot no longer resets the room instantly. It whispers the winner and waits for them to reply \"ready\" (or \"done\") before resetting for the next game, so the room isn't pulled out from under players still finishing up. If it doesn't hear back in about 3 minutes it resets on its own.\n(4) Blocked-lock handling — if a player has blocked the Timer Password Padlock the end game uses, the bot catches it right after a challenge and offers to either unblock it or use a High-Security lock instead (winner gets a key, bot auto-releases); High-Security needs both players' agreement, and a High-Security loser is asked before being taken out of the room. (Admins: a temporary !testcufflock command is still in for verifying this.)",
+    "headline": "End-game fixes: winner freed on settle, no 0-min claims, room waits before reset.",
+    "detail": "• Winner is unlocked and unbound when a deal settles.\n• Can't accidentally accept a 0-minute claim.\n• Room waits for the winner's \"ready\" before resetting (auto after ~3 min).\n• Blocked padlocks handled at challenge time.",
     "major": true
   },
   {
     "version": "2026-07-21T22:37:21-05:00",
-    "headline": "Round-start settings check, tidier roll messages, and end-game fixes: the leash can't be slipped off and the loser is fully freed at the end, the winner is unbound when a deal settles, no more accidental 0-minute claims, and the room waits for the winner before resetting.",
-    "detail": "Seven things in this update:\n(A) Confirm before rolling — once you're both in the room, I now show the agreed settings and wait for BOTH of you to reply \"ready\" (or \"start\") before the first roll, so you can double-check them. Type !cancel if something's wrong; if you don't both confirm within a couple minutes the match is called off.\n(B) Shorter roll messages — a roll now reads as one line (the winner's roll, points, and pot, with the loser's raw roll shown for context) plus the bank/keep-rolling prompt, instead of spelling out the loser's point math too.\n(1) Leash holds, then everything comes off cleanly — at end game the collar the leash attaches to is now always locked (same password and timer as everything else), so the loser can't slip the collar off and drop the leash. If they were already wearing a collar the bot locks that one in place (and unlocks it again after) instead of adding a second; a collar someone already had locked is left alone. And when the session ends — the timer runs out OR the winner types !done — if the loser is still in the room the bot now takes it ALL off them: releases every lock and removes all their bondage, so they're fully freed rather than just unlocked.\n(2) Winner unbinding — when an end-game deal is settled, the winner is now unlocked AND unbound right away. Before, if the loser had paid to LOCK the winner's bondage during the match, that locked item stayed on. Now the bot unlocks the winner's items first, then removes them.\n(3) No more 0-minute claims — if the loser cuts the claimed time all the way down to 0, the winner can no longer accidentally accept 0 minutes; they have to rebid a time (\"counter <minutes>\") or decline the deal.\n(4) Room ready-check — after a match wraps up, the game-room bot no longer resets the room instantly. It whispers the winner and waits for them to reply \"ready\" (or \"done\") before resetting for the next game. If it doesn't hear back in about 3 minutes it resets on its own.\n(5) Blocked-lock handling — if a player has blocked the Timer Password Padlock the end game uses, the bot catches it right after a challenge and offers to either unblock it or use a High-Security lock instead (winner gets a key, bot auto-releases); High-Security needs both players' agreement, and a High-Security loser is asked before being taken out of the room. (Admins: a temporary !testcufflock command is still in for verifying this.)",
+    "headline": "Confirm settings before rolling, tidier roll messages, more end-game fixes.",
+    "detail": "• Both players confirm the agreed settings (\"ready\") before the first roll.\n• Roll messages are one line.\n• End-game leash collar is locked so it can't be slipped off; loser is fully freed when the session ends.",
     "major": true
   },
   {
     "version": "2026-07-22T21:02:08-05:00",
-    "headline": "The WinnersDice room is now publicly listed so you can actually find and join it — plus end-game lock fixes, pause/resume, a paged bondage/toy picker, and easier !challenge.",
-    "detail": "a. Room is findable now — the lobby room was set to admin-only (hidden), so nobody could see it to join. It's now publicly listed like a normal room. (This was why WinnersDice looked empty.)\nb. End-game lock fix: if a shop deal put exclusive locks on items during the match, those locks are now properly replaced by timer password locks at the end.\nc. Collar lock fix: the leash collar now always gets its timer lock applied at end-game, even if it already had a lock from earlier.\nd. Bot no longer shows the menu or lets you make a second offer while waiting for the other player to respond to a deal.\ne. !pause / !resume — either player can pause the bot so you can chat or RP without it reacting. Both players are whispered when the state changes. Find it in !help game.\nf. Bondage and toy pickers now show \"M. More\" when there are more items than fit on one page. Numbers are relative (1-9 per page). Full catalog, not just the top 9.\ng. !challenge alone now whispers a numbered list of who's in the room so you can pick by number or name. The @ prefix is no longer needed. Name matching is also smarter — partial names work now.",
+    "headline": "The room is publicly listed now — plus pause/resume, paged pickers, easier !challenge.",
+    "detail": "• Room is findable (it was hidden — why it looked empty).\n• !pause / !resume the bot for RP.\n• Bondage/toy pickers page with \"M. More\".\n• !challenge alone lists who's in the room; partial names work.\n• End-game exclusive-lock and collar-lock fixes.",
     "major": true
   },
   {
     "version": "2026-07-23T23:45:14-05:00",
-    "headline": "New: matchmaking! Whisper !wd register to join the pool, then !looking to beep online players when you want a game — and get beeped when they're looking. No more sitting in an empty room.",
-    "detail": "a. !wd register — join the WinnersDice matchmaking pool. I'll add you as a friend and ask you to friend me back (MissyMissy2) — BC only shares online status when it's mutual, so that step is needed.\nb. !looking — from inside the WinnersDice room, this beeps every registered player who's online: \"<you> is in the WinnersDice lobby looking for a game!\" If they reply to the beep, I'll pass their message straight to you.\nc. !wd pause / !wd resume — stop or restart getting beeps without leaving the pool. !wd unregister leaves entirely (I keep the friend link, it's harmless).\nd. !wd status — check your registration at any time. All the matchmaking commands are also listed in the main !help menu now.\ne. Please stick around a few minutes after !looking so people have time to see the beep and arrive — leaving right away repeatedly will pause you out of the service.\nf. Wardrobe helper fix: !stuck / !redress now work for players whose item permissions are set to \"everyone except blacklist\" (they were being turned away before).",
+    "headline": "New: matchmaking — !wd register, then !looking to beep online players for a game.",
+    "detail": "• !wd register joins the pool (friend the bot back so presence works).\n• !looking beeps online registered players; their replies come to you.\n• !wd pause / resume / status / unregister — all in !help.\n• Fix: !stuck / !redress now work for \"everyone except blacklist\" item permissions.",
     "major": true
   }
 ]
