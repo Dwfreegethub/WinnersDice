@@ -78,7 +78,7 @@ const REVIEWING_FEEDBACK_STATUSES: ReadonlySet<FeedbackItemStatus> = new Set([
 // mechanic.
 // ============================================================
 
-const NEGOTIATION_ORDER: NegotiationKey[] = ["minRounds", "stripping", "bondage", "toys", "services"];
+const NEGOTIATION_ORDER: NegotiationKey[] = ["minRounds", "stripping", "bondage", "toys", "services", "clearBondageAtEndgame"];
 
 // Determines which setting still needs to be agreed on, in order.
 // Note: bondage application and lock duration are no longer negotiated up
@@ -86,6 +86,10 @@ const NEGOTIATION_ORDER: NegotiationKey[] = ["minRounds", "stripping", "bondage"
 // purchases made during the game.
 function nextNegotiationKey(config: Partial<GameConfig>): NegotiationKey | null {
     for (const key of NEGOTIATION_ORDER) {
+        // The end-game bondage-clearance term is only relevant when bondage is
+        // enabled — skip the question entirely when bondage was declined (it
+        // defaults to false in finishNegotiation).
+        if (key === "clearBondageAtEndgame" && config.bondage === false) continue;
         if (!(key in config)) return key;
     }
     return null;
@@ -100,6 +104,8 @@ function settingLabel(key: NegotiationKey): string {
         case "lockDuration": return "Lock duration (minutes)";
         case "toys": return "Toys";
         case "services": return "Actions & Services";
+        case "clearBondageAtEndgame": return "End-game bondage clearance";
+        default: return String(key);
     }
 }
 
@@ -131,7 +137,7 @@ function extractNumber(text: string): number | null {
 
 // Settings that are simple yes/no toggles, asked directly to both players.
 // Anything not in this set is settled via the !propose/!accept/!counter/!decline flow.
-const YES_NO_KEYS = new Set<NegotiationKey>(["stripping", "bondage", "toys", "services"]);
+const YES_NO_KEYS = new Set<NegotiationKey>(["stripping", "bondage", "toys", "services", "clearBondageAtEndgame"]);
 
 function isYesNoKey(key: NegotiationKey): boolean {
     return YES_NO_KEYS.has(key);
@@ -143,6 +149,10 @@ function yesNoQuestion(key: NegotiationKey): string {
         case "bondage": return "Enable bondage and locks?";
         case "toys": return "Enable toys?";
         case "services": return "Enable actions & services?";
+        case "clearBondageAtEndgame":
+            return "One more: should the winner have to buy back all their own bondage before they can call end-game? " +
+                "(Yes = no free escape — the winner pays the loser to clear it, like a normal buyback, before ending. " +
+                "Locked in for the whole match.)";
         default: return `Enable ${settingLabel(key)}?`;
     }
 }
@@ -1500,7 +1510,9 @@ export class WinnersDiceGame {
             `accept - Accept the current proposal\n` +
             `counter <value> - Counter with a different value (or just "counter" to be prompted)\n` +
             `decline - End the negotiation\n` +
-            `cancel - Abort entirely`;
+            `cancel - Abort entirely\n\n` +
+            `Settings you'll agree on: minimum rounds, stripping, bondage, toys, actions & services. ` +
+            `If bondage is on, you'll also set "clear bondage at end game" — when yes, the winner must buy back their own bondage (paying the loser) before they can call end-game. All settings lock in for the whole match.`;
 
         this.sendLongWhisper(sender, text);
     }
@@ -2747,6 +2759,7 @@ export class WinnersDiceGame {
             lockDuration: 0,
             toys: negotiation.config.toys ?? false,
             services: negotiation.config.services ?? false,
+            clearBondageAtEndgame: negotiation.config.clearBondageAtEndgame ?? false,
             maxStreak: this.defaultMaxStreak,
         };
 
@@ -2767,6 +2780,7 @@ export class WinnersDiceGame {
             bondage: config.bondage,
             toys: config.toys,
             services: config.services,
+            clearBondageAtEndgame: config.clearBondageAtEndgame,
         });
 
         // Multi-room mode: the lobby bot never runs matches itself. Hand off
@@ -3530,6 +3544,28 @@ export class WinnersDiceGame {
             return;
         }
 
+        // Bondage-clearance gate (see design_bondage_clearance.md): when the
+        // pre-game term is set, the winner can't end the match while they still
+        // have their own match-placed bondage on. They're not forced to pay —
+        // they can keep playing or mercy — but end-game won't proceed until it's
+        // all bought back. Blocks here (before banking) so they stay put and can
+        // head to the shop.
+        if (state.config.clearBondageAtEndgame) {
+            const ownBondage = state.activeBondage.filter(b => b.wearerMemberNumber === sender);
+            if (ownBondage.length > 0) {
+                const loser = state.players.find(p => p.memberNumber !== sender);
+                const loserName = loser?.name ?? "the other player";
+                const shopHint = state.awaitingPostBank === sender
+                    ? `Open the shop (reply 2) and choose "buy back bondage" to clear each piece`
+                    : `Bank first (!bank), then open the shop and choose "buy back bondage" to clear each piece`;
+                this.bot.whisper(sender,
+                    `⚔️ You still have ${ownBondage.length} piece${ownBondage.length === 1 ? "" : "s"} of bondage on, and this match requires clearing it before end-game. ` +
+                    `${shopHint} — you pay, ${loserName} gets paid (a normal buyback). ` +
+                    `You don't have to end now: keep playing, or !mercy to concede instead.`);
+                return;
+            }
+        }
+
         const winner = state.players.find(p => p.memberNumber === sender)!;
         if (state.awaitingPostBank === sender) {
             winner.balance = state.spendingBalance;
@@ -3913,6 +3949,17 @@ export class WinnersDiceGame {
         state.awaitingPostBank = null;
         state.spendMenuOpen = false;
         this.endGameAwaitingLockSlotsInput = false;
+
+        // Settle the loser's pending balance into their spendable balance for
+        // the time negotiation (see design_bondage_clearance.md). !endgame
+        // already banks the winner's pot; this is the symmetric move so any
+        // pending points the loser earned this match — including a winner's
+        // bondage-clearance buyback payments — are real bidding leverage now.
+        // End-game is the only point pending funds unlock.
+        if (loser.pendingBalance > 0) {
+            loser.balance += loser.pendingBalance;
+            loser.pendingBalance = 0;
+        }
 
         state.endGameProposal = {
             winnerMemberNumber: winner.memberNumber,
@@ -9799,6 +9846,7 @@ export class WinnersDiceGame {
             `Bondage: ${config.bondage ? "yes" : "no"}`,
             `Toys: ${config.toys ? "yes" : "no"}`,
             `Services: ${config.services ? "yes" : "no"}`,
+            ...(config.bondage ? [`Clear bondage @ end: ${config.clearBondageAtEndgame ? "yes" : "no"}`] : []),
         ].join(" · ");
     }
 
@@ -9870,6 +9918,7 @@ export class WinnersDiceGame {
             negotiation.config.bondage = cfg.bondage;
             negotiation.config.toys = cfg.toys;
             negotiation.config.services = cfg.services;
+            negotiation.config.clearBondageAtEndgame = cfg.clearBondageAtEndgame ?? false;
             negotiation.consentAllStage = "done"; // mark skipped so promptNextSetting doesn't re-ask
             this.bot.sendChat(`Both players agreed to reuse previous settings: ${this.formatSavedConfig(cfg)}. Skipping to room type.`);
             this.promptNextSetting();
@@ -9908,6 +9957,7 @@ export class WinnersDiceGame {
             bondage: negotiation.config.bondage ?? false,
             toys: negotiation.config.toys ?? false,
             services: negotiation.config.services ?? false,
+            clearBondageAtEndgame: negotiation.config.clearBondageAtEndgame ?? false,
         };
 
         negotiation.settingsCompareStage = "awaiting";
@@ -9915,10 +9965,11 @@ export class WinnersDiceGame {
 
         for (const { player, config } of experienced) {
             const items: string[] = [];
-            const keys: (keyof SavedGameConfig)[] = ["minRounds", "stripping", "bondage", "toys", "services"];
+            const keys: (keyof SavedGameConfig)[] = ["minRounds", "stripping", "bondage", "toys", "services", "clearBondageAtEndgame"];
+            const keyLabels: Partial<Record<keyof SavedGameConfig, string>> = { clearBondageAtEndgame: "Clear bondage @ end" };
             for (const k of keys) {
                 const match = (negotiated as any)[k] === (config as any)[k];
-                const label = k === "minRounds" ? `Rounds: ${(negotiated as any)[k]} min` : `${k.charAt(0).toUpperCase() + k.slice(1)}: ${(negotiated as any)[k] ? "yes" : "no"}`;
+                const label = k === "minRounds" ? `Rounds: ${(negotiated as any)[k]} min` : `${keyLabels[k] ?? (k.charAt(0).toUpperCase() + k.slice(1))}: ${(negotiated as any)[k] ? "yes" : "no"}`;
                 items.push(`${match ? "✅" : "❌"} ${label}${match ? "" : ` (your last: ${k === "minRounds" ? (config as any)[k] + " min" : ((config as any)[k] ? "yes" : "no")})`}`);
             }
             const msg = `Here's how the agreed settings compare to your last game:\n${items.join(" · ")}\nAccept these settings or switch to your saved ones? (accept/saved — 30 seconds or we'll continue)`;

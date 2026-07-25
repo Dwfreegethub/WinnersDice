@@ -1,76 +1,113 @@
 # End-Game Bondage Clearance — Design Doc
 
-**Status:** Design phase. Not yet implemented.
+**Status:** Design finalized 2026-07-24 — ready to build.
 
 ---
 
 ## Problem
 
-The current end-game flow removes the winner's active bondage for free at execution. This creates a loophole: a winner can accumulate bondage during the match and then trigger end-game without any cost, bypassing the buyback economy entirely.
+Right now the winner of any round can request end-game and have **all their own
+bondage and locks removed for free** at execution, regardless of how the match
+was going. That undercuts the deal economy: the loser placed that bondage
+expecting to be paid if the winner ever wanted it off (via buyback). Free
+removal at end-game lets the winner skip that entirely.
 
 ---
 
-## Proposed Solution
+## Solution (settled)
 
-Add a new end-game negotiation term — **bondage clearance** — that both players must agree on before the time negotiation begins. If set to "must clear," the winner is required to buy back all their active bondage before `!endgame` can be triggered.
+A **pre-game negotiation term**: "must the winner clear their bondage before
+end-game?" Decided by both players during match setup, **immutable once the
+match starts**. When enabled, the winner cannot *end the match* while they still
+have match-placed bondage on — but they are never *forced* to pay; they can keep
+playing, keep shopping, or concede via `!mercy` instead.
+
+### Where the term lives
+- New `GameConfig` field (e.g. `clearBondageAtEndgame: boolean`), added to the
+  pre-game negotiation order and agreed via the existing settings/consent flow.
+- **Only asked when `bondage` is enabled** — irrelevant otherwise.
+- Cannot be changed after the match begins.
 
 ---
 
 ## Flow
 
-1. **New negotiation term** — during end-game proposal, a new question is added (position TBD in Q1–Q5 sequence): "Must [winner] clear their bondage before end-game? (yes/no)" Both players must agree on this term, same as the other proposal questions.
+1. **Winner requests `!endgame`** (from the post-bank menu, or right after a
+   roll).
+2. Bot checks: is `clearBondageAtEndgame` on **and** does the winner have any
+   match-placed bondage (`activeBondage` where `wearer === winner`)?
+   - **No bondage** (or term off) → proceeds to the normal end-game proposal.
+   - **Bondage present** → **blocked** (proposal does NOT start). The winner
+     stays exactly where they were and gets a message like:
+     > "You still have bondage on. With clearance enabled, you have to buy it
+     > all back before you can call end-game. Open the shop → 'buy back bondage'
+     > to clear it (you'll pay, [loser] gets paid). You don't have to — you can
+     > keep playing, or **!mercy** to concede instead."
+     - If they typed `!endgame` **before banking** (straight after a roll), the
+       message also tells them to **bank first**, since the shop needs a bank
+       session.
+3. **Winner clears their bondage** through the existing bondage-buyback flow
+   (`startBondageBuyback` / `handleBondageBuybackResponse`) — standard economy,
+   no special-casing (see Economics). They can clear some, all, or none; only
+   *all* unlocks end-game.
+4. **Winner requests `!endgame` again** → bot re-checks → no bondage → the normal
+   proposal begins.
 
-2. **Winner types `!endgame` with "must clear" agreed** — bot checks whether the winner has any active bondage from the match.
-   - If no bondage: proceeds normally.
-   - If bondage exists: bot blocks and says something like — "You still have bondage on — clear it before end-game can proceed. Reply 1 to open the buyback menu."
-
-3. **Winner buys back their bondage** — using the existing buyback flow. Payment goes to the loser (as points, landing in loser's `pendingBalance`).
-
-4. **Winner types `!endgame` again** — bot re-checks, no bondage found, proposal proceeds. Balances reflect the buyback payments already made.
-
----
-
-## Open Question: Pending Balance in Negotiations
-
-When the winner buys back their bondage, the payment lands in the loser's `pendingBalance` (not yet settled into their spendable balance — that normally happens at the next bank). During the subsequent end-game time negotiation, the loser bids points to lower the time.
-
-**Should the loser's `pendingBalance` count toward their time-bid budget?**
-
-Arguments for yes:
-- The loser earned it legitimately during this match; it's just timing
-- The loser paid upfront (placed the bondage) and shouldn't be penalized by settlement lag
-- Makes the "must clear" option more meaningful — winner pays, loser gets real leverage
-
-Arguments for no:
-- `pendingBalance` isn't settled yet; keeping it locked maintains consistency with the rest of the economy
-- Simpler — no special handling needed during end-game negotiation
-- Loser still benefits at the next match via pair carryover
-
-**Decision needed** before implementation.
+No soft-lock: a broke winner simply can't end via `!endgame` and keeps playing
+(or mercies). Ending the match was never mandatory.
 
 ---
 
-## Why This Matters
+## Economics (settled)
 
-This is more than a quality-of-life fix. Bondage applied during the match is part of the deal economy — a loser placed those items with the expectation of being paid if the winner wanted them removed. Free removal at end-game undercuts that. Requiring clearance closes the loophole and makes bondage a real economic lever for both sides.
+- **Clearance uses the exact same bondage-buyback as any other time** — no
+  special split. Winner pays `2× applyPrice (+ lock fee)`; the loser (placer)
+  gets back `1× applyPrice`; the bot keeps the rest. Loser gets paid back what
+  they invested instead of nothing — that's the fairness win.
+  - *(Separate, later:* DW wants to revisit/lower the general buyback payback
+    price — that's a global buyback tweak, not part of this feature.)*
+- **Loser's pending funds become spendable at end-game.** `!endgame` already
+  banks the *winner's* pot before the proposal; we now **also settle the
+  loser's `pendingBalance` into their balance at proposal start**, so the money
+  the winner just paid to clear is immediately usable by the loser to bid the
+  time down. This is the **only** point pending funds unlock — during normal
+  play they stay pending as today. Applies to every end-game, not just
+  clearance games.
 
 ---
 
-## Code Complexity
+## Mercy
 
-Small-to-medium. Touch points:
-- `EndGameProposal` in `types.ts` — new field (`requireWinnerClearance: boolean | null`)
-- New proposal stage — question added to Q1–Q5 sequence
-- `handleEndgame` — pre-check for active winner bondage if clearance required
-- Redirect to buyback menu with shortcut option
-- No changes to time negotiation caps or deduction math — buyback happens before proposal, balances update naturally
-
-The removal itself uses existing buyback code. No new removal logic needed.
+- Clearance gates `!endgame` **only**. `!mercy` is a separate concession path and
+  is **not** affected — and the block message above explicitly reminds the
+  bound winner that mercy is an option.
+- Mercy is self-penalizing (forfeit half your points + owe a service), so it
+  isn't an exploit route around clearance.
+- **Follow-up (after this ships):** DW wants a full review of exactly what
+  happens in the mercy flow — tracked separately, not part of this build.
 
 ---
 
-## Notes
+## Code touch points
 
-- The loser remains bound at end-game as always — this change only affects the winner's bondage
-- Applies only to bondage placed during the match (tracked in `activeBondage`) — not items the winner was already wearing when they entered
-- Locks placed by the loser on the winner's bondage are included (winner would need to pay the lock removal price as well via existing lock buyout flow)
+- `types.ts` — `GameConfig.clearBondageAtEndgame: boolean`.
+- Pre-game negotiation — add the key to the order + a question, gated on
+  `bondage` being enabled; agreed via existing settings/consent handling;
+  frozen at match start (same as other config).
+- `handleEndgame` — pre-proposal gate: if term on and winner has `activeBondage`,
+  block with the clear-first + mercy-reminder message (and bank-first hint when
+  called from the pre-bank state). Otherwise proceed as today.
+- `startEndGameProposal` (or wherever the proposal begins) — settle the loser's
+  `pendingBalance` into their balance before bidding starts.
+- Removal itself reuses the existing bondage-buyback code — no new removal logic.
+
+## Scope notes
+
+- Applies only to bondage **placed during the match** (`activeBondage`), never
+  items the winner wore in.
+- Loser's locks on the winner's bondage are included (buyback already folds in
+  the lock-removal fee).
+- The loser stays bound at end-game as always — this only concerns the winner's
+  bondage.
+- Non-clearance games are unchanged (winner still gets free removal at
+  execution).

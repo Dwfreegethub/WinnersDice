@@ -102,6 +102,11 @@ export interface GameConfig {
     lockDuration: number;
     toys: boolean;
     services: boolean;
+    // If true, the winner must buy back all of their own match-placed bondage
+    // before !endgame will proceed (closes the free-removal loophole — see
+    // design_bondage_clearance.md). Only meaningful when bondage is enabled;
+    // frozen at match start like the rest of the config.
+    clearBondageAtEndgame: boolean;
     // Cap on each player's earned streak. Admin-settable via !setstreak between games.
     maxStreak: number;
 }
@@ -774,6 +779,7 @@ export interface SavedGameConfig {
     bondage: boolean;
     toys: boolean;
     services: boolean;
+    clearBondageAtEndgame: boolean;
 }
 
 // Per-player most-recent negotiation settings, keyed by memberNumber in
