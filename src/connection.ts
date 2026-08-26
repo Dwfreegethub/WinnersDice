@@ -182,7 +182,15 @@ export class BCConnection {
 
     public makeRoomPrivate(): void {
         this.socket.emit("ChatRoomAdmin", {
-            MemberNumber: this.playerNumber,
+            // MUST NOT be our own MemberNumber. The server's ChatRoomAdmin
+            // handler early-returns on
+            //   Acc.MemberNumber == data.MemberNumber && Action != Swap/MoveLeft/MoveRight
+            // so sending our own number makes an "Update" vanish silently —
+            // no error, no ChatRoomUpdateResponse, nothing. The real client
+            // sends Player.ID here, which is 0 for the local player; this
+            // field is only meaningful for member-targeted actions like
+            // Kick/Ban/Promote. Confirmed live 2026-08-22.
+            MemberNumber: 0,
             Action: "Update",
             Room: {
                 Name: secrets.roomName,
@@ -212,7 +220,9 @@ export class BCConnection {
     // Locked boolean alongside Name/Admin/Limit/etc. Needs a live test.
     public configureRoomForMatch(opts: { name: string; visibility: "public" | "hidden"; locked: boolean }): void {
         this.socket.emit("ChatRoomAdmin", {
-            MemberNumber: this.playerNumber,
+            // Not our own MemberNumber — see makeRoomPrivate() above; the
+            // server silently drops an "Update" whose MemberNumber is the sender's.
+            MemberNumber: 0,
             Action: "Update",
             Room: {
                 Name: opts.name,
