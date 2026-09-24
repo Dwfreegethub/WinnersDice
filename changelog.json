@@ -52,5 +52,11 @@
     "headline": "New: matchmaking — !wd register, then !looking to beep online players for a game.",
     "detail": "• !wd register joins the pool (friend the bot back so presence works).\n• !looking beeps online registered players; their replies come to you.\n• !wd pause / resume / status / unregister — all in !help.\n• Fix: !stuck / !redress now work for \"everyone except blacklist\" item permissions.",
     "major": true
+  },
+  {
+    "version": "2026-07-25T09:02:59-05:00",
+    "headline": "Gameplay update: a new end-game bondage rule, a tougher Mercy, boost tweaks, and fixes.",
+    "detail": "a. New pre-match option (when bondage is on): require the winner to buy back their own bondage before they can call end-game — no free escape.\nb. Mercy is now a real forfeit — give up ALL your points and stay bound, serving the other player for an agreed number of minutes.\nc. !points — check your balance, pending points, and pot mid-match.\nd. Boosts: +4 and +5 are cheaper, and the roll now shows both players' boost when either is boosted.\ne. Fix: adding or removing locks no longer resets your bondage color.",
+    "major": true
   }
 ]
